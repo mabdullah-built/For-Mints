@@ -33,6 +33,16 @@ impl Default for Stopwatch {
 pub struct LatencyMetrics {
     pub rpc_connect_ms: Option<u64>,
     pub rpc_chainid_ms: Option<u64>,
+    /// Time spent establishing/pre-warming every configured endpoint's
+    /// connection (Phase 3), before any benchmarking or state reads begin.
+    pub prewarm_ms: Option<u64>,
+    /// Time spent taking repeated read-latency samples across every
+    /// read-capable endpoint (Phase 3).
+    pub benchmark_ms: Option<u64>,
+    /// Time spent deterministically selecting the read endpoint and the
+    /// send-endpoint set from benchmark data (Phase 3). Expected to be
+    /// negligible; measured anyway for auditability.
+    pub endpoint_selection_ms: Option<u64>,
     pub metadata_ms: Option<u64>,
     pub nonce_ms: Option<u64>,
     pub fee_ms: Option<u64>,
@@ -62,6 +72,9 @@ impl LatencyMetrics {
         let mut lines = vec![
             field("rpc_connect_ms", self.rpc_connect_ms),
             field("rpc_chainid_ms", self.rpc_chainid_ms),
+            field("prewarm_ms", self.prewarm_ms),
+            field("benchmark_ms", self.benchmark_ms),
+            field("endpoint_selection_ms", self.endpoint_selection_ms),
             field("metadata_ms", self.metadata_ms),
             field("nonce_ms", self.nonce_ms),
             field("fee_ms", self.fee_ms),

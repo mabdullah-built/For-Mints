@@ -100,25 +100,34 @@ pub struct MintArgs {
     /// Skip the interactive "type yes to continue" confirmation prompt. Only meaningful with --send.
     #[arg(long)]
     pub yes: bool,
-    /// Lead time (seconds) before the state-check checkpoint. Default: 10.
-    #[arg(long, default_value_t = 10.0)]
-    pub lead_state_check_secs: f64,
-    /// Lead time (seconds) before the refresh checkpoint. Default: 3.
-    #[arg(long, default_value_t = 3.0)]
-    pub lead_refresh_secs: f64,
-    /// Lead time (seconds) before the finalize (sign + serialize) checkpoint. Default: 1.
-    #[arg(long, default_value_t = 1.0)]
-    pub lead_finalize_secs: f64,
-    /// How long to poll for a receipt before giving up, in seconds. Default: 60.
-    #[arg(long, default_value_t = 60)]
-    pub receipt_timeout_secs: u64,
-    /// Delay between receipt polls, in milliseconds. Default: 750.
-    #[arg(long, default_value_t = 750)]
-    pub receipt_poll_interval_ms: u64,
+    /// Lead time (seconds) before the state-check checkpoint. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub lead_state_check_secs: Option<f64>,
+    /// Lead time (seconds) before the refresh checkpoint. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub lead_refresh_secs: Option<f64>,
+    /// Lead time (seconds) before the finalize (sign + serialize) checkpoint. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub lead_finalize_secs: Option<f64>,
+    /// How long to poll for a receipt before giving up, in seconds. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub receipt_timeout_secs: Option<u64>,
+    /// Delay between receipt polls, in milliseconds. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub receipt_poll_interval_ms: Option<u64>,
+    /// Number of latency samples per read-capable endpoint during benchmarking. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub benchmark_samples: Option<u32>,
 }
 
 #[derive(Args, Debug)]
 pub struct BenchArgs {
     #[command(flatten)]
     pub chain_args: ChainArgs,
+    /// Number of latency samples per read-capable endpoint. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub samples: Option<u32>,
+    /// Delay between samples, in milliseconds. Defaults to the chain's execution profile.
+    #[arg(long)]
+    pub sample_delay_ms: Option<u64>,
 }

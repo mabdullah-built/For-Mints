@@ -9,6 +9,7 @@ use std::time::Duration as StdDuration;
 
 use time::OffsetDateTime;
 
+use crate::chain::benchmark::{BenchmarkConfig, HealthPolicy};
 use crate::chain::pool::RpcPool;
 use crate::domain::timing::SleepSegment;
 use crate::protocol::seadrop;
@@ -21,6 +22,7 @@ use super::broadcast::{
 use super::errors::{KairoxError, SessionError};
 use super::metrics::{LatencyMetrics, Stopwatch};
 use super::prepared::{LiveMintRequest, PreparedTransaction, prepare_live_transaction};
+use super::profile::ExecutionProfile;
 use super::receipt::{ReceiptState, poll_receipt};
 use super::scheduler::{Checkpoint, SchedulerTimings, sleep_until};
 
@@ -29,6 +31,12 @@ pub struct LiveMintConfig {
     pub scheduler: SchedulerTimings,
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
+    /// Benchmark sampling policy applied to the pool before endpoint
+    /// selection. See [`crate::chain::benchmark`].
+    pub benchmark: BenchmarkConfig,
+    /// Exclusion thresholds applied when selecting read/send endpoints
+    /// from benchmark data.
+    pub health: HealthPolicy,
 }
 
 impl Default for LiveMintConfig {
@@ -37,6 +45,20 @@ impl Default for LiveMintConfig {
             scheduler: SchedulerTimings::default(),
             receipt_poll_interval: StdDuration::from_millis(750),
             receipt_timeout: StdDuration::from_secs(60),
+            benchmark: BenchmarkConfig::default(),
+            health: HealthPolicy::default(),
+        }
+    }
+}
+
+impl From<&ExecutionProfile> for LiveMintConfig {
+    fn from(profile: &ExecutionProfile) -> Self {
+        Self {
+            scheduler: profile.scheduler_policy,
+            receipt_poll_interval: profile.receipt_poll_interval,
+            receipt_timeout: profile.receipt_timeout,
+            benchmark: profile.benchmark_policy,
+            health: profile.health_policy,
         }
     }
 }
@@ -45,6 +67,7 @@ impl Default for LiveMintConfig {
 /// the CLI decides how (or whether) to display each one.
 #[derive(Debug, Clone)]
 pub enum LiveProgress {
+    Benchmarking,
     Checkpoint(Checkpoint),
     Waiting(SleepSegment),
     Broadcasting { send_endpoint_count: usize },
@@ -72,25 +95,40 @@ pub struct LiveMintOutcome {
 /// [`BroadcastSummary::AllRejected`] — that is a known, safe outcome, not
 /// an ambiguous one.
 pub async fn run_live_mint(
-    pool: &RpcPool,
+    pool: &mut RpcPool,
     signer: &dyn Signer,
     request: &LiveMintRequest,
     config: &LiveMintConfig,
     mut on_progress: impl FnMut(LiveProgress),
 ) -> Result<LiveMintOutcome, KairoxError> {
+    let mut metrics = LatencyMetrics::default();
+
+    // BENCHMARK: bounded, repeated latency samples of every read-capable
+    // endpoint. Never broadcasts anything, never sends a real transaction
+    // merely to measure a send-only endpoint.
+    on_progress(LiveProgress::Benchmarking);
+    let benchmark_sw = Stopwatch::start();
+    pool.benchmark_all(&config.benchmark).await;
+    metrics.benchmark_ms = Some(benchmark_sw.elapsed_ms());
+
+    // SELECT: endpoint selection is finalized here, before any checkpoint
+    // runs and well before T=0 — nothing after this point re-ranks or
+    // re-chooses endpoints.
+    let selection_sw = Stopwatch::start();
     let read_client = pool.preferred_read().ok_or_else(|| {
         KairoxError::Session(SessionError(
-            "no read-capable RPC endpoint available; cannot safely prepare a live transaction"
+            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely prepare a live transaction"
                 .into(),
         ))
     })?;
-    if pool.send_capable().is_empty() {
+    let send_clients = pool.select_send_endpoints(&config.health);
+    metrics.endpoint_selection_ms = Some(selection_sw.elapsed_ms());
+    if send_clients.is_empty() {
         return Err(KairoxError::Session(SessionError(
-            "no send-capable RPC endpoint available; refusing to prepare a transaction with nowhere to broadcast it".into(),
+            "no healthy send-capable RPC endpoint available; refusing to prepare a transaction with nowhere to broadcast it".into(),
         )));
     }
 
-    let mut metrics = LatencyMetrics::default();
     let mut prepared: Option<PreparedTransaction> = None;
 
     for (checkpoint, lead) in config.scheduler.checkpoints() {
@@ -159,9 +197,18 @@ pub async fn run_live_mint(
     })
     .await;
 
+    // SCHEDULER ACCURACY: how far the actual dispatch instant landed from
+    // the verified stage-open target. Positive = late, negative = would
+    // have been early (never allowed to actually happen — the sleep above
+    // guarantees `actual_dispatch_at >= prepared.stage_start`).
+    let actual_dispatch_at = OffsetDateTime::now_utc();
+    metrics.scheduler_error_ms =
+        Some((actual_dispatch_at - prepared.stage_start).whole_milliseconds() as i64);
+
     metrics.broadcast_prepare_ms = Some(prepared.broadcast_prepare_ms);
 
-    let send_clients = pool.send_capable();
+    // send_clients was already finalized during SELECT, above — no
+    // re-ranking or re-selection happens here at T=0.
     on_progress(LiveProgress::Broadcasting {
         send_endpoint_count: send_clients.len(),
     });
@@ -279,6 +326,7 @@ mod tests {
 
             let transport = MockTransport::builder()
                 .respond("eth_chainId", json!("0x1"))
+                .respond("eth_blockNumber", json!("0x1"))
                 .respond_eth_call_selector(sd::getPublicDropCall::SELECTOR, json!(public_drop_hex))
                 .respond_eth_call_selector(
                     sd::getAllowedFeeRecipientsCall::SELECTOR,
@@ -353,15 +401,20 @@ mod tests {
             },
             receipt_poll_interval: StdDuration::from_millis(5),
             receipt_timeout: StdDuration::from_millis(200),
+            benchmark: crate::chain::benchmark::BenchmarkConfig {
+                sample_count: 1,
+                sample_delay: StdDuration::ZERO,
+            },
+            health: crate::chain::benchmark::HealthPolicy::default(),
         }
     }
 
     #[tokio::test]
     async fn fails_closed_without_send_capable_endpoint() {
         let signer = signer();
-        let empty_pool = RpcPool::from_clients(1, Vec::new());
+        let mut empty_pool = RpcPool::from_clients(1, Vec::new());
         let req = request(signer.address());
-        let err = run_live_mint(&empty_pool, &signer, &req, &tiny_config(), |_| {})
+        let err = run_live_mint(&mut empty_pool, &signer, &req, &tiny_config(), |_| {})
             .await
             .unwrap_err();
         assert!(matches!(err, KairoxError::Session(_)));
@@ -370,10 +423,10 @@ mod tests {
     #[tokio::test]
     async fn full_pipeline_broadcasts_identical_bytes_and_confirms_receipt() {
         let signer = signer();
-        let pool = healthy_pool(signer.address(), 3).await;
+        let mut pool = healthy_pool(signer.address(), 3).await;
         let req = request(signer.address());
 
-        let outcome = run_live_mint(&pool, &signer, &req, &tiny_config(), |_| {})
+        let outcome = run_live_mint(&mut pool, &signer, &req, &tiny_config(), |_| {})
             .await
             .unwrap();
 
@@ -422,11 +475,11 @@ mod tests {
         let signer = signer();
         let (sequencer, _capture) = submission_only_client(EndpointRole::Sequencer, 1, "seq").await;
         // Send-capable pool, but nothing chain-verified/read-capable in it.
-        let pool = RpcPool::from_clients(1, vec![sequencer]);
+        let mut pool = RpcPool::from_clients(1, vec![sequencer]);
         assert!(!pool.send_capable().is_empty());
 
         let req = request(signer.address());
-        let err = run_live_mint(&pool, &signer, &req, &tiny_config(), |_| {})
+        let err = run_live_mint(&mut pool, &signer, &req, &tiny_config(), |_| {})
             .await
             .unwrap_err();
         assert!(matches!(err, KairoxError::Session(_)));
@@ -442,12 +495,12 @@ mod tests {
             submission_only_client(EndpointRole::Sequencer, 1, "robinhood-sequencer").await;
         pool_clients.push(sequencer_client);
 
-        let pool = RpcPool::from_clients(1, pool_clients);
+        let mut pool = RpcPool::from_clients(1, pool_clients);
         assert_eq!(pool.read_capable().len(), 1);
         assert_eq!(pool.send_capable().len(), 2);
 
         let req = request(signer.address());
-        let outcome = run_live_mint(&pool, &signer, &req, &tiny_config(), |_| {})
+        let outcome = run_live_mint(&mut pool, &signer, &req, &tiny_config(), |_| {})
             .await
             .unwrap();
 
@@ -467,5 +520,52 @@ mod tests {
                 "every endpoint — including the submission-only one — must see the identical raw tx"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn metrics_are_populated_for_benchmark_selection_and_scheduler_accuracy() {
+        let signer = signer();
+        let mut pool = healthy_pool(signer.address(), 1).await;
+        let req = request(signer.address());
+
+        let outcome = run_live_mint(&mut pool, &signer, &req, &tiny_config(), |_| {})
+            .await
+            .unwrap();
+
+        assert!(outcome.metrics.benchmark_ms.is_some());
+        assert!(outcome.metrics.endpoint_selection_ms.is_some());
+        assert!(outcome.metrics.broadcast_prepare_ms.is_some());
+        assert!(outcome.metrics.dispatch_ms.is_some());
+        let scheduler_error = outcome
+            .metrics
+            .scheduler_error_ms
+            .expect("scheduler_error_ms must be recorded");
+        assert!(
+            scheduler_error >= 0,
+            "must never dispatch before the verified stage-open instant (scheduler_error_ms={scheduler_error})"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmarking_never_dispatches_a_broadcast() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .build();
+        let capture = transport.capture_handle();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![client]);
+        pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig {
+            sample_count: 3,
+            sample_delay: StdDuration::ZERO,
+        })
+        .await;
+
+        assert!(capture.calls_for("eth_sendRawTransaction").is_empty());
+        assert!(capture.prebuilt_bodies().is_empty());
+        assert!(!capture.calls_for("eth_blockNumber").is_empty());
     }
 }

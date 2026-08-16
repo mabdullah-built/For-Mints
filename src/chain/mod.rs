@@ -1,5 +1,6 @@
 //! Chain registry, RPC endpoint configuration, and the JSON-RPC client.
 
+pub mod benchmark;
 pub mod config;
 pub mod endpoint;
 pub mod mock;

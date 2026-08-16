@@ -6,6 +6,10 @@
 
 use std::time::{Duration, Instant};
 
+use super::benchmark::{
+    BenchmarkConfig, EndpointBenchmark, HealthPolicy, benchmark_read_latency, select_read_endpoint,
+    select_send_endpoints,
+};
 use super::endpoint::{EndpointRole, EndpointVerification, RpcEndpoint};
 use super::registry::ChainId;
 use super::rpc::{HttpTransport, RpcClient};
@@ -31,17 +35,28 @@ pub enum ConnectOutcome {
     },
 }
 
-/// A set of chain-id-verified, pre-warmed RPC clients for one chain.
+/// A set of chain-id-verified, pre-warmed RPC clients for one chain, with
+/// (optionally populated) per-endpoint benchmark data.
 pub struct RpcPool {
     chain_id: ChainId,
     clients: Vec<RpcClient>,
+    /// Parallel to `clients`. Always present (never `None`) — a
+    /// not-yet-benchmarked endpoint simply has `read_latency: None`, which
+    /// [`Self::preferred_read`] treats as "no benchmark data yet" and falls
+    /// back to Phase 2's original first-read-capable behavior for.
+    benchmarks: Vec<EndpointBenchmark>,
 }
 
 impl RpcPool {
     /// Build a pool directly from already-connected clients. Used by tests
     /// (with mock transports) and by [`Self::connect_all`].
     pub fn from_clients(chain_id: ChainId, clients: Vec<RpcClient>) -> Self {
-        Self { chain_id, clients }
+        let benchmarks = clients.iter().map(EndpointBenchmark::initial).collect();
+        Self {
+            chain_id,
+            clients,
+            benchmarks,
+        }
     }
 
     /// Connect every configured endpoint concurrently over real HTTP,
@@ -49,6 +64,8 @@ impl RpcPool {
     /// (wrong chain, timeout, network error) are excluded from the pool but
     /// reported individually — a partially healthy pool is still usable as
     /// long as it has at least one endpoint of the role a caller needs.
+    /// This connection attempt *is* Kairox's connection pre-warming; its
+    /// latency seeds each surviving client's `connection_latency_ms`.
     pub async fn connect_all(
         chain_id: ChainId,
         endpoints: &[RpcEndpoint],
@@ -69,6 +86,7 @@ impl RpcPool {
         let results = futures_util::future::join_all(attempts).await;
 
         let mut clients = Vec::new();
+        let mut connect_latencies = Vec::new();
         let mut reports = Vec::new();
         for (endpoint, elapsed, result) in results {
             let latency_ms = duration_ms(elapsed);
@@ -82,6 +100,7 @@ impl RpcPool {
                             verification: client.verification(),
                         },
                     });
+                    connect_latencies.push(latency_ms);
                     clients.push(client);
                 }
                 Err(e) => reports.push(EndpointConnectReport {
@@ -95,7 +114,12 @@ impl RpcPool {
             }
         }
 
-        (Self::from_clients(chain_id, clients), reports)
+        let mut pool = Self::from_clients(chain_id, clients);
+        for (bench, latency_ms) in pool.benchmarks.iter_mut().zip(connect_latencies) {
+            bench.connection_latency_ms = Some(latency_ms);
+        }
+
+        (pool, reports)
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -118,7 +142,10 @@ impl RpcPool {
             .collect()
     }
 
-    /// Every client whose role permits broadcasting.
+    /// Every client whose role permits broadcasting, unfiltered by health —
+    /// Phase 2's original behavior, preserved exactly. Use
+    /// [`Self::select_send_endpoints`] for the health-filtered Phase 3
+    /// broadcast candidate list.
     pub fn send_capable(&self) -> Vec<&RpcClient> {
         self.clients
             .iter()
@@ -126,10 +153,72 @@ impl RpcPool {
             .collect()
     }
 
-    /// The first read-capable client, if any. Used for the single-client
-    /// state reads Kairox performs while preparing a transaction.
+    /// Take bounded, repeated latency samples of every read-capable client
+    /// and store the results. Safe to call multiple times (each call
+    /// replaces prior read-latency data); never touches send-only/
+    /// `ConfiguredSendOnly` clients, and never broadcasts anything.
+    pub async fn benchmark_all(&mut self, config: &BenchmarkConfig) {
+        let samples =
+            futures_util::future::join_all(self.clients.iter().map(|client| async move {
+                if client.role().can_read() {
+                    Some(benchmark_read_latency(client, config).await)
+                } else {
+                    None
+                }
+            }))
+            .await;
+
+        for (bench, read_latency) in self.benchmarks.iter_mut().zip(samples) {
+            bench.read_latency = read_latency;
+        }
+    }
+
+    /// The current benchmark record for every client, in the same order as
+    /// the pool's clients.
+    pub fn benchmarks(&self) -> &[EndpointBenchmark] {
+        &self.benchmarks
+    }
+
+    fn paired(&self) -> Vec<(&RpcClient, &EndpointBenchmark)> {
+        self.clients_with_benchmarks().collect()
+    }
+
+    /// Every client paired with its current benchmark record, in pool
+    /// order. Prefer comparing the returned `&RpcClient` by identity
+    /// (`std::ptr::eq`) rather than by label when matching against
+    /// [`Self::preferred_read`]/[`Self::select_send_endpoints`] results —
+    /// labels are operator-supplied and may be absent or repeated.
+    pub fn clients_with_benchmarks(
+        &self,
+    ) -> impl Iterator<Item = (&RpcClient, &EndpointBenchmark)> {
+        self.clients.iter().zip(self.benchmarks.iter())
+    }
+
+    /// The single best read-capable, chain-verified, healthy client by
+    /// lowest median latency, deterministic on ties.
+    ///
+    /// Falls back to Phase 2's original "first read-capable client"
+    /// behavior only when [`Self::benchmark_all`] was never called at all
+    /// (no benchmark data exists yet) — existing callers that never
+    /// benchmark keep working unchanged. Once benchmarking *has* run, an
+    /// empty result means every read-capable candidate failed the health
+    /// policy, and this fails closed (`None`) rather than silently falling
+    /// back to a known-unhealthy endpoint.
     pub fn preferred_read(&self) -> Option<&RpcClient> {
+        let benchmarked = self.benchmarks.iter().any(|b| b.read_latency.is_some());
+        let selected = select_read_endpoint(&self.paired(), &HealthPolicy::default());
+        if selected.is_some() || benchmarked {
+            return selected;
+        }
         self.read_capable().into_iter().next()
+    }
+
+    /// The health-filtered, deterministically-ordered broadcast candidate
+    /// list. When no benchmark data exists yet, every send-capable client
+    /// is included (nothing to exclude on) — equivalent to
+    /// [`Self::send_capable`] in that case.
+    pub fn select_send_endpoints(&self, policy: &HealthPolicy) -> Vec<&RpcClient> {
+        select_send_endpoints(&self.paired(), policy)
     }
 }
 
@@ -286,6 +375,130 @@ mod tests {
         assert!(
             pool.preferred_read().is_none(),
             "a ConfiguredSendOnly-only pool must never report a usable read client"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_read_uses_benchmark_data_once_benchmarked() {
+        use super::super::benchmark::BenchmarkConfig;
+
+        let fast_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .build();
+        let fast = RpcClient::connect(
+            Box::new(fast_transport),
+            1,
+            EndpointRole::ReadOnly,
+            Some("fast".into()),
+        )
+        .await
+        .unwrap();
+
+        let slow_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .delay("eth_blockNumber", Duration::from_millis(20))
+            .build();
+        let slow = RpcClient::connect(
+            Box::new(slow_transport),
+            1,
+            EndpointRole::ReadOnly,
+            Some("slow".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![slow, fast]);
+        pool.benchmark_all(&BenchmarkConfig {
+            sample_count: 3,
+            sample_delay: Duration::ZERO,
+        })
+        .await;
+
+        let selected = pool.preferred_read().unwrap();
+        assert_eq!(selected.label(), Some("fast"));
+    }
+
+    #[tokio::test]
+    async fn preferred_read_fails_closed_when_benchmarked_and_all_unhealthy() {
+        use super::super::benchmark::BenchmarkConfig;
+
+        let dead_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .error("eth_blockNumber", -32000, "boom")
+            .build();
+        let dead = RpcClient::connect(Box::new(dead_transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![dead]);
+        pool.benchmark_all(&BenchmarkConfig {
+            sample_count: 3,
+            sample_delay: Duration::ZERO,
+        })
+        .await;
+
+        assert!(
+            pool.preferred_read().is_none(),
+            "must fail closed rather than silently fall back to a benchmarked-unhealthy endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_send_endpoints_matches_send_capable_before_benchmarking() {
+        let a = mock_client(1, EndpointRole::SendOnly, 1).await;
+        let pool = RpcPool::from_clients(1, vec![a]);
+        assert_eq!(
+            pool.select_send_endpoints(&super::super::benchmark::HealthPolicy::default())
+                .len(),
+            pool.send_capable().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn clients_with_benchmarks_supports_identity_based_selection_matching_with_unlabeled_endpoints()
+     {
+        use super::super::benchmark::BenchmarkConfig;
+
+        // Two endpoints, neither labeled — a naive label-based join would
+        // be unable to tell them apart (this was a real bug: comparing
+        // `RpcClient::label()` against a display-only "(unlabeled)"
+        // placeholder). Identity (pointer) comparison must still work.
+        let fast_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .build();
+        let fast = RpcClient::connect(Box::new(fast_transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+
+        let slow_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .delay("eth_blockNumber", Duration::from_millis(20))
+            .build();
+        let slow = RpcClient::connect(Box::new(slow_transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![slow, fast]);
+        pool.benchmark_all(&BenchmarkConfig {
+            sample_count: 3,
+            sample_delay: Duration::ZERO,
+        })
+        .await;
+
+        let selected_ptr = pool.preferred_read().map(std::ptr::from_ref);
+        let mut matches = 0;
+        for (client, _bench) in pool.clients_with_benchmarks() {
+            if Some(std::ptr::from_ref(client)) == selected_ptr {
+                matches += 1;
+            }
+        }
+        assert_eq!(
+            matches, 1,
+            "identity comparison must uniquely match exactly the selected client"
         );
     }
 }

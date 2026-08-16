@@ -22,8 +22,9 @@ use crate::execution::broadcast::BroadcastSummary;
 use crate::execution::errors::{KairoxError, SessionError};
 use crate::execution::live::{LiveMintConfig, LiveProgress, run_live_mint};
 use crate::execution::prepared::LiveMintRequest;
+use crate::execution::profile::ExecutionProfile;
 use crate::execution::receipt::ReceiptState;
-use crate::execution::scheduler::{Checkpoint, SchedulerTimings};
+use crate::execution::scheduler::Checkpoint;
 use crate::signing::keystore::load_signing_key;
 use crate::signing::signer::Signer;
 
@@ -61,7 +62,7 @@ async fn run_send(args: MintArgs) -> Result<(), KairoxError> {
     } else {
         load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
     };
-    let (pool, reports) = RpcPool::connect_all(resolved.info.chain_id, &endpoints).await;
+    let (mut pool, reports) = RpcPool::connect_all(resolved.info.chain_id, &endpoints).await;
     for report in &reports {
         if let ConnectOutcome::Failed { error, .. } = &report.outcome {
             let label = report
@@ -135,18 +136,32 @@ async fn run_send(args: MintArgs) -> Result<(), KairoxError> {
         safety_caps,
     };
 
-    let config = LiveMintConfig {
-        scheduler: SchedulerTimings {
-            state_check_lead: Duration::seconds_f64(args.lead_state_check_secs),
-            refresh_lead: Duration::seconds_f64(args.lead_refresh_secs),
-            finalize_lead: Duration::seconds_f64(args.lead_finalize_secs),
-        },
-        receipt_poll_interval: StdDuration::from_millis(args.receipt_poll_interval_ms),
-        receipt_timeout: StdDuration::from_secs(args.receipt_timeout_secs),
-    };
+    // Start from the chain's execution profile (benchmark sampling, health
+    // policy, and default scheduler leads), then apply any explicit CLI
+    // overrides for the scheduler/receipt-polling/benchmark timings on top.
+    let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
+    let mut config = LiveMintConfig::from(&profile);
+    if let Some(secs) = args.lead_state_check_secs {
+        config.scheduler.state_check_lead = Duration::seconds_f64(secs);
+    }
+    if let Some(secs) = args.lead_refresh_secs {
+        config.scheduler.refresh_lead = Duration::seconds_f64(secs);
+    }
+    if let Some(secs) = args.lead_finalize_secs {
+        config.scheduler.finalize_lead = Duration::seconds_f64(secs);
+    }
+    if let Some(secs) = args.receipt_timeout_secs {
+        config.receipt_timeout = StdDuration::from_secs(secs);
+    }
+    if let Some(ms) = args.receipt_poll_interval_ms {
+        config.receipt_poll_interval = StdDuration::from_millis(ms);
+    }
+    if let Some(samples) = args.benchmark_samples {
+        config.benchmark.sample_count = samples;
+    }
 
     let mut receipt_pending_announced = false;
-    let outcome = run_live_mint(&pool, &signer, &request, &config, |progress| {
+    let outcome = run_live_mint(&mut pool, &signer, &request, &config, |progress| {
         report_progress(progress, &mut receipt_pending_announced)
     })
     .await?;
@@ -222,6 +237,7 @@ fn read_stdin_confirmation() -> Option<String> {
 
 fn report_progress(progress: LiveProgress, receipt_pending_announced: &mut bool) {
     match progress {
+        LiveProgress::Benchmarking => println!("[benchmark] sampling endpoint latency"),
         LiveProgress::Checkpoint(Checkpoint::StateCheck) => println!("[checkpoint] state check"),
         LiveProgress::Checkpoint(Checkpoint::Refresh) => {
             println!("[checkpoint] refresh (nonce/fee/balance/supply)")

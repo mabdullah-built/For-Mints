@@ -5,6 +5,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use url::Url;
 
+use crate::chain::benchmark::{BroadcastLatency, EndpointBenchmark};
 use crate::chain::endpoint::EndpointRole;
 use crate::chain::pool::ConnectOutcome;
 use crate::chain::registry::ChainId;
@@ -112,6 +113,69 @@ fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
+/// Render one endpoint's full Phase 3 benchmark/selection report: role,
+/// verification, capability, latency statistics (when measurable), and
+/// whether it was actually selected for reads/sends. Never labels a
+/// `ConfiguredSendOnly` endpoint's unmeasurable read/broadcast latency as
+/// anything but explicitly unknown.
+pub fn format_benchmark_report(
+    masked_url: &str,
+    chain_id: ChainId,
+    bench: &EndpointBenchmark,
+    selected_read: bool,
+    selected_send: bool,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "{} {}",
+            bench.label.as_deref().unwrap_or("(unlabeled)"),
+            masked_url
+        ),
+        format!("    role={:?}", bench.role),
+        format!("    verification={}", bench.verification.status_label()),
+        format!("    read={}", yes_no(bench.role.can_read())),
+        format!("    send={}", yes_no(bench.role.can_send())),
+        format!("    chain_binding=configured:{chain_id}"),
+    ];
+
+    match &bench.read_latency {
+        Some(stats) if stats.sample_count > 0 => {
+            lines.push(format!(
+                "    read_latency: samples={} median={} p90={} p95={} failures={} timeouts={}",
+                stats.sample_count,
+                fmt_opt_ms(stats.median_ms),
+                fmt_opt_ms(stats.p90_ms),
+                fmt_opt_ms(stats.p95_ms),
+                stats.failures,
+                stats.timeouts,
+            ));
+        }
+        _ => lines.push("    read_latency=N/A".to_string()),
+    }
+
+    let broadcast_latency = match bench.broadcast_latency {
+        BroadcastLatency::NotApplicable => "N/A",
+        BroadcastLatency::UnknownUntilRealAttempt => "UNKNOWN_UNTIL_REAL_ATTEMPT",
+    };
+    lines.push(format!("    broadcast_latency={broadcast_latency}"));
+
+    if let Some(ms) = bench.connection_latency_ms {
+        lines.push(format!("    connection_latency={ms}ms"));
+    }
+
+    lines.push(format!("    selected_read={}", yes_no(selected_read)));
+    lines.push(format!("    selected_send={}", yes_no(selected_send)));
+
+    lines.join("\n")
+}
+
+fn fmt_opt_ms(v: Option<u64>) -> String {
+    match v {
+        Some(ms) => format!("{ms}ms"),
+        None => "n/a".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +262,56 @@ mod tests {
             },
         );
         assert!(!submission_only.to_uppercase().contains("MATCHES"));
+    }
+
+    #[test]
+    fn format_benchmark_report_shows_na_for_unmeasurable_submission_only_endpoint() {
+        use crate::chain::endpoint::EndpointRole;
+
+        let bench = EndpointBenchmark {
+            label: Some("robinhood-sequencer".into()),
+            role: EndpointRole::Sequencer,
+            verification: EndpointVerification::ConfiguredSendOnly,
+            connection_latency_ms: Some(8),
+            read_latency: None,
+            broadcast_latency: BroadcastLatency::UnknownUntilRealAttempt,
+        };
+        let report =
+            format_benchmark_report("https://sequencer.example", 4663, &bench, false, true);
+        assert!(report.contains("read_latency=N/A"));
+        assert!(report.contains("broadcast_latency=UNKNOWN_UNTIL_REAL_ATTEMPT"));
+        assert!(report.contains("selected_read=no"));
+        assert!(report.contains("selected_send=yes"));
+        assert!(report.contains("chain_binding=configured:4663"));
+    }
+
+    #[test]
+    fn format_benchmark_report_shows_latency_stats_for_verified_read_endpoint() {
+        use crate::chain::benchmark::LatencyStats;
+        use crate::chain::endpoint::EndpointRole;
+
+        let bench = EndpointBenchmark {
+            label: Some("robinhood-rpc-1".into()),
+            role: EndpointRole::ReadWrite,
+            verification: EndpointVerification::VerifiedReadWrite,
+            connection_latency_ms: Some(20),
+            read_latency: Some(LatencyStats {
+                sample_count: 5,
+                successes: 5,
+                failures: 0,
+                timeouts: 0,
+                min_ms: Some(30),
+                max_ms: Some(52),
+                mean_ms: Some(40),
+                median_ms: Some(38),
+                p90_ms: Some(50),
+                p95_ms: Some(52),
+            }),
+            broadcast_latency: BroadcastLatency::UnknownUntilRealAttempt,
+        };
+        let report = format_benchmark_report("https://rpc.example", 4663, &bench, true, true);
+        assert!(report.contains("median=38ms"));
+        assert!(report.contains("p95=52ms"));
+        assert!(report.contains("selected_read=yes"));
     }
 }
