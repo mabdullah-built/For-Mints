@@ -160,6 +160,9 @@ pub enum PrewarmStatus {
 pub struct PrewarmReport {
     pub label: Option<String>,
     pub status: PrewarmStatus,
+    /// Latency of the rewarm probe itself, when one was actually made
+    /// (`None` for `UnavailableForSubmissionOnly`, where no call happens).
+    pub latency_ms: Option<u64>,
 }
 
 /// A complete, inspectable benchmark record for one endpoint.
@@ -182,8 +185,15 @@ pub struct EndpointBenchmark {
     pub broadcast_latency: BroadcastLatency,
     /// Result of the most recent near-T0 rewarm attempt, if any has run yet.
     /// `None` before [`super::pool::RpcPool::rewarm_all`] has ever been
-    /// called for this endpoint.
+    /// called for this endpoint. Deliberately separate from `read_latency`:
+    /// a rewarm is a single fresh liveness probe, never a replacement for
+    /// `read_latency`'s richer repeated-sample statistics (median/p90/p95)
+    /// from [`super::pool::RpcPool::benchmark_all`].
     pub prewarm_status: Option<PrewarmStatus>,
+    /// Latency of the most recent rewarm probe itself. Separate from
+    /// `read_latency`/`connection_latency_ms` — this is liveness-check
+    /// latency, not a statistical read-latency sample.
+    pub prewarm_latency_ms: Option<u64>,
 }
 
 impl EndpointBenchmark {
@@ -202,6 +212,7 @@ impl EndpointBenchmark {
                 BroadcastLatency::NotApplicable
             },
             prewarm_status: None,
+            prewarm_latency_ms: None,
         }
     }
 
@@ -490,6 +501,7 @@ mod tests {
                 BroadcastLatency::NotApplicable
             },
             prewarm_status: None,
+            prewarm_latency_ms: None,
         }
     }
 

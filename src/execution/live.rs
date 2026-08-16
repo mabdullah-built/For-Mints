@@ -37,6 +37,19 @@ pub struct LiveMintConfig {
     /// Exclusion thresholds applied when selecting read/send endpoints
     /// from benchmark data.
     pub health: HealthPolicy,
+    /// Intended lead time of the prewarm/rewarm step ahead of stage-open.
+    /// Only has a real temporal effect when `known_stage_start` is set —
+    /// see that field's docs.
+    pub prewarm_lead: StdDuration,
+    /// An authoritative stage-open instant known *before* this pipeline
+    /// starts (e.g. off-chain stage timing from an OpenSea drop's
+    /// details). When set, rewarm is scheduled as a real
+    /// `known_stage_start - prewarm_lead` checkpoint instead of firing
+    /// immediately. `None` (the default, and always the case for the pure
+    /// on-chain public engine, which only learns stage timing from the
+    /// StateCheck checkpoint) preserves Phase 3's original behavior:
+    /// rewarm runs immediately, right after benchmarking.
+    pub known_stage_start: Option<OffsetDateTime>,
 }
 
 impl Default for LiveMintConfig {
@@ -47,6 +60,8 @@ impl Default for LiveMintConfig {
             receipt_timeout: StdDuration::from_secs(60),
             benchmark: BenchmarkConfig::default(),
             health: HealthPolicy::default(),
+            prewarm_lead: StdDuration::from_secs(8),
+            known_stage_start: None,
         }
     }
 }
@@ -59,8 +74,26 @@ impl From<&ExecutionProfile> for LiveMintConfig {
             receipt_timeout: profile.receipt_timeout,
             benchmark: profile.benchmark_policy,
             health: profile.health_policy,
+            prewarm_lead: std_duration_from_time(profile.prewarm_lead),
+            known_stage_start: None,
         }
     }
+}
+
+fn std_duration_from_time(d: time::Duration) -> StdDuration {
+    d.try_into().unwrap_or(StdDuration::ZERO)
+}
+
+/// How the prewarm/rewarm step was actually scheduled for one live mint
+/// run. Reported honestly rather than silently defaulting — see
+/// [`LiveMintConfig::known_stage_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrewarmScheduling {
+    /// Ran at a real `known_stage_start - prewarm_lead` checkpoint.
+    StageRelative,
+    /// Ran immediately (right after benchmarking) because no authoritative
+    /// stage-start instant was known yet at that point in the pipeline.
+    Immediate,
 }
 
 /// Progress events emitted during [`run_live_mint`]. Purely informational —
@@ -68,7 +101,7 @@ impl From<&ExecutionProfile> for LiveMintConfig {
 #[derive(Debug, Clone)]
 pub enum LiveProgress {
     Benchmarking,
-    Prewarming,
+    Prewarming { scheduling: PrewarmScheduling },
     Checkpoint(Checkpoint),
     Waiting(SleepSegment),
     Broadcasting { send_endpoint_count: usize },
@@ -82,6 +115,7 @@ pub struct LiveMintOutcome {
     pub broadcast_summary: BroadcastSummary,
     pub receipt_state: Option<ReceiptState>,
     pub metrics: LatencyMetrics,
+    pub prewarm_scheduling: PrewarmScheduling,
 }
 
 /// Run the full live pipeline: state check, refresh, finalize (sign +
@@ -113,24 +147,46 @@ pub async fn run_live_mint(
     metrics.benchmark_ms = Some(benchmark_sw.elapsed_ms());
 
     // REWARM (near-T0 prewarm): refresh liveness on every already-connected
-    // endpoint right before selection is finalized. `prewarm_lead` names
-    // this step's intended lead time ahead of on-chain stage-open, but
-    // stage-open (`stage_start`) is only discoverable via the StateCheck
-    // checkpoint below -- there is no earlier point in this pipeline where
-    // a literal `stage_start - prewarm_lead` wait could be computed without
-    // adding a redundant preliminary on-chain read purely for scheduling.
-    // `prewarm_lead` is therefore honored by ordering: since it is the
-    // largest lead value in every [`ExecutionProfile`], rewarming runs as
-    // the very first action after benchmarking and unconditionally, before
-    // any checkpoint or wait -- the same "runs immediately, no wait yet"
-    // treatment the StateCheck/Refresh checkpoints already get for the same
-    // reason. `prewarm_ms` records wall-clock elapsed time of the
-    // concurrent-per-endpoint rewarm, not a sum of per-endpoint durations.
+    // endpoint right before selection is finalized.
     //
-    // A failed rewarm changes `is_healthy_for_read`/`is_healthy_for_send`
-    // immediately (see `EndpointBenchmark::prewarm_status`), so eligibility
-    // is always finalized before SELECT runs next -- never after.
-    on_progress(LiveProgress::Prewarming);
+    // When `config.known_stage_start` is set (e.g. the OpenSea engine
+    // learned stage timing from off-chain drop details before this
+    // pipeline started), `prewarm_lead` gets a real temporal effect: rewarm
+    // actually waits for `known_stage_start - prewarm_lead` before running.
+    // Never broadcasts anything, never signs, never re-benchmarks — it is
+    // purely a wait followed by the same safe liveness probe.
+    //
+    // When no stage-start is known yet at this point (the pure on-chain
+    // public engine only discovers it via the StateCheck checkpoint,
+    // later in this function), a real wait can't be computed without
+    // adding a redundant preliminary on-chain read purely for scheduling.
+    // `prewarm_lead` then has no literal wait to apply, so rewarm instead
+    // runs as the very first action after benchmarking and unconditionally
+    // -- the same "runs immediately, no wait yet" treatment the
+    // StateCheck/Refresh checkpoints already get for the same reason. This
+    // fallback is reported honestly via `PrewarmScheduling::Immediate`
+    // rather than silently pretending a stage-relative wait happened.
+    //
+    // `prewarm_ms` records wall-clock elapsed time of the concurrent
+    // rewarm call itself, not the wait before it and not a sum of
+    // per-endpoint durations. A failed rewarm changes
+    // `is_healthy_for_read`/`is_healthy_for_send` immediately (see
+    // `EndpointBenchmark::prewarm_status`), so eligibility is always
+    // finalized before SELECT runs next -- never after.
+    let prewarm_scheduling = if let Some(stage_start) = config.known_stage_start {
+        let target = stage_start - config.prewarm_lead;
+        let now = OffsetDateTime::now_utc();
+        sleep_until(now, target, |segment| {
+            on_progress(LiveProgress::Waiting(segment))
+        })
+        .await;
+        PrewarmScheduling::StageRelative
+    } else {
+        PrewarmScheduling::Immediate
+    };
+    on_progress(LiveProgress::Prewarming {
+        scheduling: prewarm_scheduling,
+    });
     let prewarm_sw = Stopwatch::start();
     pool.rewarm_all().await;
     metrics.prewarm_ms = Some(prewarm_sw.elapsed_ms());
@@ -275,6 +331,7 @@ pub async fn run_live_mint(
         broadcast_summary: summary,
         receipt_state,
         metrics,
+        prewarm_scheduling,
     })
 }
 
@@ -430,6 +487,8 @@ mod tests {
                 sample_delay: StdDuration::ZERO,
             },
             health: crate::chain::benchmark::HealthPolicy::default(),
+            prewarm_lead: StdDuration::ZERO,
+            known_stage_start: None,
         }
     }
 
@@ -573,6 +632,44 @@ mod tests {
             "rewarm must never send a dummy/fake transaction to a genuine submission-only endpoint"
         );
         let _ = outcome;
+    }
+
+    #[tokio::test]
+    async fn prewarm_reports_immediate_when_no_stage_start_is_known() {
+        let signer = signer();
+        let mut pool = healthy_pool(signer.address(), 1).await;
+        let req = request(signer.address());
+
+        let outcome = run_live_mint(&mut pool, &signer, &req, &tiny_config(), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.prewarm_scheduling, PrewarmScheduling::Immediate);
+    }
+
+    #[tokio::test]
+    async fn prewarm_actually_waits_for_a_real_stage_relative_checkpoint_when_stage_start_is_known()
+    {
+        let signer = signer();
+        let mut pool = healthy_pool(signer.address(), 1).await;
+        let req = request(signer.address());
+
+        let mut config = tiny_config();
+        let target = OffsetDateTime::now_utc() + time::Duration::milliseconds(80);
+        config.known_stage_start = Some(target);
+        config.prewarm_lead = StdDuration::ZERO;
+
+        let started = std::time::Instant::now();
+        let outcome = run_live_mint(&mut pool, &signer, &req, &config, |_| {})
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.prewarm_scheduling, PrewarmScheduling::StageRelative);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(60),
+            "a stage-relative prewarm checkpoint must actually wait, not just record a number (elapsed={elapsed:?})"
+        );
     }
 
     #[tokio::test]

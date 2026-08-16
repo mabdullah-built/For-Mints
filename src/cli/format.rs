@@ -319,6 +319,7 @@ mod tests {
             read_latency: None,
             broadcast_latency: BroadcastLatency::UnknownUntilRealAttempt,
             prewarm_status: None,
+            prewarm_latency_ms: None,
         };
         let report =
             format_benchmark_report("https://sequencer.example", 4663, &bench, false, true);
@@ -353,6 +354,7 @@ mod tests {
             }),
             broadcast_latency: BroadcastLatency::UnknownUntilRealAttempt,
             prewarm_status: None,
+            prewarm_latency_ms: None,
         };
         let report = format_benchmark_report("https://rpc.example", 4663, &bench, true, true);
         assert!(report.contains("median=38ms"));
