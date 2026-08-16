@@ -1,0 +1,9 @@
+.research/
+.env
+.env.*
+wallets.json
+wallets/
+*.key
+node_modules/
+dist/
+coverage/
