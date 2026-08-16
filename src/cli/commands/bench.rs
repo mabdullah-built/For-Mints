@@ -83,6 +83,20 @@ pub async fn run(args: BenchArgs) -> Result<(), KairoxError> {
                     report.role
                 );
             }
+            crate::chain::pool::ConnectOutcome::WrongChain {
+                latency_ms,
+                expected,
+                reported,
+            } => {
+                println!(
+                    "{} {masked_url}\n    role={:?} status=WRONG_CHAIN expected={expected} reported={reported} latency={latency_ms}ms",
+                    report
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| "(unlabeled)".to_string()),
+                    report.role
+                );
+            }
             crate::chain::pool::ConnectOutcome::Connected { .. } => {
                 let (client, bench) = connected
                     .next()

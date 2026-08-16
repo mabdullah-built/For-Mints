@@ -7,12 +7,12 @@
 use std::time::{Duration, Instant};
 
 use super::benchmark::{
-    BenchmarkConfig, EndpointBenchmark, HealthPolicy, benchmark_read_latency, select_read_endpoint,
-    select_send_endpoints,
+    BenchmarkConfig, EndpointBenchmark, HealthPolicy, LatencyStats, PrewarmReport, PrewarmStatus,
+    SampleOutcome, benchmark_read_latency, select_read_endpoint, select_send_endpoints,
 };
 use super::endpoint::{EndpointRole, EndpointVerification, RpcEndpoint};
 use super::registry::ChainId;
-use super::rpc::{HttpTransport, RpcClient};
+use super::rpc::{HttpTransport, RpcClient, RpcError, TransportError};
 
 /// Per-endpoint outcome of connecting (and thereby pre-warming) one entry
 /// in a [`RpcPool`].
@@ -32,6 +32,15 @@ pub enum ConnectOutcome {
     Failed {
         latency_ms: u64,
         error: String,
+    },
+    /// The endpoint responded to `eth_chainId`, but reported a chain id
+    /// other than the one it was configured under. Distinct from `Failed`
+    /// (unreachable/no response) because this is a configuration mistake on
+    /// a live endpoint, not a liveness problem.
+    WrongChain {
+        latency_ms: u64,
+        expected: ChainId,
+        reported: ChainId,
     },
 }
 
@@ -103,6 +112,17 @@ impl RpcPool {
                     connect_latencies.push(latency_ms);
                     clients.push(client);
                 }
+                Err(super::rpc::RpcError::ChainIdMismatch { expected, reported }) => {
+                    reports.push(EndpointConnectReport {
+                        label: endpoint.label.clone(),
+                        role: endpoint.role,
+                        outcome: ConnectOutcome::WrongChain {
+                            latency_ms,
+                            expected,
+                            reported,
+                        },
+                    })
+                }
                 Err(e) => reports.push(EndpointConnectReport {
                     label: endpoint.label.clone(),
                     role: endpoint.role,
@@ -120,6 +140,88 @@ impl RpcPool {
         }
 
         (pool, reports)
+    }
+
+    /// Near-T0 rewarm: refresh liveness on already-connected clients ahead
+    /// of a mint attempt.
+    ///
+    /// This is distinct from [`Self::connect_all`], which performs the
+    /// *initial* connection/discovery (DNS/TCP/TLS + the mandatory
+    /// `eth_chainId` verification that decides each endpoint's trust
+    /// classification). `rewarm_all` never changes an endpoint's trust
+    /// classification — it only refreshes liveness signal for endpoints
+    /// already admitted to the pool, using the same safe-probe rules
+    /// throughout: a fresh `eth_blockNumber` sample for read-capable
+    /// endpoints, a reused `eth_chainId` call for chain-id-verified
+    /// send-capable endpoints, and — critically — no call at all for a
+    /// genuine [`EndpointVerification::ConfiguredSendOnly`] endpoint, since
+    /// its only exposed method is `eth_sendRawTransaction` and Kairox never
+    /// sends a fake/dummy transaction merely to warm a connection.
+    ///
+    /// A successful read-capable rewarm *replaces* (not merges with) that
+    /// endpoint's `read_latency` with a fresh one-sample [`LatencyStats`] —
+    /// freshest signal wins over the richer but stale multi-sample
+    /// benchmark data from [`Self::benchmark_all`]. A failed rewarm for any
+    /// probed endpoint marks it unhealthy for both read and send selection
+    /// via `prewarm_status`, so a fresh failure is never silently reported
+    /// as healthy.
+    pub async fn rewarm_all(&mut self) -> Vec<PrewarmReport> {
+        // Every endpoint's probe runs concurrently (mirrors `connect_all`
+        // and `benchmark_all`): `run_live_mint` times this call's wall-clock
+        // duration as `prewarm_ms`, and a sum of sequential per-endpoint
+        // probe times would misrepresent that as far slower than it
+        // actually is.
+        let outcomes =
+            futures_util::future::join_all(self.clients.iter().zip(self.benchmarks.iter()).map(
+                |(client, bench)| async move {
+                    let label = client.label().map(str::to_string);
+
+                    if bench.verification == EndpointVerification::ConfiguredSendOnly {
+                        return (label, PrewarmStatus::UnavailableForSubmissionOnly, None);
+                    }
+
+                    if client.role().can_read() {
+                        let started = Instant::now();
+                        let outcome = match client.block_number().await {
+                            Ok(_) => SampleOutcome::Ok(duration_ms(started.elapsed())),
+                            Err(RpcError::Transport(TransportError::Timeout(_))) => {
+                                SampleOutcome::Timeout
+                            }
+                            Err(_) => SampleOutcome::Error,
+                        };
+                        let status = if matches!(outcome, SampleOutcome::Ok(_)) {
+                            PrewarmStatus::Warmed
+                        } else {
+                            PrewarmStatus::Failed
+                        };
+                        return (label, status, Some(LatencyStats::from_samples(&[outcome])));
+                    }
+
+                    // Chain-id-verified, send-capable, not read-capable
+                    // (`VerifiedSend`): reuse the same `eth_chainId`
+                    // capability call as a pure liveness probe. This never
+                    // re-runs trust classification -- only
+                    // `RpcClient::connect` does that.
+                    let status = match client.chain_id().await {
+                        Ok(_) => PrewarmStatus::Warmed,
+                        Err(_) => PrewarmStatus::Failed,
+                    };
+                    (label, status, None)
+                },
+            ))
+            .await;
+
+        let mut reports = Vec::with_capacity(outcomes.len());
+        for ((label, status, read_latency), bench) in
+            outcomes.into_iter().zip(self.benchmarks.iter_mut())
+        {
+            if read_latency.is_some() {
+                bench.read_latency = read_latency;
+            }
+            bench.prewarm_status = Some(status);
+            reports.push(PrewarmReport { label, status });
+        }
+        reports
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -326,13 +428,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_all_accepts_submission_only_endpoint_and_binds_it_via_chain_config() {
-        use super::super::endpoint::{EndpointVerification, RpcEndpoint};
+    async fn connect_all_rejects_genuinely_dead_sequencer_url_via_chain_config() {
+        use super::super::endpoint::RpcEndpoint;
         use url::Url;
 
-        // No eth_chainId configured at all -> simulates a genuine
-        // submission-only sequencer ingress. It is still accepted because
-        // it was explicitly configured under chain id 4663.
+        // "sequencer.example" is a reserved, guaranteed-non-resolving domain
+        // (RFC 2606) -> this is a real, end-to-end proof that a Sequencer
+        // role alone is never enough to admit a dead endpoint into the pool.
+        // It must be rejected as unreachable, never accepted as
+        // ConfiguredSendOnly, even though it was explicitly configured under
+        // chain id 4663.
         let endpoint = RpcEndpoint::new(
             Url::parse("https://sequencer.example").unwrap(),
             EndpointRole::Sequencer,
@@ -346,21 +451,25 @@ mod tests {
             4663,
             "binding comes only from the chain-scoped config call"
         );
-        assert_eq!(pool.len(), 1);
-        assert_eq!(pool.send_capable().len(), 1);
+        assert_eq!(
+            pool.len(),
+            0,
+            "a dead sequencer URL must not enter the pool"
+        );
+        assert!(pool.send_capable().is_empty());
         assert!(pool.read_capable().is_empty());
 
         match &reports[0].outcome {
-            ConnectOutcome::Connected { verification, .. } => {
-                assert_eq!(*verification, EndpointVerification::ConfiguredSendOnly);
-            }
-            other => panic!("expected Connected, got {other:?}"),
+            ConnectOutcome::Failed { .. } => {}
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn submission_only_endpoint_present_but_no_read_capable_endpoint() {
-        let sequencer_transport = MockTransport::builder().build();
+        let sequencer_transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let sequencer = RpcClient::connect(
             Box::new(sequencer_transport),
             1,
@@ -499,6 +608,90 @@ mod tests {
         assert_eq!(
             matches, 1,
             "identity comparison must uniquely match exactly the selected client"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewarm_all_warms_read_capable_endpoint_via_block_number() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x2a"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let mut pool = RpcPool::from_clients(1, vec![client]);
+
+        let reports = pool.rewarm_all().await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, PrewarmStatus::Warmed);
+        assert_eq!(
+            pool.benchmarks()[0].prewarm_status,
+            Some(PrewarmStatus::Warmed)
+        );
+        assert!(pool.benchmarks()[0].read_latency.is_some());
+    }
+
+    #[tokio::test]
+    async fn rewarm_all_marks_verified_send_endpoint_warmed_via_chain_id_reuse() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let mut pool = RpcPool::from_clients(1, vec![client]);
+
+        let reports = pool.rewarm_all().await;
+        assert_eq!(reports[0].status, PrewarmStatus::Warmed);
+        // Send-only, non-read role -> no read_latency is ever populated.
+        assert!(pool.benchmarks()[0].read_latency.is_none());
+    }
+
+    #[tokio::test]
+    async fn rewarm_all_never_probes_genuine_configured_send_only_endpoint() {
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let mut pool = RpcPool::from_clients(1, vec![client]);
+
+        let reports = pool.rewarm_all().await;
+        assert_eq!(
+            reports[0].status,
+            PrewarmStatus::UnavailableForSubmissionOnly
+        );
+        assert_eq!(
+            pool.benchmarks()[0].prewarm_status,
+            Some(PrewarmStatus::UnavailableForSubmissionOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn rewarm_all_marks_failed_read_probe_and_excludes_from_health() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .error("eth_blockNumber", -32000, "boom")
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+            .await
+            .unwrap();
+        let mut pool = RpcPool::from_clients(1, vec![client]);
+
+        let reports = pool.rewarm_all().await;
+        assert_eq!(reports[0].status, PrewarmStatus::Failed);
+        let bench = &pool.benchmarks()[0];
+        assert_eq!(bench.prewarm_status, Some(PrewarmStatus::Failed));
+        let policy = HealthPolicy::default();
+        assert!(
+            !bench.is_healthy_for_read(&policy),
+            "a fresh prewarm failure must never be silently reported as healthy"
+        );
+        assert!(
+            !bench.is_healthy_for_send(&policy),
+            "a fresh prewarm failure must exclude the endpoint from send selection too"
         );
     }
 }

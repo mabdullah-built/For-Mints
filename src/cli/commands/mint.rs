@@ -238,6 +238,7 @@ fn read_stdin_confirmation() -> Option<String> {
 fn report_progress(progress: LiveProgress, receipt_pending_announced: &mut bool) {
     match progress {
         LiveProgress::Benchmarking => println!("[benchmark] sampling endpoint latency"),
+        LiveProgress::Prewarming => println!("[prewarm] rewarming connections"),
         LiveProgress::Checkpoint(Checkpoint::StateCheck) => println!("[checkpoint] state check"),
         LiveProgress::Checkpoint(Checkpoint::Refresh) => {
             println!("[checkpoint] refresh (nonce/fee/balance/supply)")

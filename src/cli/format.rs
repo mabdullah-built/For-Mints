@@ -106,6 +106,17 @@ pub fn format_endpoint_status(
                 yes_no(role.can_send()),
             )
         }
+        ConnectOutcome::WrongChain {
+            latency_ms,
+            expected,
+            reported,
+        } => {
+            format!(
+                "{label} {masked_url}\n    role={role:?} read={} send={} chain_binding=configured:{chain_id} status=WRONG_CHAIN expected={expected} reported={reported} latency={latency_ms}ms",
+                yes_no(role.can_read()),
+                yes_no(role.can_send()),
+            )
+        }
     }
 }
 
@@ -250,6 +261,38 @@ mod tests {
     }
 
     #[test]
+    fn format_endpoint_status_distinguishes_wrong_chain_from_unreachable() {
+        let wrong_chain = format_endpoint_status(
+            "mismatched",
+            "https://rpc.example",
+            EndpointRole::ReadOnly,
+            4663,
+            &ConnectOutcome::WrongChain {
+                latency_ms: 15,
+                expected: 4663,
+                reported: 1,
+            },
+        );
+        assert!(wrong_chain.contains("status=WRONG_CHAIN"));
+        assert!(wrong_chain.contains("expected=4663"));
+        assert!(wrong_chain.contains("reported=1"));
+        assert!(!wrong_chain.contains("status=UNREACHABLE"));
+
+        let unreachable = format_endpoint_status(
+            "dead",
+            "https://dead.example",
+            EndpointRole::SendOnly,
+            4663,
+            &ConnectOutcome::Failed {
+                latency_ms: 30,
+                error: "network error".into(),
+            },
+        );
+        assert!(unreachable.contains("status=UNREACHABLE"));
+        assert!(!unreachable.contains("WRONG_CHAIN"));
+    }
+
+    #[test]
     fn format_endpoint_status_never_labels_submission_only_as_matches() {
         let submission_only = format_endpoint_status(
             "seq",
@@ -275,6 +318,7 @@ mod tests {
             connection_latency_ms: Some(8),
             read_latency: None,
             broadcast_latency: BroadcastLatency::UnknownUntilRealAttempt,
+            prewarm_status: None,
         };
         let report =
             format_benchmark_report("https://sequencer.example", 4663, &bench, false, true);
@@ -308,6 +352,7 @@ mod tests {
                 p95_ms: Some(52),
             }),
             broadcast_latency: BroadcastLatency::UnknownUntilRealAttempt,
+            prewarm_status: None,
         };
         let report = format_benchmark_report("https://rpc.example", 4663, &bench, true, true);
         assert!(report.contains("median=38ms"));

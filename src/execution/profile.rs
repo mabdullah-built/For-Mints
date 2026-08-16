@@ -30,9 +30,14 @@ pub struct ExecutionProfile {
     pub receipt_timeout: StdDuration,
 }
 
-/// Robinhood Chain (id 4663) is Phase 3's priority chain: direct sequencer
-/// submission is expected to be available and fast, so benchmarking is
-/// cheap (fewer, quicker samples) and the scheduler leads are tighter.
+/// Robinhood Chain (id 4663) is Phase 3's priority chain. Its scheduler
+/// leads, sample counts, and prewarm lead below are initial, provisional
+/// defaults reflecting the assumption that direct sequencer submission is
+/// available and fast -- they have never been measured against real
+/// Robinhood RPC/sequencer infrastructure (no such infrastructure has been
+/// benchmarked in this environment), and must be treated as a starting
+/// point to validate and tune once real endpoints are available, not as an
+/// empirically optimized result.
 fn robinhood() -> ExecutionProfile {
     ExecutionProfile {
         chain_id: 4663,

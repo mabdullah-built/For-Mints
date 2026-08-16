@@ -135,6 +135,33 @@ pub enum BroadcastLatency {
     UnknownUntilRealAttempt,
 }
 
+/// The outcome of a near-T0 rewarm attempt for one endpoint (see
+/// [`super::pool::RpcPool::rewarm_all`]). Kept separate from
+/// [`BroadcastLatency`]/`read_latency` because rewarming is a liveness
+/// refresh, not a fresh statistical sample set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrewarmStatus {
+    /// A safe capability probe (`eth_blockNumber` for read-capable
+    /// endpoints, `eth_chainId` for chain-id-verified send-capable
+    /// endpoints) succeeded.
+    Warmed,
+    /// A genuine [`EndpointVerification::ConfiguredSendOnly`] endpoint that
+    /// exposes only `eth_sendRawTransaction` was intentionally left alone —
+    /// Kairox never sends a fake/dummy transaction merely to warm a
+    /// connection.
+    UnavailableForSubmissionOnly,
+    /// The safe capability probe was attempted and failed.
+    Failed,
+}
+
+/// One endpoint's outcome from a call to
+/// [`super::pool::RpcPool::rewarm_all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrewarmReport {
+    pub label: Option<String>,
+    pub status: PrewarmStatus,
+}
+
 /// A complete, inspectable benchmark record for one endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointBenchmark {
@@ -153,6 +180,10 @@ pub struct EndpointBenchmark {
     /// not permit reads at all — never a fabricated value.
     pub read_latency: Option<LatencyStats>,
     pub broadcast_latency: BroadcastLatency,
+    /// Result of the most recent near-T0 rewarm attempt, if any has run yet.
+    /// `None` before [`super::pool::RpcPool::rewarm_all`] has ever been
+    /// called for this endpoint.
+    pub prewarm_status: Option<PrewarmStatus>,
 }
 
 impl EndpointBenchmark {
@@ -170,6 +201,7 @@ impl EndpointBenchmark {
             } else {
                 BroadcastLatency::NotApplicable
             },
+            prewarm_status: None,
         }
     }
 
@@ -178,6 +210,9 @@ impl EndpointBenchmark {
     /// (impossible) latency data attached to them.
     pub fn is_healthy_for_read(&self, policy: &HealthPolicy) -> bool {
         if !self.role.can_read() {
+            return false;
+        }
+        if self.prewarm_status == Some(PrewarmStatus::Failed) {
             return false;
         }
         match &self.read_latency {
@@ -198,6 +233,9 @@ impl EndpointBenchmark {
     /// excluded even from sending.
     pub fn is_healthy_for_send(&self, policy: &HealthPolicy) -> bool {
         if !self.role.can_send() {
+            return false;
+        }
+        if self.prewarm_status == Some(PrewarmStatus::Failed) {
             return false;
         }
         match &self.read_latency {
@@ -451,6 +489,7 @@ mod tests {
             } else {
                 BroadcastLatency::NotApplicable
             },
+            prewarm_status: None,
         }
     }
 
@@ -563,7 +602,9 @@ mod tests {
 
     #[tokio::test]
     async fn select_send_endpoints_includes_configured_send_only_without_read_data() {
-        let transport = MockTransport::builder().build();
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let configured_send_only = RpcClient::connect(
             Box::new(transport),
             1,

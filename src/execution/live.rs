@@ -68,6 +68,7 @@ impl From<&ExecutionProfile> for LiveMintConfig {
 #[derive(Debug, Clone)]
 pub enum LiveProgress {
     Benchmarking,
+    Prewarming,
     Checkpoint(Checkpoint),
     Waiting(SleepSegment),
     Broadcasting { send_endpoint_count: usize },
@@ -110,6 +111,29 @@ pub async fn run_live_mint(
     let benchmark_sw = Stopwatch::start();
     pool.benchmark_all(&config.benchmark).await;
     metrics.benchmark_ms = Some(benchmark_sw.elapsed_ms());
+
+    // REWARM (near-T0 prewarm): refresh liveness on every already-connected
+    // endpoint right before selection is finalized. `prewarm_lead` names
+    // this step's intended lead time ahead of on-chain stage-open, but
+    // stage-open (`stage_start`) is only discoverable via the StateCheck
+    // checkpoint below -- there is no earlier point in this pipeline where
+    // a literal `stage_start - prewarm_lead` wait could be computed without
+    // adding a redundant preliminary on-chain read purely for scheduling.
+    // `prewarm_lead` is therefore honored by ordering: since it is the
+    // largest lead value in every [`ExecutionProfile`], rewarming runs as
+    // the very first action after benchmarking and unconditionally, before
+    // any checkpoint or wait -- the same "runs immediately, no wait yet"
+    // treatment the StateCheck/Refresh checkpoints already get for the same
+    // reason. `prewarm_ms` records wall-clock elapsed time of the
+    // concurrent-per-endpoint rewarm, not a sum of per-endpoint durations.
+    //
+    // A failed rewarm changes `is_healthy_for_read`/`is_healthy_for_send`
+    // immediately (see `EndpointBenchmark::prewarm_status`), so eligibility
+    // is always finalized before SELECT runs next -- never after.
+    on_progress(LiveProgress::Prewarming);
+    let prewarm_sw = Stopwatch::start();
+    pool.rewarm_all().await;
+    metrics.prewarm_ms = Some(prewarm_sw.elapsed_ms());
 
     // SELECT: endpoint selection is finalized here, before any checkpoint
     // runs and well before T=0 — nothing after this point re-ranks or
@@ -461,7 +485,10 @@ mod tests {
         chain_id: u64,
         label: &str,
     ) -> (RpcClient, crate::chain::mock::CaptureHandle) {
-        let transport = MockTransport::builder().echo_raw_transaction_hash().build();
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .echo_raw_transaction_hash()
+            .build();
         let capture = transport.capture_handle();
         let client =
             RpcClient::connect(Box::new(transport), chain_id, role, Some(label.to_string()))
@@ -523,6 +550,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewarm_never_sends_a_dummy_transaction_to_a_submission_only_endpoint() {
+        let signer = signer();
+        let mut pool_clients = healthy_clients(signer.address(), 1).await;
+        let (sequencer_client, sequencer_capture) =
+            submission_only_client(EndpointRole::Sequencer, 1, "robinhood-sequencer").await;
+        pool_clients.push(sequencer_client);
+        let mut pool = RpcPool::from_clients(1, pool_clients);
+
+        let req = request(signer.address());
+        let outcome = run_live_mint(&mut pool, &signer, &req, &tiny_config(), |_| {})
+            .await
+            .unwrap();
+
+        // The submission-only endpoint must see exactly one
+        // `eth_sendRawTransaction` call -- the real, prebuilt broadcast at
+        // T=0 -- and nothing extra from the prewarm step trying to fake a
+        // liveness check on it.
+        assert_eq!(
+            sequencer_capture.prebuilt_bodies().len(),
+            1,
+            "rewarm must never send a dummy/fake transaction to a genuine submission-only endpoint"
+        );
+        let _ = outcome;
+    }
+
+    #[tokio::test]
     async fn metrics_are_populated_for_benchmark_selection_and_scheduler_accuracy() {
         let signer = signer();
         let mut pool = healthy_pool(signer.address(), 1).await;
@@ -533,6 +586,10 @@ mod tests {
             .unwrap();
 
         assert!(outcome.metrics.benchmark_ms.is_some());
+        assert!(
+            outcome.metrics.prewarm_ms.is_some(),
+            "prewarm_ms must be actually populated by a real rewarm step, not left dead"
+        );
         assert!(outcome.metrics.endpoint_selection_ms.is_some());
         assert!(outcome.metrics.broadcast_prepare_ms.is_some());
         assert!(outcome.metrics.dispatch_ms.is_some());

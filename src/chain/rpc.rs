@@ -233,23 +233,74 @@ impl std::fmt::Debug for RpcClient {
     }
 }
 
+/// Standard JSON-RPC error code for "the method does not exist / is not
+/// available" (EIP-1474 / the original JSON-RPC 2.0 spec). This is the
+/// clearest, structured signal that an endpoint is *responsive* but simply
+/// doesn't implement `eth_chainId` — as opposed to being unreachable.
+const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
+
+/// Whether `error` is responsive evidence that the endpoint explicitly does
+/// not support the method just called, rather than evidence the endpoint
+/// couldn't be reached at all.
+///
+/// Only [`RpcError::RpcReturnedError`] — a well-formed JSON-RPC error
+/// envelope the endpoint actually sent back — can indicate this. Every
+/// other `RpcError` variant (`Transport::Network` for DNS/TCP/TLS
+/// failures, `Transport::Timeout`, `Transport::InvalidJson` for
+/// non-JSON/garbage bodies, or `MalformedResponse` for JSON that isn't a
+/// valid JSON-RPC envelope) gives no proof the endpoint is alive, and must
+/// never be treated as "responsive but unsupported."
+///
+/// The standard code (`-32601`) is checked first. A small, explicitly
+/// documented set of message substrings is also accepted, because some
+/// production nodes return a non-standard code (commonly `-32000`) with a
+/// message that still unambiguously says the method is unknown — this is a
+/// narrow, conservative fallback, not general string matching on arbitrary
+/// errors.
+fn indicates_unsupported_method(error: &RpcError) -> bool {
+    match error {
+        RpcError::RpcReturnedError { code, message } => {
+            *code == JSON_RPC_METHOD_NOT_FOUND || message_indicates_unsupported_method(message)
+        }
+        _ => false,
+    }
+}
+
+fn message_indicates_unsupported_method(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("method not found")
+        || lower.contains("method not supported")
+        || lower.contains("unsupported method")
+        // Erigon and some other production nodes phrase this as
+        // "the method X does not exist/is not available" under a
+        // non-standard error code.
+        || (lower.contains("does not exist") && lower.contains("method"))
+}
+
 impl RpcClient {
     /// Connect and establish trust in the endpoint, according to its role:
     ///
     /// - Read-capable roles (`ReadWrite`, `ReadOnly`, `Public`) **must**
-    ///   report a matching `eth_chainId`. Any failure (transport error,
-    ///   malformed response, or mismatch) rejects the endpoint outright —
-    ///   this path is unchanged from before and never weakened.
+    ///   report a matching `eth_chainId`. Any failure whatsoever — network,
+    ///   timeout, malformed body, or an RPC error of any kind — rejects the
+    ///   endpoint outright. There is no degraded path for these roles.
     /// - Send-only-capable roles (`SendOnly`, `Sequencer`, `Private`) are
-    ///   also verified via `eth_chainId` when it succeeds, and rejected on
-    ///   a *mismatch* exactly like a read-capable endpoint. But if the call
-    ///   itself fails (the endpoint simply doesn't implement it — common
-    ///   for submission-only sequencer/relay ingress), the endpoint is
-    ///   still accepted, marked [`EndpointVerification::ConfiguredSendOnly`],
-    ///   and bound to `expected_chain_id` purely through the fact that it
-    ///   was configured under that exact chain id. It is never usable for
-    ///   any state read (enforced at each read method below, not just by
-    ///   caller discipline).
+    ///   verified via `eth_chainId` exactly like a read-capable endpoint
+    ///   when it succeeds, and rejected on a *mismatch* the same way. The
+    ///   only degraded path is narrow and specific: the endpoint must have
+    ///   actually **responded** with a well-formed JSON-RPC error that
+    ///   [`indicates_unsupported_method`] recognizes as "method not
+    ///   supported" (see that function for exactly what qualifies). Only
+    ///   then is the endpoint accepted as
+    ///   [`EndpointVerification::ConfiguredSendOnly`], bound to
+    ///   `expected_chain_id` purely through having been configured under
+    ///   that exact chain id. A DNS failure, TCP refusal, TLS failure,
+    ///   connection timeout, or unparseable response is **not** evidence
+    ///   of anything except "we could not talk to this endpoint" — those
+    ///   always reject, for every role, with no exception.
+    ///
+    /// A `ConfiguredSendOnly` endpoint is never usable for any state read
+    /// (enforced at each read method below, not just by caller discipline).
     pub async fn connect(
         transport: Box<dyn Transport>,
         expected_chain_id: ChainId,
@@ -281,19 +332,22 @@ impl RpcClient {
                 expected: expected_chain_id,
                 reported,
             }),
-            Err(e) if role.can_read() => {
-                // Read-capable roles have no degraded path: chain-id
-                // verification is mandatory for them, full stop.
-                Err(e)
+            Err(e) => {
+                let eligible_for_submission_only =
+                    !role.can_read() && role.can_send() && indicates_unsupported_method(&e);
+                if eligible_for_submission_only {
+                    client.verification = EndpointVerification::ConfiguredSendOnly;
+                    Ok(client)
+                } else {
+                    // Read-capable roles never get a degraded path; and for
+                    // send-only-capable roles, anything short of a
+                    // responsive "method not supported" reply (network
+                    // failure, timeout, malformed body, or a JSON-RPC error
+                    // that doesn't clearly mean "unsupported method") is
+                    // simply unproven — reject rather than guess.
+                    Err(e)
+                }
             }
-            Err(_) if role.can_send() => {
-                // Submission-only role with unsupported/failing eth_chainId:
-                // accept it, but only as chain-bound-by-configuration, never
-                // as independently chain-verified.
-                client.verification = EndpointVerification::ConfiguredSendOnly;
-                Ok(client)
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -925,14 +979,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_only_endpoint_with_unsupported_chain_id_is_accepted_as_configured() {
-        // No "eth_chainId" response configured at all -> the transport
-        // reports a network error, simulating a submission-only endpoint
-        // that simply doesn't implement eth_chainId.
-        let transport = MockTransport::builder().build();
+    async fn send_only_endpoint_with_responsive_method_not_found_is_accepted_as_configured() {
+        // The endpoint DID respond, with a well-formed JSON-RPC error
+        // saying the method is unsupported -> this is exactly the
+        // "responsive but doesn't implement eth_chainId" case that must be
+        // accepted as ConfiguredSendOnly.
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
             .await
-            .expect("submission-only endpoints must still be accepted");
+            .expect("a responsive submission-only endpoint must still be accepted");
         assert_eq!(
             client.verification(),
             EndpointVerification::ConfiguredSendOnly
@@ -941,15 +998,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequencer_endpoint_with_unsupported_chain_id_is_accepted_as_configured() {
-        let transport = MockTransport::builder().build();
+    async fn sequencer_endpoint_with_responsive_method_not_found_is_accepted_as_configured() {
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let client = RpcClient::connect(Box::new(transport), 4663, EndpointRole::Sequencer, None)
             .await
-            .expect("sequencer endpoints must still be accepted without eth_chainId");
+            .expect("a responsive sequencer must still be accepted without eth_chainId");
         assert_eq!(
             client.verification(),
             EndpointVerification::ConfiguredSendOnly
         );
+    }
+
+    #[tokio::test]
+    async fn private_endpoint_with_non_standard_unsupported_method_message_is_accepted_as_configured()
+     {
+        // Some nodes return a non-standard code with a message that still
+        // clearly says the method is unknown -- the narrow, documented
+        // message-substring fallback must catch this too.
+        let transport = MockTransport::builder()
+            .error(
+                "eth_chainId",
+                -32000,
+                "the method eth_chainId does not exist/is not available",
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::Private, None)
+            .await
+            .expect(
+                "a non-standard but unambiguous 'unsupported method' response must still qualify",
+            );
+        assert_eq!(
+            client.verification(),
+            EndpointVerification::ConfiguredSendOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn send_only_endpoint_with_network_failure_is_rejected_not_accepted() {
+        // No "eth_chainId" response configured at all -> the mock reports a
+        // network-style transport failure. This must NEVER be treated as
+        // "responsive but unsupported" -- a genuinely dead endpoint must be
+        // rejected outright, even for a send-only-capable role.
+        let transport = MockTransport::builder().build();
+        let err = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .expect_err("an unreachable endpoint must never become ConfiguredSendOnly");
+        assert!(matches!(
+            err,
+            RpcError::Transport(TransportError::Network(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sequencer_endpoint_with_connection_timeout_is_rejected_not_accepted() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .delay("eth_chainId", Duration::from_millis(50))
+            .build()
+            .with_call_timeout(Duration::from_millis(1));
+        let err = RpcClient::connect(Box::new(transport), 4663, EndpointRole::Sequencer, None)
+            .await
+            .expect_err("a connection timeout must never become ConfiguredSendOnly");
+        assert!(matches!(
+            err,
+            RpcError::Transport(TransportError::Timeout(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sequencer_endpoint_with_malformed_json_is_rejected_not_accepted() {
+        let transport = MockTransport::builder()
+            .respond(
+                "eth_chainId",
+                json!({"this is not": "a valid envelope shape"}),
+            )
+            .build();
+        // eth_chainId responding with a JSON object lacking "result"/"error"
+        // is treated as MalformedResponse by RpcClient::raw_call, not as a
+        // structured "method not found" -- must fail closed, not qualify
+        // for ConfiguredSendOnly.
+        let err = RpcClient::connect(Box::new(transport), 4663, EndpointRole::Sequencer, None)
+            .await
+            .expect_err("a malformed response must never become ConfiguredSendOnly");
+        assert!(matches!(err, RpcError::MalformedResponse(_)));
+    }
+
+    #[test]
+    fn indicates_unsupported_method_rejects_generic_rpc_errors() {
+        let err = RpcError::RpcReturnedError {
+            code: -32000,
+            message: "execution reverted".into(),
+        };
+        assert!(!indicates_unsupported_method(&err));
+    }
+
+    #[test]
+    fn indicates_unsupported_method_accepts_standard_code() {
+        let err = RpcError::RpcReturnedError {
+            code: JSON_RPC_METHOD_NOT_FOUND,
+            message: "anything".into(),
+        };
+        assert!(indicates_unsupported_method(&err));
     }
 
     #[tokio::test]
@@ -995,7 +1146,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_send_only_client_rejects_eth_call() {
-        let transport = MockTransport::builder().build();
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
             .await
             .unwrap();
@@ -1014,7 +1167,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_send_only_client_rejects_transaction_count() {
-        let transport = MockTransport::builder().build();
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::Sequencer, None)
             .await
             .unwrap();
@@ -1030,7 +1185,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_send_only_client_rejects_priority_fee_and_balance_and_receipt() {
-        let transport = MockTransport::builder().build();
+        let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
+            .build();
         let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::Private, None)
             .await
             .unwrap();
@@ -1065,6 +1222,7 @@ mod tests {
     async fn configured_send_only_client_can_still_broadcast() {
         let expected = B256::repeat_byte(0x55);
         let transport = MockTransport::builder()
+            .error("eth_chainId", -32601, "Method not found")
             .respond(
                 "eth_sendRawTransaction",
                 json!(format!("0x{}", hex::encode(expected))),
