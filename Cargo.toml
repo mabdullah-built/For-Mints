@@ -20,10 +20,12 @@ alloy-sol-types = "1.6.1"
 async-trait = "0.1.92"
 clap = { version = "4.6.6", features = ["derive"] }
 dotenvy = "0.15.7"
+futures-util = "0.3.34"
 hex = "0.4.3"
 k256 = { version = "0.14.0", features = ["ecdsa"] }
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "http2"] }
+rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"

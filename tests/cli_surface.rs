@@ -1,7 +1,7 @@
-//! Integration tests that exercise the compiled `kairox` binary directly,
-//! covering the CLI-level safety guarantees Phase 1 must hold: `--send` is
-//! rejected, no command ever broadcasts, and basic argument validation
-//! works end-to-end.
+//! Integration tests that exercise the compiled `kairox` binary directly:
+//! dry-run commands never broadcast, `--send` still requires real
+//! connectivity/confirmation rather than bypassing validation, and basic
+//! argument validation works end-to-end.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -11,12 +11,12 @@ fn kairox() -> Command {
 }
 
 #[test]
-fn doctor_runs_and_reports_dry_run_enabled() {
+fn doctor_runs_and_reports_dry_run_default() {
     kairox()
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Dry-run mode: ENABLED"))
+        .stdout(predicate::str::contains("Dry-run mode: DEFAULT"))
         .stdout(predicate::str::contains("Kairox v"));
 }
 
@@ -41,27 +41,29 @@ fn clock_runs_and_reports_utc_time() {
 }
 
 #[test]
-fn mint_rejects_send_flag_with_clear_message_and_nonzero_exit() {
+fn mint_dry_run_still_broadcasts_nothing() {
+    // No --rpc-url and no KAIROX_RPC_* configured: dry-run `mint` (no
+    // --send) must fail on the same "no RPC endpoint configured" path as
+    // `plan` — it never reaches a send-capable codepath, confirming the
+    // dry-run pipeline is architecturally distinct from the live one.
     kairox()
+        .env_remove("KAIROX_RPC_1_0_URL")
         .args([
             "mint",
             "0x000000000000000000000000000000000000c0de",
             "--wallet",
             "0x0000000000000000000000000000000000000aaa",
-            "--send",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "broadcasting is not enabled in Phase 1",
-        ));
+        .stderr(predicate::str::contains("no RPC endpoint configured"));
 }
 
 #[test]
-fn mint_send_rejection_happens_before_any_rpc_is_required() {
-    // No --rpc-url and no KAIROX_RPC_* configured: if --send rejection
-    // happened *after* attempting to connect, this would instead fail with
-    // an RPC/config error rather than the dedicated --send message.
+fn mint_send_without_rpc_configuration_fails_closed_not_silently() {
+    // --send is a real feature in Phase 2, but it still requires genuine
+    // connectivity to build a live plan — it must not bypass validation or
+    // fall back to any default.
     kairox()
         .env_remove("KAIROX_RPC_1_0_URL")
         .args([
@@ -70,12 +72,11 @@ fn mint_send_rejection_happens_before_any_rpc_is_required() {
             "--wallet",
             "0x0000000000000000000000000000000000000aaa",
             "--send",
+            "--yes",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "broadcasting is not enabled in Phase 1",
-        ));
+        .stderr(predicate::str::contains("no RPC endpoint configured"));
 }
 
 #[test]
@@ -133,7 +134,7 @@ fn plan_requires_wallet_argument() {
 }
 
 #[test]
-fn help_lists_all_phase1_commands() {
+fn help_lists_all_commands() {
     kairox()
         .arg("--help")
         .assert()
@@ -142,5 +143,16 @@ fn help_lists_all_phase1_commands() {
         .stdout(predicate::str::contains("clock"))
         .stdout(predicate::str::contains("inspect"))
         .stdout(predicate::str::contains("plan"))
-        .stdout(predicate::str::contains("mint"));
+        .stdout(predicate::str::contains("mint"))
+        .stdout(predicate::str::contains("bench"));
+}
+
+#[test]
+fn mint_help_documents_send_and_yes_flags() {
+    kairox()
+        .args(["mint", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--send"))
+        .stdout(predicate::str::contains("--yes"));
 }

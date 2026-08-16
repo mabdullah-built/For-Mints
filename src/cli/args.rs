@@ -8,7 +8,7 @@ use url::Url;
 #[command(
     name = "kairox",
     version,
-    about = "Independent public SeaDrop mint execution CLI (Phase 1: foundation + dry-run planning; no broadcast path exists yet)"
+    about = "Independent public SeaDrop mint execution CLI (Phase 2: pre-signing + multi-RPC broadcast; dry-run by default, --send opts into live broadcast)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,8 +25,10 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Produce a dry-run execution plan for a public mint.
     Plan(PlanArgs),
-    /// Run the full validation/planning pipeline, then stop. Phase 1 is dry-run only.
+    /// Dry run by default. Pass --send (with --yes, or interactive confirmation) to broadcast live.
     Mint(MintArgs),
+    /// Connect to every configured RPC endpoint for a chain and report latency/role/capability. Never signs or broadcasts.
+    Bench(BenchArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -59,7 +61,7 @@ pub struct PlanArgs {
     pub collection: Address,
     #[command(flatten)]
     pub chain_args: ChainArgs,
-    /// Wallet address to plan a mint for. A plain address only — Phase 1 never requires or accepts a private key.
+    /// Wallet address to plan a mint for. A plain address only — never a private key (that is loaded separately via KAIROX_SIGNING_KEY or interactive prompt, only when --send is used).
     #[arg(long)]
     pub wallet: Address,
     /// Number of tokens to mint.
@@ -92,7 +94,31 @@ pub struct PlanArgs {
 pub struct MintArgs {
     #[command(flatten)]
     pub plan_args: PlanArgs,
-    /// Broadcast the transaction. NOT SUPPORTED in Phase 1 — supplying this flag is rejected.
+    /// Broadcast the transaction live. Without this flag, `mint` is always dry-run only.
     #[arg(long)]
     pub send: bool,
+    /// Skip the interactive "type yes to continue" confirmation prompt. Only meaningful with --send.
+    #[arg(long)]
+    pub yes: bool,
+    /// Lead time (seconds) before the state-check checkpoint. Default: 10.
+    #[arg(long, default_value_t = 10.0)]
+    pub lead_state_check_secs: f64,
+    /// Lead time (seconds) before the refresh checkpoint. Default: 3.
+    #[arg(long, default_value_t = 3.0)]
+    pub lead_refresh_secs: f64,
+    /// Lead time (seconds) before the finalize (sign + serialize) checkpoint. Default: 1.
+    #[arg(long, default_value_t = 1.0)]
+    pub lead_finalize_secs: f64,
+    /// How long to poll for a receipt before giving up, in seconds. Default: 60.
+    #[arg(long, default_value_t = 60)]
+    pub receipt_timeout_secs: u64,
+    /// Delay between receipt polls, in milliseconds. Default: 750.
+    #[arg(long, default_value_t = 750)]
+    pub receipt_poll_interval_ms: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct BenchArgs {
+    #[command(flatten)]
+    pub chain_args: ChainArgs,
 }

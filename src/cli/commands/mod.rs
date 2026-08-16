@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod clock;
 pub mod doctor;
 pub mod inspect;

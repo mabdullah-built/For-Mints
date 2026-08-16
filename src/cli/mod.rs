@@ -1,7 +1,7 @@
-//! CLI entry point: argument parsing and dispatch. Every command in Phase 1
-//! is either purely informational (`doctor`, `clock`) or dry-run only
-//! (`inspect`, `plan`, `mint`) — no code path in this module broadcasts a
-//! transaction.
+//! CLI entry point: argument parsing and dispatch. `doctor`, `clock`,
+//! `inspect`, `plan`, and `bench` never broadcast anything. `mint` is
+//! dry-run by default; only `mint --send` (with confirmation) reaches the
+//! live broadcast pipeline in [`crate::execution::live`].
 
 pub mod args;
 pub mod commands;
@@ -33,6 +33,7 @@ async fn run_with(command: Command) -> i32 {
         Command::Inspect(args) => commands::inspect::run(args).await,
         Command::Plan(args) => commands::plan::run(args).await,
         Command::Mint(args) => commands::mint::run(args).await,
+        Command::Bench(args) => commands::bench::run(args).await,
     };
 
     match result {

@@ -6,13 +6,14 @@
 
 use std::time::Duration;
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use thiserror::Error;
 use url::Url;
 
 use crate::execution::errors::{Categorize, ErrorCategory};
+use crate::protocol::logs::RawLog;
 
 use super::registry::ChainId;
 
@@ -116,6 +117,15 @@ pub struct BlockHeader {
     pub number: u64,
     pub timestamp: u64,
     pub base_fee_per_gas: Option<u128>,
+}
+
+/// The fields Kairox needs from `eth_getTransactionReceipt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionReceipt {
+    pub transaction_hash: B256,
+    pub status_success: bool,
+    pub block_number: u64,
+    pub logs: Vec<RawLog>,
 }
 
 /// A single endpoint, wrapped with the chain id it has been verified
@@ -305,6 +315,150 @@ impl RpcClient {
             .await?;
         Self::hex_to_u64(&result, "estimateGas")
     }
+
+    /// `eth_getBalance(address, "latest")`.
+    pub async fn get_balance(&self, address: Address) -> Result<U256, RpcError> {
+        let result = self
+            .raw_call("eth_getBalance", json!([address.to_string(), "latest"]))
+            .await?;
+        let s = result
+            .as_str()
+            .ok_or_else(|| RpcError::MalformedResponse("balance was not a string".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        U256::from_str_radix(s, 16)
+            .map_err(|e| RpcError::MalformedResponse(format!("balance was not valid hex: {e}")))
+    }
+
+    /// `eth_sendRawTransaction`. Returns the transaction hash the node
+    /// reports accepting. Callers must compare this against the locally
+    /// computed hash — never assume the two match.
+    pub async fn send_raw_transaction(&self, raw: &Bytes) -> Result<B256, RpcError> {
+        let result = self
+            .raw_call(
+                "eth_sendRawTransaction",
+                json!([format!("0x{}", hex::encode(raw))]),
+            )
+            .await?;
+        let s = result
+            .as_str()
+            .ok_or_else(|| RpcError::MalformedResponse("tx hash was not a string".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let bytes = hex::decode(s)
+            .map_err(|e| RpcError::MalformedResponse(format!("tx hash was not valid hex: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(RpcError::MalformedResponse(format!(
+                "tx hash had {} bytes, expected 32",
+                bytes.len()
+            )));
+        }
+        Ok(B256::from_slice(&bytes))
+    }
+
+    /// `eth_getTransactionReceipt`. Returns `Ok(None)` while the
+    /// transaction is still pending (a `null` result is not an error).
+    pub async fn get_transaction_receipt(
+        &self,
+        tx_hash: B256,
+    ) -> Result<Option<TransactionReceipt>, RpcError> {
+        let result = self
+            .raw_call(
+                "eth_getTransactionReceipt",
+                json!([format!("0x{}", hex::encode(tx_hash))]),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let obj = result
+            .as_object()
+            .ok_or_else(|| RpcError::MalformedResponse("receipt was not an object".into()))?;
+
+        let reported_hash = obj
+            .get("transactionHash")
+            .ok_or_else(|| RpcError::MalformedResponse("receipt missing transactionHash".into()))?;
+        let reported_hash = Self::hex_to_b256(reported_hash, "transactionHash")?;
+
+        let status = obj
+            .get("status")
+            .ok_or_else(|| RpcError::MalformedResponse("receipt missing status".into()))?;
+        let status_success = Self::hex_to_u64(status, "status")? == 1;
+
+        let block_number = obj
+            .get("blockNumber")
+            .ok_or_else(|| RpcError::MalformedResponse("receipt missing blockNumber".into()))?;
+        let block_number = Self::hex_to_u64(block_number, "blockNumber")?;
+
+        let logs_value = obj
+            .get("logs")
+            .ok_or_else(|| RpcError::MalformedResponse("receipt missing logs".into()))?;
+        let logs_array = logs_value
+            .as_array()
+            .ok_or_else(|| RpcError::MalformedResponse("receipt logs was not an array".into()))?;
+        let logs = logs_array
+            .iter()
+            .map(Self::decode_log)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(TransactionReceipt {
+            transaction_hash: reported_hash,
+            status_success,
+            block_number,
+            logs,
+        }))
+    }
+
+    fn hex_to_b256(value: &Value, field: &str) -> Result<B256, RpcError> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| RpcError::MalformedResponse(format!("{field} was not a string")))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let bytes = hex::decode(s)
+            .map_err(|e| RpcError::MalformedResponse(format!("{field} was not valid hex: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(RpcError::MalformedResponse(format!(
+                "{field} had {} bytes, expected 32",
+                bytes.len()
+            )));
+        }
+        Ok(B256::from_slice(&bytes))
+    }
+
+    fn decode_log(value: &Value) -> Result<RawLog, RpcError> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| RpcError::MalformedResponse("log was not an object".into()))?;
+
+        let address = obj
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::MalformedResponse("log missing address".into()))?;
+        let address = address
+            .parse::<Address>()
+            .map_err(|e| RpcError::MalformedResponse(format!("log address invalid: {e}")))?;
+
+        let topics_array = obj
+            .get("topics")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RpcError::MalformedResponse("log missing topics array".into()))?;
+        let topics = topics_array
+            .iter()
+            .map(|t| Self::hex_to_b256(t, "log topic"))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let data_str = obj
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::MalformedResponse("log missing data".into()))?;
+        let data_str = data_str.strip_prefix("0x").unwrap_or(data_str);
+        let data = hex::decode(data_str)
+            .map_err(|e| RpcError::MalformedResponse(format!("log data was not valid hex: {e}")))?;
+
+        Ok(RawLog {
+            address,
+            topics,
+            data: Bytes::from(data),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -419,5 +573,153 @@ mod tests {
             .unwrap();
         let block = client.latest_block().await.unwrap();
         assert_eq!(block.base_fee_per_gas, None);
+    }
+
+    #[tokio::test]
+    async fn get_balance_parses_hex() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let balance = client.get_balance(Address::ZERO).await.unwrap();
+        assert_eq!(balance, U256::from(1_000_000_000_000_000_000u128));
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_parses_tx_hash() {
+        let expected = B256::repeat_byte(0xab);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond(
+                "eth_sendRawTransaction",
+                json!(format!("0x{}", hex::encode(expected))),
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let hash = client
+            .send_raw_transaction(&Bytes::from(vec![0x02, 0xde, 0xad]))
+            .await
+            .unwrap();
+        assert_eq!(hash, expected);
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_rejects_malformed_hash_length() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_sendRawTransaction", json!("0xdead"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let err = client
+            .send_raw_transaction(&Bytes::from(vec![0x02]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::MalformedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn get_transaction_receipt_returns_none_when_pending() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_getTransactionReceipt", json!(null))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let receipt = client
+            .get_transaction_receipt(B256::repeat_byte(0x11))
+            .await
+            .unwrap();
+        assert!(receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_transaction_receipt_decodes_success_with_logs() {
+        let tx_hash = B256::repeat_byte(0x22);
+        let nft = Address::repeat_byte(0x33);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond(
+                "eth_getTransactionReceipt",
+                json!({
+                    "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+                    "status": "0x1",
+                    "blockNumber": "0x64",
+                    "logs": [{
+                        "address": nft.to_string(),
+                        "topics": [format!("0x{}", hex::encode(alloy_primitives::keccak256(b"Transfer(address,address,uint256)")))],
+                        "data": "0x"
+                    }]
+                }),
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let receipt = client
+            .get_transaction_receipt(tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(receipt.status_success);
+        assert_eq!(receipt.block_number, 100);
+        assert_eq!(receipt.transaction_hash, tx_hash);
+        assert_eq!(receipt.logs.len(), 1);
+        assert_eq!(receipt.logs[0].address, nft);
+    }
+
+    #[tokio::test]
+    async fn get_transaction_receipt_decodes_revert_status() {
+        let tx_hash = B256::repeat_byte(0x22);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond(
+                "eth_getTransactionReceipt",
+                json!({
+                    "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+                    "status": "0x0",
+                    "blockNumber": "0x64",
+                    "logs": []
+                }),
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let receipt = client
+            .get_transaction_receipt(tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!receipt.status_success);
+    }
+
+    #[tokio::test]
+    async fn get_transaction_receipt_rejects_malformed_logs() {
+        let tx_hash = B256::repeat_byte(0x22);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond(
+                "eth_getTransactionReceipt",
+                json!({
+                    "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+                    "status": "0x1",
+                    "blockNumber": "0x64",
+                    "logs": [{"address": "not-an-address", "topics": [], "data": "0x"}]
+                }),
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let err = client.get_transaction_receipt(tx_hash).await.unwrap_err();
+        assert!(matches!(err, RpcError::MalformedResponse(_)));
     }
 }
