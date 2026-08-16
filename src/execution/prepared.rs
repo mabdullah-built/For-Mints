@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use time::OffsetDateTime;
 
 use crate::chain::registry::{ChainId, ChainInfo};
-use crate::chain::rpc::RpcClient;
+use crate::chain::rpc::{PreparedBroadcast, RpcClient};
 use crate::domain::fees::{Eip1559Fees, SafetyCaps, worst_case_total_spend};
 use crate::domain::timing::StageStatus;
 use crate::protocol::seadrop::{self, encode_mint_public, select_fee_recipient};
@@ -43,6 +43,13 @@ pub struct PreparedTransaction {
     pub signing_hash: B256,
     pub raw_signed_bytes: Bytes,
     pub tx_hash: B256,
+    /// The fully prebuilt broadcast payload for this transaction — built
+    /// once, here, before the stage-open wait. The T=0 hot path only ever
+    /// reads `broadcast.json_rpc_body`.
+    pub broadcast: PreparedBroadcast,
+    /// How long [`PreparedBroadcast::build`] took — hex-encoding plus JSON
+    /// serialization, measured once, ahead of time.
+    pub broadcast_prepare_ms: u64,
     pub prepared_at: OffsetDateTime,
 }
 
@@ -211,6 +218,15 @@ pub async fn prepare_live_transaction(
     let raw_signed_bytes = signed.raw_bytes();
     let tx_hash = signed.tx_hash();
 
+    // Everything the T=0 hot path will ever touch is built here, once,
+    // before the stage-open wait: hex-encode the raw signed transaction and
+    // serialize the complete eth_sendRawTransaction JSON-RPC request body.
+    // `broadcast_to_all` later sends `broadcast.json_rpc_body` verbatim to
+    // every send-capable endpoint — no re-encoding, no re-serialization.
+    let broadcast_prepare_started = std::time::Instant::now();
+    let broadcast = PreparedBroadcast::build(tx_hash, raw_signed_bytes.clone());
+    let broadcast_prepare_ms = broadcast_prepare_started.elapsed().as_millis() as u64;
+
     Ok(PreparedTransaction {
         chain_id: request.chain.chain_id,
         wallet: request.wallet,
@@ -226,6 +242,8 @@ pub async fn prepare_live_transaction(
         signing_hash,
         raw_signed_bytes,
         tx_hash,
+        broadcast,
+        broadcast_prepare_ms,
         prepared_at: OffsetDateTime::now_utc(),
     })
 }

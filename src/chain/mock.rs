@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -22,12 +23,15 @@ struct MockEntry {
 /// Cloned from the transport *before* it is moved into an `RpcClient`, so
 /// tests can still inspect what was actually sent afterwards.
 #[derive(Clone, Default)]
-pub struct CaptureHandle(Arc<Mutex<Vec<(String, Value)>>>);
+pub struct CaptureHandle {
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+    prebuilt_bodies: Arc<Mutex<Vec<Bytes>>>,
+}
 
 impl CaptureHandle {
     /// All `(method, params)` pairs received, in call order.
     pub fn all(&self) -> Vec<(String, Value)> {
-        self.0.lock().expect("capture mutex poisoned").clone()
+        self.calls.lock().expect("capture mutex poisoned").clone()
     }
 
     /// Params of every call made to `method`, in call order.
@@ -37,6 +41,16 @@ impl CaptureHandle {
             .filter(|(m, _)| m == method)
             .map(|(_, p)| p)
             .collect()
+    }
+
+    /// Every raw request body received via
+    /// [`Transport::send_prebuilt_request`], byte-for-byte, in call order —
+    /// used to prove the T=0 hot path never rebuilds its JSON-RPC request.
+    pub fn prebuilt_bodies(&self) -> Vec<Bytes> {
+        self.prebuilt_bodies
+            .lock()
+            .expect("capture mutex poisoned")
+            .clone()
     }
 }
 
@@ -195,7 +209,7 @@ impl MockTransportBuilder {
 impl Transport for MockTransport {
     async fn call(&self, method: &str, params: Value) -> Result<Value, TransportError> {
         self.capture
-            .0
+            .calls
             .lock()
             .expect("capture mutex poisoned")
             .push((method.to_string(), params.clone()));
@@ -250,6 +264,28 @@ impl Transport for MockTransport {
             .clone()
             .ok_or_else(|| TransportError::Network(format!("no mock response for {method}")))?;
         Ok(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+    }
+
+    async fn send_prebuilt_request(&self, body: &Bytes) -> Result<Value, TransportError> {
+        self.capture
+            .prebuilt_bodies
+            .lock()
+            .expect("capture mutex poisoned")
+            .push(body.clone());
+
+        // Decode the prebuilt envelope purely to route it through the same
+        // canned-response/delay/timeout machinery `call` already has — this
+        // is test-harness plumbing, not a stand-in for what the hot path
+        // itself does (the hot path builds nothing; it only sends `body`).
+        let parsed: Value =
+            serde_json::from_slice(body).map_err(|e| TransportError::InvalidJson(e.to_string()))?;
+        let method = parsed
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let params = parsed.get("params").cloned().unwrap_or(json!([]));
+        self.call(&method, params).await
     }
 }
 

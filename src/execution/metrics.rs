@@ -39,6 +39,12 @@ pub struct LatencyMetrics {
     pub simulation_ms: Option<u64>,
     pub sign_ms: Option<u64>,
     pub serialize_ms: Option<u64>,
+    /// Time spent building the prebuilt broadcast payload — hex-encoding
+    /// the raw signed transaction and serializing the complete
+    /// `eth_sendRawTransaction` JSON-RPC request body — measured once,
+    /// before T=0. Distinct from `dispatch_ms`, which measures only actual
+    /// network fan-out against the already-built payload.
+    pub broadcast_prepare_ms: Option<u64>,
     pub scheduler_error_ms: Option<i64>,
     pub dispatch_ms: Option<u64>,
     pub rpc_accept_ms: Option<u64>,
@@ -62,6 +68,7 @@ impl LatencyMetrics {
             field("simulation_ms", self.simulation_ms),
             field("sign_ms", self.sign_ms),
             field("serialize_ms", self.serialize_ms),
+            field("broadcast_prepare_ms", self.broadcast_prepare_ms),
         ];
         lines.push(match self.scheduler_error_ms {
             Some(v) => format!("  {:<24} {v} ms", "scheduler_error_ms"),

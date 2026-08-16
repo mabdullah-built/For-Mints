@@ -10,6 +10,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use thiserror::Error;
+use time::OffsetDateTime;
 use url::Url;
 
 use crate::execution::errors::{Categorize, ErrorCategory};
@@ -71,6 +72,57 @@ impl Categorize for RpcError {
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> Result<Value, TransportError>;
+
+    /// Send an already fully-serialized JSON-RPC request body verbatim —
+    /// no reconstruction, no re-serialization, no hex-encoding. This exists
+    /// specifically for the latency-critical `eth_sendRawTransaction`
+    /// fan-out (see [`PreparedBroadcast`]); every other RPC call continues
+    /// to go through [`Self::call`], which builds its request normally.
+    async fn send_prebuilt_request(&self, body: &Bytes) -> Result<Value, TransportError>;
+}
+
+/// An immutable, fully prebuilt `eth_sendRawTransaction` broadcast payload.
+///
+/// Built exactly once, before the stage-open instant, from the signed
+/// transaction produced by [`crate::execution::prepared::prepare_live_transaction`].
+/// The T=0 hot path only ever reads these bytes over the wire — it never
+/// hex-encodes, never constructs or serializes JSON, and never touches the
+/// signing/ABI/fee/nonce machinery again. One prepared transaction always
+/// yields exactly one `PreparedBroadcast`, dispatched identically to every
+/// send-capable endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedBroadcast {
+    pub tx_hash: B256,
+    pub raw_signed_tx: Bytes,
+    pub raw_tx_hex: String,
+    pub json_rpc_body: Bytes,
+    pub prepared_at: OffsetDateTime,
+}
+
+impl PreparedBroadcast {
+    /// Hex-encode `raw_signed_tx` once and serialize the complete
+    /// `eth_sendRawTransaction` JSON-RPC request body once. Everything
+    /// downstream (broadcast fan-out to N endpoints) reuses these same
+    /// bytes verbatim.
+    pub fn build(tx_hash: B256, raw_signed_tx: Bytes) -> Self {
+        let raw_tx_hex = format!("0x{}", hex::encode(&raw_signed_tx));
+        let envelope = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [raw_tx_hex.clone()],
+        });
+        let json_rpc_body = Bytes::from(
+            serde_json::to_vec(&envelope).expect("serializing a JSON-RPC envelope never fails"),
+        );
+        Self {
+            tx_hash,
+            raw_signed_tx,
+            raw_tx_hex,
+            json_rpc_body,
+            prepared_at: OffsetDateTime::now_utc(),
+        }
+    }
 }
 
 /// A `reqwest`-backed transport with a bounded per-call timeout. Never
@@ -103,6 +155,30 @@ impl Transport for HttpTransport {
         });
 
         let request = self.client.post(self.url.clone()).json(&body).send();
+
+        let response = tokio::time::timeout(self.timeout, request)
+            .await
+            .map_err(|_| TransportError::Timeout(self.timeout))?
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+
+        let value: Value = tokio::time::timeout(self.timeout, response.json())
+            .await
+            .map_err(|_| TransportError::Timeout(self.timeout))?
+            .map_err(|e| TransportError::InvalidJson(e.to_string()))?;
+
+        Ok(value)
+    }
+
+    async fn send_prebuilt_request(&self, body: &Bytes) -> Result<Value, TransportError> {
+        // No `json!`/serde construction here — `body` is already the exact
+        // bytes to send. Only the network round trip happens in this
+        // function.
+        let request = self
+            .client
+            .post(self.url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+            .send();
 
         let response = tokio::time::timeout(self.timeout, request)
             .await
@@ -259,23 +335,7 @@ impl RpcClient {
 
     async fn raw_call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let response = self.transport.call(method, params).await?;
-        let obj = response
-            .as_object()
-            .ok_or_else(|| RpcError::MalformedResponse("response was not a JSON object".into()))?;
-
-        if let Some(error) = obj.get("error") {
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(RpcError::RpcReturnedError { code, message });
-        }
-
-        obj.get("result")
-            .cloned()
-            .ok_or_else(|| RpcError::MalformedResponse("response had no result field".into()))
+        Self::extract_result(response)
     }
 
     fn hex_to_u64(value: &Value, field: &str) -> Result<u64, RpcError> {
@@ -412,9 +472,12 @@ impl RpcClient {
             .map_err(|e| RpcError::MalformedResponse(format!("balance was not valid hex: {e}")))
     }
 
-    /// `eth_sendRawTransaction`. Returns the transaction hash the node
-    /// reports accepting. Callers must compare this against the locally
-    /// computed hash — never assume the two match.
+    /// `eth_sendRawTransaction`, building its request the normal way (used
+    /// by ad-hoc/test call sites). The T=0 broadcast hot path uses
+    /// [`Self::broadcast_prepared`] instead, which sends an already-built
+    /// [`PreparedBroadcast`] with no per-call encoding. Returns the
+    /// transaction hash the node reports accepting — callers must compare
+    /// this against the locally computed hash, never assume the two match.
     pub async fn send_raw_transaction(&self, raw: &Bytes) -> Result<B256, RpcError> {
         self.require_send_capability("eth_sendRawTransaction")?;
         let result = self
@@ -423,6 +486,45 @@ impl RpcClient {
                 json!([format!("0x{}", hex::encode(raw))]),
             )
             .await?;
+        Self::parse_tx_hash_result(&result)
+    }
+
+    /// Broadcast an already fully prebuilt `eth_sendRawTransaction`
+    /// request. Performs **no** hex-encoding, JSON construction, or
+    /// serialization — `prepared.json_rpc_body` is sent to the wire
+    /// exactly as it was built ahead of time. This is the T=0 hot-path
+    /// entry point used by [`crate::execution::broadcast::broadcast_to_all`].
+    pub async fn broadcast_prepared(&self, prepared: &PreparedBroadcast) -> Result<B256, RpcError> {
+        self.require_send_capability("eth_sendRawTransaction")?;
+        let response = self
+            .transport
+            .send_prebuilt_request(&prepared.json_rpc_body)
+            .await?;
+        let result = Self::extract_result(response)?;
+        Self::parse_tx_hash_result(&result)
+    }
+
+    fn extract_result(response: Value) -> Result<Value, RpcError> {
+        let obj = response
+            .as_object()
+            .ok_or_else(|| RpcError::MalformedResponse("response was not a JSON object".into()))?;
+
+        if let Some(error) = obj.get("error") {
+            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(RpcError::RpcReturnedError { code, message });
+        }
+
+        obj.get("result")
+            .cloned()
+            .ok_or_else(|| RpcError::MalformedResponse("response had no result field".into()))
+    }
+
+    fn parse_tx_hash_result(result: &Value) -> Result<B256, RpcError> {
         let s = result
             .as_str()
             .ok_or_else(|| RpcError::MalformedResponse("tx hash was not a string".into()))?;
@@ -997,5 +1099,117 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- PreparedBroadcast: prebuilt hot-path payload ---------------------
+
+    #[test]
+    fn prepared_broadcast_body_targets_eth_send_raw_transaction() {
+        let raw = Bytes::from(vec![0x02, 0xde, 0xad, 0xbe, 0xef]);
+        let tx_hash = B256::repeat_byte(0x11);
+        let prepared = PreparedBroadcast::build(tx_hash, raw);
+
+        let parsed: Value = serde_json::from_slice(&prepared.json_rpc_body).unwrap();
+        assert_eq!(parsed["method"], json!("eth_sendRawTransaction"));
+        assert_eq!(parsed["jsonrpc"], json!("2.0"));
+    }
+
+    #[test]
+    fn prepared_broadcast_body_contains_the_exact_signed_raw_transaction() {
+        let raw = Bytes::from(vec![0x02, 0x01, 0x02, 0x03, 0xff]);
+        let prepared = PreparedBroadcast::build(B256::ZERO, raw.clone());
+
+        assert_eq!(prepared.raw_tx_hex, format!("0x{}", hex::encode(&raw)));
+        assert_eq!(prepared.raw_signed_tx, raw);
+
+        let parsed: Value = serde_json::from_slice(&prepared.json_rpc_body).unwrap();
+        assert_eq!(parsed["params"][0], json!(prepared.raw_tx_hex));
+    }
+
+    #[test]
+    fn prepared_broadcast_tx_hash_matches_keccak_of_raw_signed_bytes() {
+        let raw = Bytes::from(vec![0x02, 0xaa, 0xbb, 0xcc]);
+        let tx_hash = alloy_primitives::keccak256(&raw);
+        let prepared = PreparedBroadcast::build(tx_hash, raw.clone());
+
+        assert_eq!(
+            prepared.tx_hash,
+            alloy_primitives::keccak256(&prepared.raw_signed_tx)
+        );
+    }
+
+    #[test]
+    fn prepared_broadcast_build_is_deterministic() {
+        let raw = Bytes::from(vec![0x02, 0x10, 0x20]);
+        let tx_hash = B256::repeat_byte(0x22);
+        let a = PreparedBroadcast::build(tx_hash, raw.clone());
+        let b = PreparedBroadcast::build(tx_hash, raw);
+        assert_eq!(
+            a.json_rpc_body, b.json_rpc_body,
+            "no hidden state across builds"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_prepared_rejects_read_only_client() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let prepared = PreparedBroadcast::build(B256::ZERO, Bytes::from(vec![0x02]));
+        let err = client.broadcast_prepared(&prepared).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::CapabilityDenied {
+                attempted: "eth_sendRawTransaction",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_prepared_sends_the_prebuilt_body_verbatim() {
+        let raw = Bytes::from(vec![0x02, 0x55, 0x66]);
+        let tx_hash = alloy_primitives::keccak256(&raw);
+        let prepared = PreparedBroadcast::build(tx_hash, raw);
+
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .echo_raw_transaction_hash()
+            .build();
+        let capture = transport.capture_handle();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+
+        let hash = client.broadcast_prepared(&prepared).await.unwrap();
+        assert_eq!(hash, tx_hash);
+        assert_eq!(
+            capture.prebuilt_bodies(),
+            vec![prepared.json_rpc_body.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_prepared_timeout_is_retryable_category() {
+        let raw = Bytes::from(vec![0x02]);
+        let prepared = PreparedBroadcast::build(B256::ZERO, raw);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_sendRawTransaction", json!("0xabc"))
+            .delay("eth_sendRawTransaction", Duration::from_millis(50))
+            .build()
+            .with_call_timeout(Duration::from_millis(1));
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let err = client.broadcast_prepared(&prepared).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Transport(TransportError::Timeout(_))
+        ));
+        assert!(matches!(err.category(), ErrorCategory::Retryable));
     }
 }

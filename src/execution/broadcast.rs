@@ -8,10 +8,10 @@
 
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::B256;
 use time::OffsetDateTime;
 
-use crate::chain::rpc::{RpcClient, RpcError, TransportError};
+use crate::chain::rpc::{PreparedBroadcast, RpcClient, RpcError, TransportError};
 
 use super::errors::{KairoxError, SessionError};
 
@@ -132,14 +132,15 @@ pub struct EndpointBroadcastResult {
     pub outcome: BroadcastOutcome,
 }
 
-/// Broadcast the exact same `raw` bytes to every client in `clients`,
-/// concurrently. `expected_tx_hash` is the hash Kairox computed locally
-/// from the signed transaction — every `Accepted` result is checked
-/// against it.
+/// Dispatch the exact same prebuilt `eth_sendRawTransaction` request to
+/// every client in `clients`, concurrently. This is the T=0 hot path: no
+/// hex-encoding, JSON construction, or serialization happens here or in
+/// anything it calls — `prepared.json_rpc_body` was already built once,
+/// ahead of time (see [`crate::execution::prepared::prepare_live_transaction`]),
+/// and is sent to every endpoint byte-for-byte identical.
 pub async fn broadcast_to_all(
     clients: &[&RpcClient],
-    raw: &Bytes,
-    expected_tx_hash: B256,
+    prepared: &PreparedBroadcast,
 ) -> Vec<EndpointBroadcastResult> {
     let attempts = clients.iter().enumerate().map(|(i, client)| async move {
         let label = client
@@ -148,18 +149,19 @@ pub async fn broadcast_to_all(
             .unwrap_or_else(|| format!("endpoint[{i}]"));
         let dispatched_at = OffsetDateTime::now_utc();
         let started = Instant::now();
-        let result = client.send_raw_transaction(raw).await;
+        let result = client.broadcast_prepared(prepared).await;
         let elapsed = started.elapsed();
         let responded_at = Some(OffsetDateTime::now_utc());
         let latency_ms = Some(duration_ms(elapsed));
 
         let outcome = match result {
-            Ok(reported_hash) if reported_hash == expected_tx_hash => {
-                BroadcastOutcome::Accepted { tx_hash: reported_hash }
-            }
+            Ok(reported_hash) if reported_hash == prepared.tx_hash => BroadcastOutcome::Accepted {
+                tx_hash: reported_hash,
+            },
             Ok(reported_hash) => BroadcastOutcome::FatalRejection {
                 message: format!(
-                    "endpoint returned unexpected tx hash {reported_hash} (expected {expected_tx_hash})"
+                    "endpoint returned unexpected tx hash {reported_hash} (expected {})",
+                    prepared.tx_hash
                 ),
             },
             Err(e) => classify_send_error(&e),
@@ -311,9 +313,10 @@ mod tests {
     async fn broadcast_to_all_sends_identical_raw_bytes_and_matching_hash() {
         let client_a = accepting_client("a").await;
         let client_b = accepting_client("b").await;
-        let raw = Bytes::from(vec![0x02, 0xde, 0xad, 0xbe, 0xef]);
+        let raw = alloy_primitives::Bytes::from(vec![0x02, 0xde, 0xad, 0xbe, 0xef]);
+        let prepared = PreparedBroadcast::build(expected_hash(), raw);
 
-        let results = broadcast_to_all(&[&client_a, &client_b], &raw, expected_hash()).await;
+        let results = broadcast_to_all(&[&client_a, &client_b], &prepared).await;
 
         assert_eq!(results.len(), 2);
         for r in &results {
@@ -339,13 +342,64 @@ mod tests {
         let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
             .await
             .unwrap();
-        let raw = Bytes::from(vec![0x02]);
+        let raw = alloy_primitives::Bytes::from(vec![0x02]);
+        let prepared = PreparedBroadcast::build(expected_hash(), raw);
 
-        let results = broadcast_to_all(&[&client], &raw, expected_hash()).await;
+        let results = broadcast_to_all(&[&client], &prepared).await;
         assert!(matches!(
             results[0].outcome,
             BroadcastOutcome::FatalRejection { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_to_all_sends_byte_identical_prebuilt_json_bodies() {
+        let transport_a = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .echo_raw_transaction_hash()
+            .build();
+        let capture_a = transport_a.capture_handle();
+        let client_a = RpcClient::connect(
+            Box::new(transport_a),
+            1,
+            EndpointRole::SendOnly,
+            Some("a".into()),
+        )
+        .await
+        .unwrap();
+
+        let transport_b = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .echo_raw_transaction_hash()
+            .build();
+        let capture_b = transport_b.capture_handle();
+        let client_b = RpcClient::connect(
+            Box::new(transport_b),
+            1,
+            EndpointRole::Sequencer,
+            Some("b".into()),
+        )
+        .await
+        .unwrap();
+
+        let raw = alloy_primitives::Bytes::from(vec![0x02, 0x01, 0x02, 0x03]);
+        let tx_hash = alloy_primitives::keccak256(&raw);
+        let prepared = PreparedBroadcast::build(tx_hash, raw);
+
+        let results = broadcast_to_all(&[&client_a, &client_b], &prepared).await;
+        for r in &results {
+            assert_eq!(r.outcome, BroadcastOutcome::Accepted { tx_hash });
+        }
+
+        let body_a = capture_a.prebuilt_bodies();
+        let body_b = capture_b.prebuilt_bodies();
+        assert_eq!(body_a.len(), 1);
+        assert_eq!(body_b.len(), 1);
+        assert_eq!(
+            body_a[0], body_b[0],
+            "every endpoint must receive the byte-identical prebuilt JSON-RPC body"
+        );
+        assert_eq!(body_a[0], prepared.json_rpc_body);
     }
 
     #[test]

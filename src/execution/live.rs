@@ -159,13 +159,17 @@ pub async fn run_live_mint(
     })
     .await;
 
+    metrics.broadcast_prepare_ms = Some(prepared.broadcast_prepare_ms);
+
     let send_clients = pool.send_capable();
     on_progress(LiveProgress::Broadcasting {
         send_endpoint_count: send_clients.len(),
     });
+    // Hot path: dispatch the already-built payload. No hex-encoding, JSON
+    // construction, or serialization happens in `broadcast_to_all` or
+    // anything it calls — only the network round trip is timed here.
     let dispatch_sw = Stopwatch::start();
-    let broadcast_results =
-        broadcast_to_all(&send_clients, &prepared.raw_signed_bytes, prepared.tx_hash).await;
+    let broadcast_results = broadcast_to_all(&send_clients, &prepared.broadcast).await;
     metrics.dispatch_ms = Some(dispatch_sw.elapsed_ms());
     metrics.rpc_accept_ms = broadcast_results.iter().filter_map(|r| r.latency_ms).min();
 
@@ -397,17 +401,26 @@ mod tests {
     /// A genuine submission-only endpoint: no `eth_chainId` response
     /// configured at all (so it connects as `ConfiguredSendOnly`), but it
     /// does accept `eth_sendRawTransaction` and echoes the real hash.
-    async fn submission_only_client(role: EndpointRole, chain_id: u64, label: &str) -> RpcClient {
+    /// Returns the client alongside a capture handle so tests can inspect
+    /// the exact prebuilt bytes it received.
+    async fn submission_only_client(
+        role: EndpointRole,
+        chain_id: u64,
+        label: &str,
+    ) -> (RpcClient, crate::chain::mock::CaptureHandle) {
         let transport = MockTransport::builder().echo_raw_transaction_hash().build();
-        RpcClient::connect(Box::new(transport), chain_id, role, Some(label.to_string()))
-            .await
-            .unwrap()
+        let capture = transport.capture_handle();
+        let client =
+            RpcClient::connect(Box::new(transport), chain_id, role, Some(label.to_string()))
+                .await
+                .unwrap();
+        (client, capture)
     }
 
     #[tokio::test]
     async fn fails_closed_without_any_verified_read_capable_endpoint() {
         let signer = signer();
-        let sequencer = submission_only_client(EndpointRole::Sequencer, 1, "seq").await;
+        let (sequencer, _capture) = submission_only_client(EndpointRole::Sequencer, 1, "seq").await;
         // Send-capable pool, but nothing chain-verified/read-capable in it.
         let pool = RpcPool::from_clients(1, vec![sequencer]);
         assert!(!pool.send_capable().is_empty());
@@ -425,8 +438,9 @@ mod tests {
         // One fully verified read+send node (state comes only from here).
         let mut pool_clients = healthy_clients(signer.address(), 1).await;
         // One genuine submission-only sequencer: no eth_chainId support.
-        pool_clients
-            .push(submission_only_client(EndpointRole::Sequencer, 1, "robinhood-sequencer").await);
+        let (sequencer_client, sequencer_capture) =
+            submission_only_client(EndpointRole::Sequencer, 1, "robinhood-sequencer").await;
+        pool_clients.push(sequencer_client);
 
         let pool = RpcPool::from_clients(1, pool_clients);
         assert_eq!(pool.read_capable().len(), 1);
@@ -438,6 +452,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.broadcast_results.len(), 2);
+        assert_eq!(
+            sequencer_capture.prebuilt_bodies(),
+            vec![outcome.prepared.broadcast.json_rpc_body.clone()],
+            "the ConfiguredSendOnly sequencer must receive the exact same prebuilt payload as every other endpoint"
+        );
         let expected_hash = outcome.prepared.tx_hash;
         for r in &outcome.broadcast_results {
             assert_eq!(
