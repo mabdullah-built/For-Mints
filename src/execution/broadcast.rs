@@ -73,6 +73,13 @@ pub fn classify_send_error(error: &RpcError) -> BroadcastOutcome {
         RpcError::ChainIdMismatch { .. } => BroadcastOutcome::FatalRejection {
             message: error.to_string(),
         },
+        // Should never actually occur: `broadcast_to_all` only calls
+        // `send_raw_transaction` on send-capable clients. If it somehow
+        // does, this is a Kairox bug, not a chain condition — fatal either
+        // way, never silently retried.
+        RpcError::CapabilityDenied { .. } => BroadcastOutcome::FatalRejection {
+            message: error.to_string(),
+        },
         RpcError::MalformedResponse(message) => BroadcastOutcome::TransportUnknown {
             message: message.clone(),
         },

@@ -233,6 +233,10 @@ mod tests {
     }
 
     async fn healthy_pool(wallet: Address, node_count: usize) -> RpcPool {
+        RpcPool::from_clients(1, healthy_clients(wallet, node_count).await)
+    }
+
+    async fn healthy_clients(wallet: Address, node_count: usize) -> Vec<RpcClient> {
         let mut clients = Vec::new();
         for i in 0..node_count {
             let public_drop = PublicDropAbi {
@@ -316,7 +320,7 @@ mod tests {
                     .unwrap(),
             );
         }
-        RpcPool::from_clients(1, clients)
+        clients
     }
 
     fn request(wallet: Address) -> LiveMintRequest {
@@ -388,5 +392,61 @@ mod tests {
             outcome.receipt_state,
             Some(ReceiptState::ConfirmedSuccess { .. })
         ));
+    }
+
+    /// A genuine submission-only endpoint: no `eth_chainId` response
+    /// configured at all (so it connects as `ConfiguredSendOnly`), but it
+    /// does accept `eth_sendRawTransaction` and echoes the real hash.
+    async fn submission_only_client(role: EndpointRole, chain_id: u64, label: &str) -> RpcClient {
+        let transport = MockTransport::builder().echo_raw_transaction_hash().build();
+        RpcClient::connect(Box::new(transport), chain_id, role, Some(label.to_string()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fails_closed_without_any_verified_read_capable_endpoint() {
+        let signer = signer();
+        let sequencer = submission_only_client(EndpointRole::Sequencer, 1, "seq").await;
+        // Send-capable pool, but nothing chain-verified/read-capable in it.
+        let pool = RpcPool::from_clients(1, vec![sequencer]);
+        assert!(!pool.send_capable().is_empty());
+
+        let req = request(signer.address());
+        let err = run_live_mint(&pool, &signer, &req, &tiny_config(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn identical_raw_bytes_reach_a_genuine_submission_only_endpoint_too() {
+        let signer = signer();
+        // One fully verified read+send node (state comes only from here).
+        let mut pool_clients = healthy_clients(signer.address(), 1).await;
+        // One genuine submission-only sequencer: no eth_chainId support.
+        pool_clients
+            .push(submission_only_client(EndpointRole::Sequencer, 1, "robinhood-sequencer").await);
+
+        let pool = RpcPool::from_clients(1, pool_clients);
+        assert_eq!(pool.read_capable().len(), 1);
+        assert_eq!(pool.send_capable().len(), 2);
+
+        let req = request(signer.address());
+        let outcome = run_live_mint(&pool, &signer, &req, &tiny_config(), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.broadcast_results.len(), 2);
+        let expected_hash = outcome.prepared.tx_hash;
+        for r in &outcome.broadcast_results {
+            assert_eq!(
+                r.outcome,
+                crate::execution::broadcast::BroadcastOutcome::Accepted {
+                    tx_hash: expected_hash
+                },
+                "every endpoint — including the submission-only one — must see the identical raw tx"
+            );
+        }
     }
 }

@@ -4,10 +4,11 @@
 
 use crate::chain::config::{ProcessEnv, load_chain_endpoints};
 use crate::chain::endpoint::RpcEndpoint;
-use crate::chain::pool::{ConnectOutcome, RpcPool};
+use crate::chain::pool::RpcPool;
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::BenchArgs;
 use crate::cli::context::resolve_chain;
+use crate::cli::format::{format_endpoint_status, mask_url};
 use crate::execution::errors::KairoxError;
 
 pub async fn run(args: BenchArgs) -> Result<(), KairoxError> {
@@ -39,24 +40,21 @@ pub async fn run(args: BenchArgs) -> Result<(), KairoxError> {
 
     let (pool, reports) = RpcPool::connect_all(resolved.info.chain_id, &endpoints).await;
 
-    for report in &reports {
+    for (endpoint, report) in endpoints.iter().zip(reports.iter()) {
         let label = report
             .label
             .clone()
             .unwrap_or_else(|| "(unlabeled)".to_string());
-        match &report.outcome {
-            ConnectOutcome::Connected { latency_ms } => {
-                println!(
-                    "  {label} role={:?} -> connected in {latency_ms} ms",
-                    report.role
-                );
-            }
-            ConnectOutcome::Failed { latency_ms, error } => {
-                println!(
-                    "  {label} role={:?} -> FAILED after {latency_ms} ms: {error}",
-                    report.role
-                );
-            }
+        let masked_url = mask_url(&endpoint.url);
+        let block = format_endpoint_status(
+            &label,
+            &masked_url,
+            report.role,
+            resolved.info.chain_id,
+            &report.outcome,
+        );
+        for line in block.lines() {
+            println!("  {line}");
         }
     }
 

@@ -15,6 +15,7 @@ use url::Url;
 use crate::execution::errors::{Categorize, ErrorCategory};
 use crate::protocol::logs::RawLog;
 
+use super::endpoint::{EndpointRole, EndpointVerification};
 use super::registry::ChainId;
 
 /// A transport failure, independent of any JSON-RPC-level error returned by
@@ -43,6 +44,11 @@ pub enum RpcError {
         expected: ChainId,
         reported: ChainId,
     },
+    #[error("endpoint role {role:?} does not permit {attempted}; refusing to call it")]
+    CapabilityDenied {
+        role: EndpointRole,
+        attempted: &'static str,
+    },
 }
 
 impl Categorize for RpcError {
@@ -54,6 +60,7 @@ impl Categorize for RpcError {
             RpcError::RpcReturnedError { .. } => ErrorCategory::Fatal,
             RpcError::MalformedResponse(_) => ErrorCategory::Fatal,
             RpcError::ChainIdMismatch { .. } => ErrorCategory::Fatal,
+            RpcError::CapabilityDenied { .. } => ErrorCategory::Fatal,
         }
     }
 }
@@ -134,8 +141,9 @@ pub struct TransactionReceipt {
 pub struct RpcClient {
     transport: Box<dyn Transport>,
     expected_chain_id: ChainId,
-    role: super::endpoint::EndpointRole,
+    role: EndpointRole,
     label: Option<String>,
+    verification: EndpointVerification,
 }
 
 impl std::fmt::Debug for RpcClient {
@@ -144,41 +152,109 @@ impl std::fmt::Debug for RpcClient {
             .field("expected_chain_id", &self.expected_chain_id)
             .field("role", &self.role)
             .field("label", &self.label)
+            .field("verification", &self.verification)
             .finish_non_exhaustive()
     }
 }
 
 impl RpcClient {
-    /// Connect and verify the endpoint reports `expected_chain_id`. Rejects
-    /// (does not construct a client for) any mismatched endpoint.
+    /// Connect and establish trust in the endpoint, according to its role:
+    ///
+    /// - Read-capable roles (`ReadWrite`, `ReadOnly`, `Public`) **must**
+    ///   report a matching `eth_chainId`. Any failure (transport error,
+    ///   malformed response, or mismatch) rejects the endpoint outright —
+    ///   this path is unchanged from before and never weakened.
+    /// - Send-only-capable roles (`SendOnly`, `Sequencer`, `Private`) are
+    ///   also verified via `eth_chainId` when it succeeds, and rejected on
+    ///   a *mismatch* exactly like a read-capable endpoint. But if the call
+    ///   itself fails (the endpoint simply doesn't implement it — common
+    ///   for submission-only sequencer/relay ingress), the endpoint is
+    ///   still accepted, marked [`EndpointVerification::ConfiguredSendOnly`],
+    ///   and bound to `expected_chain_id` purely through the fact that it
+    ///   was configured under that exact chain id. It is never usable for
+    ///   any state read (enforced at each read method below, not just by
+    ///   caller discipline).
     pub async fn connect(
         transport: Box<dyn Transport>,
         expected_chain_id: ChainId,
-        role: super::endpoint::EndpointRole,
+        role: EndpointRole,
         label: Option<String>,
     ) -> Result<Self, RpcError> {
-        let client = RpcClient {
+        let mut client = RpcClient {
             transport,
             expected_chain_id,
             role,
             label,
+            verification: EndpointVerification::ConfiguredSendOnly,
         };
-        let reported = client.chain_id().await?;
-        if reported != expected_chain_id {
-            return Err(RpcError::ChainIdMismatch {
+
+        match client.chain_id().await {
+            Ok(reported) if reported == expected_chain_id => {
+                client.verification = if role.can_read() {
+                    if role.can_send() {
+                        EndpointVerification::VerifiedReadWrite
+                    } else {
+                        EndpointVerification::VerifiedReadOnly
+                    }
+                } else {
+                    EndpointVerification::VerifiedSend
+                };
+                Ok(client)
+            }
+            Ok(reported) => Err(RpcError::ChainIdMismatch {
                 expected: expected_chain_id,
                 reported,
-            });
+            }),
+            Err(e) if role.can_read() => {
+                // Read-capable roles have no degraded path: chain-id
+                // verification is mandatory for them, full stop.
+                Err(e)
+            }
+            Err(_) if role.can_send() => {
+                // Submission-only role with unsupported/failing eth_chainId:
+                // accept it, but only as chain-bound-by-configuration, never
+                // as independently chain-verified.
+                client.verification = EndpointVerification::ConfiguredSendOnly;
+                Ok(client)
+            }
+            Err(e) => Err(e),
         }
-        Ok(client)
     }
 
-    pub fn role(&self) -> super::endpoint::EndpointRole {
+    pub fn role(&self) -> EndpointRole {
         self.role
     }
 
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
+    }
+
+    /// How trust in this endpoint was established. See
+    /// [`EndpointVerification`].
+    pub fn verification(&self) -> EndpointVerification {
+        self.verification
+    }
+
+    fn require_read_capability(&self, attempted: &'static str) -> Result<(), RpcError> {
+        if self.role.can_read() {
+            Ok(())
+        } else {
+            Err(RpcError::CapabilityDenied {
+                role: self.role,
+                attempted,
+            })
+        }
+    }
+
+    fn require_send_capability(&self, attempted: &'static str) -> Result<(), RpcError> {
+        if self.role.can_send() {
+            Ok(())
+        } else {
+            Err(RpcError::CapabilityDenied {
+                role: self.role,
+                attempted,
+            })
+        }
     }
 
     async fn raw_call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -228,6 +304,7 @@ impl RpcClient {
 
     /// `eth_blockNumber`.
     pub async fn block_number(&self) -> Result<u64, RpcError> {
+        self.require_read_capability("eth_blockNumber")?;
         let result = self.raw_call("eth_blockNumber", json!([])).await?;
         Self::hex_to_u64(&result, "blockNumber")
     }
@@ -235,6 +312,7 @@ impl RpcClient {
     /// `eth_getBlockByNumber("latest", false)`, reduced to the fields
     /// Kairox needs.
     pub async fn latest_block(&self) -> Result<BlockHeader, RpcError> {
+        self.require_read_capability("eth_getBlockByNumber")?;
         let result = self
             .raw_call("eth_getBlockByNumber", json!(["latest", false]))
             .await?;
@@ -262,6 +340,7 @@ impl RpcClient {
 
     /// `eth_getTransactionCount(address, "pending")`.
     pub async fn transaction_count(&self, address: Address) -> Result<u64, RpcError> {
+        self.require_read_capability("eth_getTransactionCount")?;
         let result = self
             .raw_call(
                 "eth_getTransactionCount",
@@ -273,12 +352,14 @@ impl RpcClient {
 
     /// `eth_maxPriorityFeePerGas`.
     pub async fn max_priority_fee_per_gas(&self) -> Result<u128, RpcError> {
+        self.require_read_capability("eth_maxPriorityFeePerGas")?;
         let result = self.raw_call("eth_maxPriorityFeePerGas", json!([])).await?;
         Self::hex_to_u128(&result, "maxPriorityFeePerGas")
     }
 
     /// `eth_call` against `to` with `data`, at the `"latest"` block.
     pub async fn eth_call(&self, to: Address, data: &Bytes) -> Result<Bytes, RpcError> {
+        self.require_read_capability("eth_call")?;
         let call_object = json!({
             "to": to.to_string(),
             "data": format!("0x{}", hex::encode(data)),
@@ -304,6 +385,7 @@ impl RpcClient {
         data: &Bytes,
         value: U256,
     ) -> Result<u64, RpcError> {
+        self.require_read_capability("eth_estimateGas")?;
         let call_object = json!({
             "from": from.to_string(),
             "to": to.to_string(),
@@ -318,6 +400,7 @@ impl RpcClient {
 
     /// `eth_getBalance(address, "latest")`.
     pub async fn get_balance(&self, address: Address) -> Result<U256, RpcError> {
+        self.require_read_capability("eth_getBalance")?;
         let result = self
             .raw_call("eth_getBalance", json!([address.to_string(), "latest"]))
             .await?;
@@ -333,6 +416,7 @@ impl RpcClient {
     /// reports accepting. Callers must compare this against the locally
     /// computed hash — never assume the two match.
     pub async fn send_raw_transaction(&self, raw: &Bytes) -> Result<B256, RpcError> {
+        self.require_send_capability("eth_sendRawTransaction")?;
         let result = self
             .raw_call(
                 "eth_sendRawTransaction",
@@ -360,6 +444,7 @@ impl RpcClient {
         &self,
         tx_hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
+        self.require_read_capability("eth_getTransactionReceipt")?;
         let result = self
             .raw_call(
                 "eth_getTransactionReceipt",
@@ -721,5 +806,196 @@ mod tests {
             .unwrap();
         let err = client.get_transaction_receipt(tx_hash).await.unwrap_err();
         assert!(matches!(err, RpcError::MalformedResponse(_)));
+    }
+
+    // --- send-only / sequencer hardening ---------------------------------
+
+    #[tokio::test]
+    async fn send_only_endpoint_with_working_chain_id_is_fully_verified() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        assert_eq!(client.verification(), EndpointVerification::VerifiedSend);
+        assert!(client.verification().chain_id_confirmed());
+    }
+
+    #[tokio::test]
+    async fn send_only_endpoint_with_unsupported_chain_id_is_accepted_as_configured() {
+        // No "eth_chainId" response configured at all -> the transport
+        // reports a network error, simulating a submission-only endpoint
+        // that simply doesn't implement eth_chainId.
+        let transport = MockTransport::builder().build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .expect("submission-only endpoints must still be accepted");
+        assert_eq!(
+            client.verification(),
+            EndpointVerification::ConfiguredSendOnly
+        );
+        assert!(!client.verification().chain_id_confirmed());
+    }
+
+    #[tokio::test]
+    async fn sequencer_endpoint_with_unsupported_chain_id_is_accepted_as_configured() {
+        let transport = MockTransport::builder().build();
+        let client = RpcClient::connect(Box::new(transport), 4663, EndpointRole::Sequencer, None)
+            .await
+            .expect("sequencer endpoints must still be accepted without eth_chainId");
+        assert_eq!(
+            client.verification(),
+            EndpointVerification::ConfiguredSendOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_endpoint_with_unsupported_chain_id_is_rejected() {
+        let transport = MockTransport::builder().build();
+        let err = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .expect_err("read-capable roles must never degrade to unverified");
+        assert!(matches!(
+            err,
+            RpcError::Transport(TransportError::Network(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_write_endpoint_with_unsupported_chain_id_is_rejected() {
+        let transport = MockTransport::builder().build();
+        let err = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+            .await
+            .expect_err("read-capable roles must never degrade to unverified");
+        assert!(matches!(
+            err,
+            RpcError::Transport(TransportError::Network(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_only_endpoint_rejected_on_chain_id_mismatch() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x2"))
+            .build();
+        let err = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::ChainIdMismatch {
+                expected: 1,
+                reported: 2
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_send_only_client_rejects_eth_call() {
+        let transport = MockTransport::builder().build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let err = client
+            .eth_call(Address::ZERO, &Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::CapabilityDenied {
+                role: EndpointRole::SendOnly,
+                attempted: "eth_call"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_send_only_client_rejects_transaction_count() {
+        let transport = MockTransport::builder().build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::Sequencer, None)
+            .await
+            .unwrap();
+        let err = client.transaction_count(Address::ZERO).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::CapabilityDenied {
+                attempted: "eth_getTransactionCount",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_send_only_client_rejects_priority_fee_and_balance_and_receipt() {
+        let transport = MockTransport::builder().build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::Private, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client.max_priority_fee_per_gas().await.unwrap_err(),
+            RpcError::CapabilityDenied {
+                attempted: "eth_maxPriorityFeePerGas",
+                ..
+            }
+        ));
+        assert!(matches!(
+            client.get_balance(Address::ZERO).await.unwrap_err(),
+            RpcError::CapabilityDenied {
+                attempted: "eth_getBalance",
+                ..
+            }
+        ));
+        assert!(matches!(
+            client
+                .get_transaction_receipt(B256::ZERO)
+                .await
+                .unwrap_err(),
+            RpcError::CapabilityDenied {
+                attempted: "eth_getTransactionReceipt",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_send_only_client_can_still_broadcast() {
+        let expected = B256::repeat_byte(0x55);
+        let transport = MockTransport::builder()
+            .respond(
+                "eth_sendRawTransaction",
+                json!(format!("0x{}", hex::encode(expected))),
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::SendOnly, None)
+            .await
+            .unwrap();
+        let hash = client
+            .send_raw_transaction(&Bytes::from(vec![0x02]))
+            .await
+            .unwrap();
+        assert_eq!(hash, expected);
+    }
+
+    #[tokio::test]
+    async fn read_only_client_rejects_send_raw_transaction() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let err = client
+            .send_raw_transaction(&Bytes::from(vec![0x02]))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::CapabilityDenied {
+                attempted: "eth_sendRawTransaction",
+                ..
+            }
+        ));
     }
 }

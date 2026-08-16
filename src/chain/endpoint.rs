@@ -43,6 +43,52 @@ impl EndpointRole {
     }
 }
 
+/// The outcome of establishing trust in one endpoint at connect time.
+///
+/// A read-capable role (`ReadWrite`, `ReadOnly`, `Public`) always requires a
+/// successful, matching `eth_chainId` — there is no degraded state for
+/// those roles; they either become `VerifiedReadWrite`/`VerifiedReadOnly`
+/// or the connection attempt fails outright.
+///
+/// A send-only-capable role (`SendOnly`, `Sequencer`, `Private`) is allowed
+/// to lack `eth_chainId` support entirely — many real sequencer/relay
+/// ingress endpoints only implement `eth_sendRawTransaction` — but such an
+/// endpoint is never treated as chain-verified. It is trusted for
+/// broadcasting only because it was explicitly configured under that exact
+/// chain id (`KAIROX_RPC_<chainId>_<index>_URL`), never because Kairox
+/// guessed or defaulted its chain association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointVerification {
+    /// Read+send role, `eth_chainId` succeeded and matched.
+    VerifiedReadWrite,
+    /// Read-only role, `eth_chainId` succeeded and matched.
+    VerifiedReadOnly,
+    /// Send-only-capable role, `eth_chainId` succeeded and matched anyway
+    /// (some sequencer/relay endpoints do implement it).
+    VerifiedSend,
+    /// Send-only-capable role, `eth_chainId` is unsupported or failed.
+    /// Trusted for broadcast only via its explicit chain-id configuration
+    /// binding — never used for any state read.
+    ConfiguredSendOnly,
+}
+
+impl EndpointVerification {
+    /// Whether `eth_chainId` was independently confirmed for this
+    /// endpoint. `false` means chain association rests entirely on
+    /// configuration (only ever true for `ConfiguredSendOnly`).
+    pub fn chain_id_confirmed(self) -> bool {
+        !matches!(self, Self::ConfiguredSendOnly)
+    }
+
+    /// A short, stable label for display (`doctor`/`bench`).
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::VerifiedReadWrite | Self::VerifiedReadOnly | Self::VerifiedSend => "VERIFIED",
+            Self::ConfiguredSendOnly => "SUBMISSION_ONLY",
+        }
+    }
+}
+
 /// A single configured RPC endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcEndpoint {

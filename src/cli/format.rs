@@ -5,6 +5,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use url::Url;
 
+use crate::chain::endpoint::EndpointRole;
+use crate::chain::pool::ConnectOutcome;
+use crate::chain::registry::ChainId;
 use crate::execution::errors::{KairoxError, SessionError};
 
 /// Parse a base-10 wei amount from a CLI argument, with a clear error
@@ -66,9 +69,53 @@ pub fn mask_url(url: &Url) -> String {
     masked.to_string()
 }
 
+/// Render one endpoint's connection/capability report, deliberately never
+/// collapsing a `ConfiguredSendOnly` (unverifiable, submission-only)
+/// endpoint into the same "chainId MATCHES"-style display as a genuinely
+/// `eth_chainId`-verified one. Shared by `doctor` and `bench` so both stay
+/// consistent.
+pub fn format_endpoint_status(
+    label: &str,
+    masked_url: &str,
+    role: EndpointRole,
+    chain_id: ChainId,
+    outcome: &ConnectOutcome,
+) -> String {
+    match outcome {
+        ConnectOutcome::Connected {
+            latency_ms,
+            verification,
+        } => {
+            let eth_chain_id = if verification.chain_id_confirmed() {
+                "verified"
+            } else {
+                "unsupported"
+            };
+            format!(
+                "{label} {masked_url}\n    role={role:?} read={} send={} chain_binding=configured:{chain_id} eth_chainId={eth_chain_id} status={} latency={latency_ms}ms",
+                yes_no(role.can_read()),
+                yes_no(role.can_send()),
+                verification.status_label(),
+            )
+        }
+        ConnectOutcome::Failed { latency_ms, error } => {
+            format!(
+                "{label} {masked_url}\n    role={role:?} read={} send={} chain_binding=configured:{chain_id} status=UNREACHABLE latency={latency_ms}ms error={error}",
+                yes_no(role.can_read()),
+                yes_no(role.can_send()),
+            )
+        }
+    }
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::endpoint::EndpointVerification;
 
     #[test]
     fn parse_wei_accepts_decimal() {
@@ -102,5 +149,54 @@ mod tests {
     #[test]
     fn format_selector_is_0x_prefixed_hex() {
         assert_eq!(format_selector([0xde, 0xad, 0xbe, 0xef]), "0xdeadbeef");
+    }
+
+    #[test]
+    fn format_endpoint_status_distinguishes_submission_only_from_verified() {
+        let verified = format_endpoint_status(
+            "reader",
+            "https://rpc.example",
+            EndpointRole::ReadOnly,
+            1,
+            &ConnectOutcome::Connected {
+                latency_ms: 12,
+                verification: EndpointVerification::VerifiedReadOnly,
+            },
+        );
+        assert!(verified.contains("status=VERIFIED"));
+        assert!(verified.contains("eth_chainId=verified"));
+        assert!(!verified.contains("SUBMISSION_ONLY"));
+
+        let submission_only = format_endpoint_status(
+            "robinhood-sequencer",
+            "https://sequencer.example",
+            EndpointRole::Sequencer,
+            4663,
+            &ConnectOutcome::Connected {
+                latency_ms: 8,
+                verification: EndpointVerification::ConfiguredSendOnly,
+            },
+        );
+        assert!(submission_only.contains("status=SUBMISSION_ONLY"));
+        assert!(submission_only.contains("eth_chainId=unsupported"));
+        assert!(submission_only.contains("chain_binding=configured:4663"));
+        assert!(submission_only.contains("read=no"));
+        assert!(submission_only.contains("send=yes"));
+        assert!(!submission_only.contains("status=VERIFIED"));
+    }
+
+    #[test]
+    fn format_endpoint_status_never_labels_submission_only_as_matches() {
+        let submission_only = format_endpoint_status(
+            "seq",
+            "https://sequencer.example",
+            EndpointRole::SendOnly,
+            1,
+            &ConnectOutcome::Connected {
+                latency_ms: 5,
+                verification: EndpointVerification::ConfiguredSendOnly,
+            },
+        );
+        assert!(!submission_only.to_uppercase().contains("MATCHES"));
     }
 }

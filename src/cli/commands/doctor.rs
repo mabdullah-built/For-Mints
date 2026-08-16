@@ -5,9 +5,9 @@ use time::OffsetDateTime;
 use crate::chain::config::{
     ProcessEnv, SIGNING_KEY_ENV_VAR, load_chain_endpoints, secret_env_var_present,
 };
-use crate::chain::pool::{ConnectOutcome, RpcPool};
+use crate::chain::pool::RpcPool;
 use crate::chain::registry::ChainRegistry;
-use crate::cli::format::mask_url;
+use crate::cli::format::{format_endpoint_status, mask_url};
 
 pub async fn run() {
     println!("Kairox v{}", crate::VERSION);
@@ -54,19 +54,15 @@ pub async fn run() {
                 .clone()
                 .unwrap_or_else(|| "(unlabeled)".to_string());
             let masked_url = mask_url(&endpoint.url);
-            match &report.outcome {
-                ConnectOutcome::Connected { latency_ms } => {
-                    println!(
-                        "    [{label}] {masked_url} role={:?} -> reachable in {latency_ms} ms, chainId MATCHES",
-                        report.role
-                    );
-                }
-                ConnectOutcome::Failed { latency_ms, error } => {
-                    println!(
-                        "    [{label}] {masked_url} role={:?} -> UNREACHABLE or MISMATCHED after {latency_ms} ms: {error}",
-                        report.role
-                    );
-                }
+            let block = format_endpoint_status(
+                &label,
+                &masked_url,
+                report.role,
+                chain.chain_id,
+                &report.outcome,
+            );
+            for line in block.lines() {
+                println!("    {line}");
             }
         }
         println!(

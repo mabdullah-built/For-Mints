@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::endpoint::{EndpointRole, RpcEndpoint};
+use super::endpoint::{EndpointRole, EndpointVerification, RpcEndpoint};
 use super::registry::ChainId;
 use super::rpc::{HttpTransport, RpcClient};
 
@@ -21,8 +21,14 @@ pub struct EndpointConnectReport {
 
 #[derive(Debug, Clone)]
 pub enum ConnectOutcome {
-    Connected { latency_ms: u64 },
-    Failed { latency_ms: u64, error: String },
+    Connected {
+        latency_ms: u64,
+        verification: EndpointVerification,
+    },
+    Failed {
+        latency_ms: u64,
+        error: String,
+    },
 }
 
 /// A set of chain-id-verified, pre-warmed RPC clients for one chain.
@@ -71,7 +77,10 @@ impl RpcPool {
                     reports.push(EndpointConnectReport {
                         label: endpoint.label.clone(),
                         role: endpoint.role,
-                        outcome: ConnectOutcome::Connected { latency_ms },
+                        outcome: ConnectOutcome::Connected {
+                            latency_ms,
+                            verification: client.verification(),
+                        },
                     });
                     clients.push(client);
                 }
@@ -225,5 +234,58 @@ mod tests {
         let pool = RpcPool::from_clients(1, vec![]);
         assert!(pool.is_empty());
         assert!(pool.preferred_read().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_all_accepts_submission_only_endpoint_and_binds_it_via_chain_config() {
+        use super::super::endpoint::{EndpointVerification, RpcEndpoint};
+        use url::Url;
+
+        // No eth_chainId configured at all -> simulates a genuine
+        // submission-only sequencer ingress. It is still accepted because
+        // it was explicitly configured under chain id 4663.
+        let endpoint = RpcEndpoint::new(
+            Url::parse("https://sequencer.example").unwrap(),
+            EndpointRole::Sequencer,
+        )
+        .with_label("robinhood-sequencer");
+
+        let (pool, reports) = RpcPool::connect_all(4663, &[endpoint]).await;
+
+        assert_eq!(
+            pool.chain_id(),
+            4663,
+            "binding comes only from the chain-scoped config call"
+        );
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.send_capable().len(), 1);
+        assert!(pool.read_capable().is_empty());
+
+        match &reports[0].outcome {
+            ConnectOutcome::Connected { verification, .. } => {
+                assert_eq!(*verification, EndpointVerification::ConfiguredSendOnly);
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_only_endpoint_present_but_no_read_capable_endpoint() {
+        let sequencer_transport = MockTransport::builder().build();
+        let sequencer = RpcClient::connect(
+            Box::new(sequencer_transport),
+            1,
+            EndpointRole::Sequencer,
+            Some("seq".into()),
+        )
+        .await
+        .unwrap();
+
+        let pool = RpcPool::from_clients(1, vec![sequencer]);
+        assert!(!pool.send_capable().is_empty());
+        assert!(
+            pool.preferred_read().is_none(),
+            "a ConfiguredSendOnly-only pool must never report a usable read client"
+        );
     }
 }
