@@ -1,8 +1,8 @@
-//! Signing abstraction. Phase 1 exposes only [`LocalSigner`], an in-memory
-//! signer built from raw key bytes, and never wires a real private key into
-//! the CLI. Its purpose in this phase is architectural: Phase 2's
-//! pre-signing pipeline will hold a `Signer` per wallet and sign candidate
-//! transactions ahead of a mint window — no broadcast path exists yet.
+//! Signing abstraction. [`LocalSigner`] is an in-memory signer built from
+//! raw key bytes, loaded only from `KAIROX_SIGNING_KEY` or an interactive
+//! prompt (see [`crate::signing::keystore`]), and used by the live
+//! pre-signing pipeline to sign a candidate transaction ahead of a mint
+//! window before broadcast.
 
 use std::fmt;
 

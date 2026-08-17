@@ -411,7 +411,17 @@ pub async fn run_multi_wallet_public_mint(
     on_progress(MultiWalletProgress::AggregatePreflight);
     let preflight_sw = Stopwatch::start();
 
-    let aggregate_requested: u64 = wallets.iter().map(|(r, _)| r.quantity).sum();
+    // `.sum()` on a plain u64 iterator wraps silently in a release build on
+    // overflow (Rust's default outside debug-assertions) -- with up to
+    // MAX_WALLETS manifest entries each carrying an attacker/operator-
+    // controlled u64 quantity, an adversarial manifest could otherwise wrap
+    // this aggregate down to a small number and sail past the
+    // `aggregate_requested > remaining_supply` fail-closed check below.
+    // `saturating_add` instead clamps to u64::MAX, which always fails that
+    // check rather than silently bypassing it.
+    let aggregate_requested: u64 = wallets
+        .iter()
+        .fold(0u64, |acc, (r, _)| acc.saturating_add(r.quantity));
     let mint_stats_calldata = crate::protocol::seadrop::encode_get_mint_stats(Address::ZERO);
     let mint_stats_raw = read_client
         .eth_call(nft_contract, &mint_stats_calldata)
@@ -1097,7 +1107,12 @@ async fn check_opensea_aggregate_invariants(
             .min()
             .expect("stage_constrained is non-empty");
 
-        let aggregate_quantity: u64 = unsigned_ready.iter().map(|(r, _, _)| r.quantity).sum();
+        // See the aggregate_requested comment in `run_multi_wallet_public_mint`:
+        // saturating fold, not `.sum()`, so a wrap can never silently
+        // bypass the stage-supply fail-closed check below.
+        let aggregate_quantity: u64 = unsigned_ready
+            .iter()
+            .fold(0u64, |acc, (r, _, _)| acc.saturating_add(r.quantity));
 
         // Fresh, verified read -- never SEND_ONLY/SEQUENCER/ConfiguredSendOnly
         // (guaranteed by `read_client` itself, selected via `preferred_read`
@@ -2376,6 +2391,70 @@ mod tests {
             }
             seen.insert(*wallet);
         }
+    }
+
+    #[tokio::test]
+    async fn aggregate_quantity_overflow_fails_closed_instead_of_wrapping_past_the_check() {
+        // Two wallets whose quantities sum past u64::MAX (u64::MAX + 100):
+        // a naive `.sum()` wraps this down to 99, which would incorrectly
+        // pass a tiny remaining-supply check -- the saturating fold must
+        // clamp to u64::MAX instead, so the aggregate-supply check below
+        // still fails closed exactly like the non-overflowing case.
+        let public_drop = seadrop::PublicDropAbi {
+            mintPrice: alloy_primitives::Uint::from(10_000_000_000_000_000u128),
+            startTime: alloy_primitives::Uint::from(
+                datetime!(2020-01-01 00:00:00 UTC).unix_timestamp() as u64,
+            ),
+            endTime: alloy_primitives::Uint::from(
+                datetime!(2999-01-01 00:00:00 UTC).unix_timestamp() as u64,
+            ),
+            maxTotalMintableByWallet: 50,
+            feeBps: 0,
+            restrictFeeRecipients: false,
+        };
+        let public_drop_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getPublicDropCall::abi_encode_returns(&public_drop))
+        );
+        let mint_stats_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getMintStatsCall::abi_encode_returns(
+                &seadrop::getMintStatsReturn {
+                    minterNumMinted: U256::ZERO,
+                    currentTotalSupply: U256::from(9_999u64),
+                    maxSupply: U256::from(10_000u64), // only 1 remaining
+                }
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .respond_eth_call_selector(seadrop::getPublicDropCall::SELECTOR, json!(public_drop_hex))
+            .respond_eth_call_selector(seadrop::getMintStatsCall::SELECTOR, json!(mint_stats_hex))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+            .await
+            .unwrap();
+        let mut pool = RpcPool::from_clients(1, vec![client]);
+
+        let mut wallets = wallets_abc();
+        wallets.truncate(2);
+        wallets[0].0.quantity = u64::MAX;
+        wallets[1].0.quantity = 100;
+
+        let err = run_multi_wallet_public_mint(
+            &mut pool,
+            &chain(),
+            NFT,
+            SEADROP,
+            &wallets,
+            &tiny_config(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+        assert!(format!("{err}").contains("aggregate requested quantity"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! RPC endpoint configuration: an endpoint's declared *role* determines how
-//! Kairox is allowed to use it. Roles exist now so Phase 2's broadcast
-//! fan-out has a stable shape to build on; Phase 1 only reads.
+//! Kairox is allowed to use it -- reads, sends, or both -- and gates the
+//! broadcast fan-out in [`crate::execution::broadcast`].
 
 use std::time::Duration;
 

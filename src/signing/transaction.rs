@@ -104,9 +104,9 @@ impl SignedEip1559Tx {
     }
 
     /// `0x02 || rlp([...fields, yParity, r, s])` — the exact bytes
-    /// `eth_sendRawTransaction` expects. Phase 1 never broadcasts this; it
-    /// exists so Phase 2's pre-signing pipeline has a stable target to
-    /// produce and cache.
+    /// `eth_sendRawTransaction` expects; this is what actually gets
+    /// broadcast to every send-capable endpoint (see
+    /// [`crate::execution::broadcast`]).
     pub fn raw_bytes(&self) -> Bytes {
         let mut out = Vec::with_capacity(160);
         out.push(EIP1559_TX_TYPE);

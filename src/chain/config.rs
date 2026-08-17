@@ -11,9 +11,10 @@ use url::Url;
 use super::endpoint::{ChainEndpoints, EndpointRole, RpcEndpoint};
 use super::registry::ChainId;
 
-/// The reserved environment variable name Phase 2 will use for a signing
-/// key. Phase 1 never reads its value — only whether it is set, purely for
-/// `kairox doctor` reporting.
+/// The environment variable a real signing key is loaded from (see
+/// [`crate::signing::keystore::load_signing_key`]). This module itself
+/// never reads its value — only whether it is set, purely for `kairox
+/// doctor` reporting.
 pub const SIGNING_KEY_ENV_VAR: &str = "KAIROX_SIGNING_KEY";
 
 /// Environment variable prefix under which RPC endpoints are configured:

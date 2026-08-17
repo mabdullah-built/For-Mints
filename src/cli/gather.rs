@@ -79,7 +79,9 @@ pub async fn fetch_fee_hint(client: &RpcClient) -> Result<FeeHint, KairoxError> 
 /// Best-effort pending nonce. `None` if the RPC call fails — the plan still
 /// displays, with the nonce field reported as unavailable, since a nonce
 /// read failing does not by itself make the mint unsafe to *plan* (only to
-/// broadcast, which Phase 1 never does).
+/// broadcast; this preview pipeline never broadcasts anything -- the live
+/// send path re-fetches its own nonce fresh, strictly, in
+/// [`crate::execution::prepared`]).
 pub async fn fetch_nonce(client: &RpcClient, wallet: Address) -> Option<u64> {
     client.transaction_count(wallet).await.ok()
 }
