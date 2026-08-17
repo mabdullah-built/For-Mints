@@ -162,6 +162,152 @@ pub fn build_execution_plan_report(
     }
 }
 
+/// A fresh random per-session identifier, generated once at the start of a
+/// live mint session -- always BEFORE any signing happens. Used only for
+/// correlating a session's own log lines/report with itself; never fed
+/// into signing, never derived from or influencing any cryptographic
+/// material. 128 bits from the process CSPRNG, hex-encoded.
+pub fn generate_session_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    format!("session_{}", hex::encode(bytes))
+}
+
+/// One wallet's outcome within a session -- dry-run or live, single-wallet
+/// or (future) multi-wallet. Never contains a private key, key_env VALUE,
+/// OpenSea API key, `Authorization` header, or raw signed transaction --
+/// only the transaction HASH once broadcast, per the Phase 6 "never
+/// persist a raw signed tx by default" rule.
+#[derive(Debug, Serialize)]
+pub struct WalletReport {
+    pub label: Option<String>,
+    pub address: String,
+    pub quantity: u64,
+    /// A short state tag: "PLANNED" (dry-run), "CONFIRMED_SUCCESS",
+    /// "CONFIRMED_EXECUTION_MISMATCH", "CONFIRMED_REVERT",
+    /// "RECEIPT_UNKNOWN", or "NOT_BROADCAST" (aborted before any send).
+    pub state: String,
+    pub error_code: Option<String>,
+    pub tx_hash: Option<String>,
+    pub token_ids: Vec<String>,
+    pub broadcast: Vec<BroadcastOutcomeReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BroadcastOutcomeReport {
+    pub endpoint_label: String,
+    pub role: String,
+    pub outcome: String,
+    pub error_code: Option<String>,
+    pub latency_ms: Option<u64>,
+}
+
+pub fn build_broadcast_outcome_reports(
+    results: &[crate::execution::broadcast::EndpointBroadcastResult],
+) -> Vec<BroadcastOutcomeReport> {
+    results
+        .iter()
+        .map(|r| BroadcastOutcomeReport {
+            endpoint_label: r.label.clone(),
+            role: format!("{:?}", r.role),
+            outcome: format!("{:?}", r.outcome),
+            error_code: r.outcome.error_code().map(str::to_string),
+            latency_ms: r.latency_ms,
+        })
+        .collect()
+}
+
+pub fn wallet_report_from_receipt(
+    label: Option<String>,
+    address: Address,
+    quantity: u64,
+    tx_hash: Option<alloy_primitives::B256>,
+    receipt_state: Option<&crate::execution::receipt::ReceiptState>,
+    broadcast: Vec<BroadcastOutcomeReport>,
+) -> WalletReport {
+    use crate::execution::receipt::ReceiptState;
+    let (state, error_code, token_ids): (&str, Option<String>, Vec<String>) = match receipt_state {
+        None => ("NOT_BROADCAST", None, Vec::new()),
+        Some(ReceiptState::ConfirmedSuccess { minted }) => (
+            "CONFIRMED_SUCCESS",
+            None,
+            minted.iter().map(|m| m.token_id.to_string()).collect(),
+        ),
+        Some(s @ ReceiptState::ConfirmedExecutionMismatch { minted, .. }) => (
+            "CONFIRMED_EXECUTION_MISMATCH",
+            s.error_code().map(str::to_string),
+            minted.iter().map(|m| m.token_id.to_string()).collect(),
+        ),
+        Some(s @ ReceiptState::ConfirmedRevert) => (
+            "CONFIRMED_REVERT",
+            s.error_code().map(str::to_string),
+            Vec::new(),
+        ),
+        Some(s @ ReceiptState::ReceiptUnknown) => (
+            "RECEIPT_UNKNOWN",
+            s.error_code().map(str::to_string),
+            Vec::new(),
+        ),
+    };
+    WalletReport {
+        label,
+        address: format_addr(address),
+        quantity,
+        state: state.to_string(),
+        error_code,
+        tx_hash: tx_hash.map(|h| format!("{h:#x}")),
+        token_ids,
+        broadcast,
+    }
+}
+
+/// The structured, secret-free record of one `kairox mint` session --
+/// dry-run or live. `schema_version` first, `session_id` generated before
+/// any signing, `plan_id` linking back to the plan this session executed.
+#[derive(Debug, Serialize)]
+pub struct SessionReport {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub plan_id: Option<String>,
+    pub started_at: String,
+    pub completed_at: String,
+    pub chain: String,
+    pub chain_id: u64,
+    pub collection: String,
+    pub engine: String,
+    pub dry_run: bool,
+    pub wallets: Vec<WalletReport>,
+    pub metrics: Option<crate::execution::metrics::LatencyMetrics>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_session_report(
+    session_id: String,
+    plan_id: Option<String>,
+    started_at: OffsetDateTime,
+    chain_name: &str,
+    chain_id: u64,
+    collection: Address,
+    engine: &str,
+    dry_run: bool,
+    wallets: Vec<WalletReport>,
+    metrics: Option<crate::execution::metrics::LatencyMetrics>,
+) -> SessionReport {
+    SessionReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        session_id,
+        plan_id,
+        started_at: format_rfc3339(started_at),
+        completed_at: format_rfc3339(OffsetDateTime::now_utc()),
+        chain: chain_name.to_string(),
+        chain_id,
+        collection: format_addr(collection),
+        engine: engine.to_string(),
+        dry_run,
+        wallets,
+        metrics,
+    }
+}
+
 /// Write `contents` to `path` via a temp file in the same directory
 /// followed by a rename, so a write failure (disk full, permissions,
 /// process killed mid-write) can never leave a truncated/corrupt file

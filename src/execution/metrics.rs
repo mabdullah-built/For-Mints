@@ -28,8 +28,10 @@ impl Default for Stopwatch {
 }
 
 /// Buffered latency measurements for one live mint attempt, in the order
-/// the pipeline produces them.
-#[derive(Debug, Clone, Default)]
+/// the pipeline produces them. `Serialize` so a session report can embed
+/// the whole thing verbatim -- every field is a plain
+/// `Option<u{64,32}>`/`Option<i64>` timing, never anything secret.
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LatencyMetrics {
     pub rpc_connect_ms: Option<u64>,
     pub rpc_chainid_ms: Option<u64>,

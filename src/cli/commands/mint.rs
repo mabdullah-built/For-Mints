@@ -6,7 +6,7 @@
 use std::io::BufRead;
 use std::time::Duration as StdDuration;
 
-use time::Duration;
+use time::{Duration, OffsetDateTime};
 
 use crate::chain::config::{EnvSource, ProcessEnv, load_chain_endpoints};
 use crate::chain::endpoint::{EndpointRole, RpcEndpoint};
@@ -104,21 +104,52 @@ async fn run_dry_run(
     args: MintArgs,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
-    println!("=================================================");
-    println!(" DRY RUN — NO TRANSACTION BROADCAST");
-    println!("=================================================");
-    println!();
+    let json = args.plan_args.json;
+    let output = args.plan_args.output.clone();
+
+    if !json {
+        eprintln!("=================================================");
+        eprintln!(" DRY RUN — NO TRANSACTION BROADCAST");
+        eprintln!("=================================================");
+        eprintln!();
+    }
 
     match select_engine(&args, config_path).await? {
         SelectedEngine::Public => {
+            let plan = build_mint_plan(&args.plan_args, config_path).await?;
+            if json || output.is_some() {
+                let wallet = args
+                    .plan_args
+                    .wallet
+                    .expect("build_mint_plan already required --wallet");
+                let report = crate::cli::report::build_execution_plan_report(
+                    &plan,
+                    "public",
+                    wallet,
+                    config_path,
+                );
+                emit_report(&report, json, output.as_deref())?;
+                return Ok(());
+            }
             println!("selected engine: PUBLIC (pure on-chain PublicSeaDropEngine)");
             println!();
-            let plan = build_mint_plan(&args.plan_args, config_path).await?;
             print_plan(&plan);
         }
         SelectedEngine::OpenSea { slug } => {
-            println!("selected engine: OPENSEA (official OpenSea Drops API)");
-            println!();
+            if json || output.is_some() {
+                // `kairox plan`/`kairox mint`'s JSON dry-run report is built
+                // from a validated MintPlan (see `cli::report::ExecutionPlanReport`),
+                // which the OpenSea engine's dry-run preview does not
+                // produce today (it only fetches informational drop
+                // metadata, never a validated on-chain plan) -- fail
+                // clearly rather than emit a JSON object with a different,
+                // undocumented shape.
+                return Err(KairoxError::Session(SessionError(
+                    "--json/--output for a dry run is only supported for the PUBLIC engine today; the OpenSea engine's dry-run preview has no structured report yet".into(),
+                )));
+            }
+            eprintln!("selected engine: OPENSEA (official OpenSea Drops API)");
+            eprintln!();
             let opensea = load_opensea_client(StdDuration::from_secs(10))?;
             let drop_details = opensea.get_drop_details(&slug).await?;
             println!("--- OPENSEA API METADATA (off-chain, informational only) ---");
@@ -146,6 +177,31 @@ async fn run_dry_run(
     println!(" DRY RUN — NO TRANSACTION BROADCAST");
     println!(" Pass --send (with --yes, or interactive confirmation) to broadcast live.");
     println!("=================================================");
+    Ok(())
+}
+
+/// Serialize `report` to JSON once, and: print it to stdout iff `json`,
+/// write it to `output` iff given. At least one of the two is always true
+/// when this is called. stdout carries ONLY the JSON object -- diagnostic
+/// text about where a file was written goes to stderr.
+fn emit_report<T: serde::Serialize>(
+    report: &T,
+    json: bool,
+    output: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
+    let text = serde_json::to_string(report).expect("report types are always serializable");
+    if let Some(path) = output {
+        crate::cli::report::write_report_atomic(path, &text).map_err(|e| {
+            KairoxError::Session(SessionError(format!(
+                "failed to write report to {}: {e}",
+                path.display()
+            )))
+        })?;
+        eprintln!("Report written to {}", path.display());
+    }
+    if json {
+        println!("{text}");
+    }
     Ok(())
 }
 
@@ -199,6 +255,10 @@ async fn run_send_public(
     args: MintArgs,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
+    let json = args.plan_args.json;
+    let output = args.plan_args.output.clone();
+    let started_at = OffsetDateTime::now_utc();
+
     let wallet = args.plan_args.wallet.ok_or_else(|| {
         KairoxError::Session(SessionError(
             "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
@@ -214,6 +274,23 @@ async fn run_send_public(
     // live pipeline below.
     let preview = build_mint_plan(&args.plan_args, config_path).await?;
 
+    // session_id is generated here -- before any signing key is loaded or
+    // used -- purely for correlating this session's own report/logs with
+    // itself. No signing material is ever derived from it.
+    let session_id = crate::cli::report::generate_session_id();
+    let plan_id = Some(crate::cli::report::compute_plan_id(
+        crate::cli::report::PlanIdInputs {
+            chain_id: preview.chain.chain_id,
+            collection: preview.nft_contract,
+            engine: "public",
+            wallets: &[wallet],
+            quantities: &[preview.quantity],
+            stage_start_unix: preview.stage_start.unix_timestamp(),
+            stage_end_unix: preview.stage_end.unix_timestamp(),
+            config_fingerprint: &crate::cli::report::config_fingerprint(config_path),
+        },
+    ));
+
     let mut pool = connect_send_pool(
         &resolved,
         args.plan_args.chain_args.rpc_url.as_ref(),
@@ -221,34 +298,57 @@ async fn run_send_public(
     )
     .await?;
 
-    println!("selected engine: PUBLIC (pure on-chain PublicSeaDropEngine)");
-    println!("=================================================");
-    println!(" LIVE SEND CONFIRMATION");
-    println!("=================================================");
-    println!(
+    eprintln!("selected engine: PUBLIC (pure on-chain PublicSeaDropEngine)");
+    eprintln!("session_id: {session_id}");
+    eprintln!("=================================================");
+    eprintln!(" LIVE SEND CONFIRMATION");
+    eprintln!("=================================================");
+    eprintln!(
         "chain:                {} (chain id {})",
         resolved.info.name, resolved.info.chain_id
     );
-    println!("wallet:                {}", wallet);
-    println!("collection:            {}", args.plan_args.collection);
-    println!("quantity:              {}", args.plan_args.quantity);
-    println!("mint value:            {} wei", preview.mint_value);
-    println!("worst-case gas cost:   {} wei", preview.worst_case_gas_cost);
-    println!(
+    eprintln!("wallet:                {}", wallet);
+    eprintln!("collection:            {}", args.plan_args.collection);
+    eprintln!("quantity:              {}", args.plan_args.quantity);
+    eprintln!("mint value:            {} wei", preview.mint_value);
+    eprintln!("worst-case gas cost:   {} wei", preview.worst_case_gas_cost);
+    eprintln!(
         "worst-case total spend:{} wei",
         preview.worst_case_total_spend
     );
-    println!("target contract:       {}", preview.target_contract);
-    println!(
+    eprintln!("target contract:       {}", preview.target_contract);
+    eprintln!(
         "planned stage-open:    {} (unix {})",
         format_unix(preview.stage_start.unix_timestamp() as u64),
         preview.stage_start.unix_timestamp()
     );
-    println!("send-capable endpoints:{}", pool.send_capable().len());
-    println!("=================================================");
+    eprintln!("send-capable endpoints:{}", pool.send_capable().len());
+    eprintln!("=================================================");
 
     if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
-        println!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        eprintln!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        if json || output.is_some() {
+            let report = crate::cli::report::build_session_report(
+                session_id,
+                plan_id,
+                started_at,
+                resolved.info.name,
+                resolved.info.chain_id,
+                args.plan_args.collection,
+                "public",
+                false,
+                vec![crate::cli::report::wallet_report_from_receipt(
+                    None,
+                    wallet,
+                    args.plan_args.quantity,
+                    None,
+                    None,
+                    Vec::new(),
+                )],
+                None,
+            );
+            emit_report(&report, json, output.as_deref())?;
+        }
         return Ok(());
     }
 
@@ -310,6 +410,33 @@ async fn run_send_public(
     })
     .await?;
 
+    if json || output.is_some() {
+        let broadcast =
+            crate::cli::report::build_broadcast_outcome_reports(&outcome.broadcast_results);
+        let wallet_report = crate::cli::report::wallet_report_from_receipt(
+            None,
+            wallet,
+            args.plan_args.quantity,
+            Some(outcome.prepared.tx_hash),
+            outcome.receipt_state.as_ref(),
+            broadcast,
+        );
+        let report = crate::cli::report::build_session_report(
+            session_id,
+            plan_id,
+            started_at,
+            resolved.info.name,
+            resolved.info.chain_id,
+            args.plan_args.collection,
+            "public",
+            false,
+            vec![wallet_report],
+            Some(outcome.metrics),
+        );
+        emit_report(&report, json, output.as_deref())?;
+        return Ok(());
+    }
+
     print_broadcast_result(
         outcome.prepared.tx_hash,
         &outcome.broadcast_results,
@@ -326,6 +453,10 @@ async fn run_send_opensea(
     slug: String,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
+    let json = args.plan_args.json;
+    let output = args.plan_args.output.clone();
+    let started_at = OffsetDateTime::now_utc();
+
     let wallet = args.plan_args.wallet.ok_or_else(|| {
         KairoxError::Session(SessionError(
             "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
@@ -345,28 +476,70 @@ async fn run_send_opensea(
 
     let drop_details = opensea.get_drop_details(&slug).await?;
 
-    println!("selected engine: OPENSEA (official OpenSea Drops API)");
-    println!("=================================================");
-    println!(" LIVE SEND CONFIRMATION");
-    println!("=================================================");
-    println!(
+    // session_id/plan_id are generated here -- before any signing key is
+    // loaded or used. The OpenSea engine's plan_id uses a zero stage
+    // window: unlike the public engine, the pre-signing preview here is
+    // only the informational drop-metadata fetch above, which carries no
+    // validated on-chain stage window to hash.
+    let session_id = crate::cli::report::generate_session_id();
+    let plan_id = Some(crate::cli::report::compute_plan_id(
+        crate::cli::report::PlanIdInputs {
+            chain_id: resolved.info.chain_id,
+            collection: args.plan_args.collection,
+            engine: "opensea",
+            wallets: &[wallet],
+            quantities: &[args.plan_args.quantity],
+            stage_start_unix: 0,
+            stage_end_unix: 0,
+            config_fingerprint: &crate::cli::report::config_fingerprint(config_path),
+        },
+    ));
+
+    eprintln!("selected engine: OPENSEA (official OpenSea Drops API)");
+    eprintln!("session_id: {session_id}");
+    eprintln!("=================================================");
+    eprintln!(" LIVE SEND CONFIRMATION");
+    eprintln!("=================================================");
+    eprintln!(
         "chain:                {} (chain id {})",
         resolved.info.name, resolved.info.chain_id
     );
-    println!("wallet:                {}", wallet);
-    println!("collection:            {}", args.plan_args.collection);
-    println!("opensea slug:          {slug}");
-    println!("quantity:              {}", args.plan_args.quantity);
-    println!(
+    eprintln!("wallet:                {}", wallet);
+    eprintln!("collection:            {}", args.plan_args.collection);
+    eprintln!("opensea slug:          {slug}");
+    eprintln!("quantity:              {}", args.plan_args.quantity);
+    eprintln!(
         "opensea drop_type:     {} (off-chain metadata, not on-chain verified)",
         drop_details.drop_type
     );
-    println!("target contract:       {}", resolved.seadrop_contract);
-    println!("send-capable endpoints:{}", pool.send_capable().len());
-    println!("=================================================");
+    eprintln!("target contract:       {}", resolved.seadrop_contract);
+    eprintln!("send-capable endpoints:{}", pool.send_capable().len());
+    eprintln!("=================================================");
 
     if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
-        println!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        eprintln!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        if json || output.is_some() {
+            let report = crate::cli::report::build_session_report(
+                session_id,
+                plan_id,
+                started_at,
+                resolved.info.name,
+                resolved.info.chain_id,
+                args.plan_args.collection,
+                "opensea",
+                false,
+                vec![crate::cli::report::wallet_report_from_receipt(
+                    None,
+                    wallet,
+                    args.plan_args.quantity,
+                    None,
+                    None,
+                    Vec::new(),
+                )],
+                None,
+            );
+            emit_report(&report, json, output.as_deref())?;
+        }
         return Ok(());
     }
 
@@ -421,6 +594,33 @@ async fn run_send_opensea(
         report_opensea_progress(progress)
     })
     .await?;
+
+    if json || output.is_some() {
+        let broadcast =
+            crate::cli::report::build_broadcast_outcome_reports(&outcome.broadcast_results);
+        let wallet_report = crate::cli::report::wallet_report_from_receipt(
+            None,
+            wallet,
+            args.plan_args.quantity,
+            Some(outcome.prepared.tx_hash),
+            outcome.receipt_state.as_ref(),
+            broadcast,
+        );
+        let report = crate::cli::report::build_session_report(
+            session_id,
+            plan_id,
+            started_at,
+            resolved.info.name,
+            resolved.info.chain_id,
+            args.plan_args.collection,
+            "opensea",
+            false,
+            vec![wallet_report],
+            Some(outcome.metrics),
+        );
+        emit_report(&report, json, output.as_deref())?;
+        return Ok(());
+    }
 
     print_broadcast_result(
         outcome.prepared.tx_hash,
@@ -521,43 +721,46 @@ pub fn confirmation_satisfied(yes: bool, mut read_line: impl FnMut() -> Option<S
 }
 
 fn read_stdin_confirmation() -> Option<String> {
-    print!("Type 'yes' to broadcast live, anything else to abort: ");
+    eprint!("Type 'yes' to broadcast live, anything else to abort: ");
     use std::io::Write;
-    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).ok()?;
     Some(line)
 }
 
+/// Progress/diagnostic text always goes to stderr -- never stdout, in
+/// either human or `--json` mode -- so stdout is always either the final
+/// human report or (with `--json`) exactly one JSON object, never a mix.
 fn report_progress(progress: LiveProgress, receipt_pending_announced: &mut bool) {
     match progress {
-        LiveProgress::Benchmarking => println!("[benchmark] sampling endpoint latency"),
+        LiveProgress::Benchmarking => eprintln!("[benchmark] sampling endpoint latency"),
         LiveProgress::Prewarming { scheduling } => {
             let mode = match scheduling {
                 crate::execution::live::PrewarmScheduling::StageRelative => "stage-relative",
                 crate::execution::live::PrewarmScheduling::Immediate => "immediate",
             };
-            println!("[prewarm] rewarming connections ({mode})");
+            eprintln!("[prewarm] rewarming connections ({mode})");
         }
-        LiveProgress::Checkpoint(Checkpoint::StateCheck) => println!("[checkpoint] state check"),
+        LiveProgress::Checkpoint(Checkpoint::StateCheck) => eprintln!("[checkpoint] state check"),
         LiveProgress::Checkpoint(Checkpoint::Refresh) => {
-            println!("[checkpoint] refresh (nonce/fee/balance/supply)")
+            eprintln!("[checkpoint] refresh (nonce/fee/balance/supply)")
         }
         LiveProgress::Checkpoint(Checkpoint::Finalize) => {
-            println!("[checkpoint] finalize (sign + serialize)")
+            eprintln!("[checkpoint] finalize (sign + serialize)")
         }
         LiveProgress::Waiting(SleepSegment::Coarse(d)) => {
-            println!("[waiting] {} s until next checkpoint", d.whole_seconds())
+            eprintln!("[waiting] {} s until next checkpoint", d.whole_seconds())
         }
         LiveProgress::Waiting(SleepSegment::Fine(_)) => {}
         LiveProgress::Broadcasting {
             send_endpoint_count,
         } => {
-            println!("[dispatch] broadcasting to {send_endpoint_count} endpoint(s)");
+            eprintln!("[dispatch] broadcasting to {send_endpoint_count} endpoint(s)");
         }
         LiveProgress::ReceiptPending => {
             if !*receipt_pending_announced {
-                println!("[receipt] waiting for confirmation...");
+                eprintln!("[receipt] waiting for confirmation...");
                 *receipt_pending_announced = true;
             }
         }
@@ -566,32 +769,32 @@ fn report_progress(progress: LiveProgress, receipt_pending_announced: &mut bool)
 
 fn report_opensea_progress(progress: OpenSeaProgress) {
     match progress {
-        OpenSeaProgress::Benchmarking => println!("[benchmark] sampling endpoint latency"),
+        OpenSeaProgress::Benchmarking => eprintln!("[benchmark] sampling endpoint latency"),
         OpenSeaProgress::FetchingDropDetails => {
-            println!("[opensea] fetching drop details")
+            eprintln!("[opensea] fetching drop details")
         }
         OpenSeaProgress::Prewarming { scheduling } => {
             let mode = match scheduling {
                 crate::execution::live::PrewarmScheduling::StageRelative => "stage-relative",
                 crate::execution::live::PrewarmScheduling::Immediate => "immediate",
             };
-            println!("[prewarm] rewarming connections ({mode})");
+            eprintln!("[prewarm] rewarming connections ({mode})");
         }
         OpenSeaProgress::Waiting(SleepSegment::Coarse(d)) => {
-            println!("[waiting] {} s until stage open", d.whole_seconds())
+            eprintln!("[waiting] {} s until stage open", d.whole_seconds())
         }
         OpenSeaProgress::Waiting(SleepSegment::Fine(_)) => {}
         OpenSeaProgress::RequestingMintTransaction => {
-            println!("[opensea] requesting mint transaction")
+            eprintln!("[opensea] requesting mint transaction")
         }
-        OpenSeaProgress::Validating => println!("[opensea] validating response locally"),
-        OpenSeaProgress::Simulating => println!("[chain] simulating transaction"),
+        OpenSeaProgress::Validating => eprintln!("[opensea] validating response locally"),
+        OpenSeaProgress::Simulating => eprintln!("[chain] simulating transaction"),
         OpenSeaProgress::Broadcasting {
             send_endpoint_count,
         } => {
-            println!("[dispatch] broadcasting to {send_endpoint_count} endpoint(s)");
+            eprintln!("[dispatch] broadcasting to {send_endpoint_count} endpoint(s)");
         }
-        OpenSeaProgress::ReceiptPending => println!("[receipt] waiting for confirmation..."),
+        OpenSeaProgress::ReceiptPending => eprintln!("[receipt] waiting for confirmation..."),
     }
 }
 

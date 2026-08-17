@@ -142,6 +142,35 @@ impl HttpTransport {
             timeout,
         }
     }
+
+    /// Describe a `reqwest::Error` WITHOUT ever using its top-level
+    /// `Display`/`to_string()` -- `reqwest::Error` embeds the full request
+    /// URL (including any userinfo credentials or query-string token) in
+    /// its own `Display` output, which would otherwise flow straight into
+    /// `TransportError::Network` and out to `doctor`/error text. The
+    /// underlying cause (`source()`) describes the failure (DNS, connect,
+    /// TLS, etc.) without the URL, so this is used instead; `mask_url` is
+    /// the only place a configured endpoint's URL is ever meant to reach
+    /// output, deliberately redacted.
+    fn describe_network_error(e: &reqwest::Error) -> String {
+        let kind = if e.is_timeout() {
+            "timeout"
+        } else if e.is_connect() {
+            "connect error"
+        } else if e.is_request() {
+            "request error"
+        } else if e.is_body() {
+            "body error"
+        } else if e.is_decode() {
+            "decode error"
+        } else {
+            "network error"
+        };
+        match std::error::Error::source(e) {
+            Some(source) => format!("{kind}: {source}"),
+            None => kind.to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -159,12 +188,12 @@ impl Transport for HttpTransport {
         let response = tokio::time::timeout(self.timeout, request)
             .await
             .map_err(|_| TransportError::Timeout(self.timeout))?
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+            .map_err(|e| TransportError::Network(Self::describe_network_error(&e)))?;
 
         let value: Value = tokio::time::timeout(self.timeout, response.json())
             .await
             .map_err(|_| TransportError::Timeout(self.timeout))?
-            .map_err(|e| TransportError::InvalidJson(e.to_string()))?;
+            .map_err(|e| TransportError::InvalidJson(Self::describe_network_error(&e)))?;
 
         Ok(value)
     }
@@ -183,12 +212,12 @@ impl Transport for HttpTransport {
         let response = tokio::time::timeout(self.timeout, request)
             .await
             .map_err(|_| TransportError::Timeout(self.timeout))?
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+            .map_err(|e| TransportError::Network(Self::describe_network_error(&e)))?;
 
         let value: Value = tokio::time::timeout(self.timeout, response.json())
             .await
             .map_err(|_| TransportError::Timeout(self.timeout))?
-            .map_err(|e| TransportError::InvalidJson(e.to_string()))?;
+            .map_err(|e| TransportError::InvalidJson(Self::describe_network_error(&e)))?;
 
         Ok(value)
     }
