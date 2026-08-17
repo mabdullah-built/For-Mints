@@ -61,6 +61,17 @@ Pure, I/O-free math: `Eip1559Fees` (enforces `max_fee >= base_fee`, `priority <=
 
 `cli::report::compute_plan_id` hashes (truncated keccak256) the safe facts that define a planned mint intent — chain id, collection, engine, wallet(s), quantity, stage window, a config-path fingerprint — deliberately excluding the generation timestamp, so two `plan`/`mint` invocations for the same underlying intent produce the same `plan_id`; `generated_at` carries per-invocation timing separately. `cli::report::generate_session_id` produces a fresh random 128-bit id before any signing happens, used only for correlating a session's own report/logs with itself. `execution::errors::KairoxErrorCode` maps every structurally-typed internal error onto a stable external code; `BroadcastOutcome::error_code`/`ReceiptState::error_code` cover the two outcome families (`BROADCAST_FATAL`/`BROADCAST_UNCERTAIN`, `RECEIPT_REVERT`/`RECEIPT_MINT_MISMATCH`) that are not `KairoxError`s at all, since they're not failures of the Kairox process — they're accurately-classified real-world outcomes.
 
+## Timeouts and retry policy
+
+| Timeout | Default source | Where |
+|---|---|---|
+| Per-RPC-call timeout | `RpcEndpoint`'s configured timeout (`KAIROX_RPC_*_TIMEOUT_MS`, or `chain::endpoint::DEFAULT_RPC_TIMEOUT`) | `chain::rpc::HttpTransport` |
+| Broadcast/receipt timeout | `execution::profile::ExecutionProfile::for_chain` (per-chain default), overridable via `--receipt-timeout-secs`/`--receipt-poll-interval-ms` | `execution::live`, `execution::opensea_engine` |
+| OpenSea API call timeout | Fixed 10s (`load_opensea_client`) | `cli::commands::mint` |
+| `kairox receipt` recheck timeout | `--timeout-secs` (default 10s) — deliberately short: a bounded recheck, not an open-ended watch | `cli::commands::receipt` |
+
+Retry policy is bounded and explicit everywhere it exists, never silent/unbounded: `execution::opensea_engine`'s mint-request retry loop is capped at a fixed `MAX_ATTEMPTS` (3) and only retries `Retryable`-categorized errors (timeout, 5xx, 429) — never a `Fatal` or `MustStopSession` one. Nothing in Kairox retries a broadcast once a transaction has been signed; see [docs/security.md](security.md#uncertain-broadcast-handling).
+
 ## Recovery utilities
 
 `.research/nft-public-mint` and `.research/osnm-z` are read-only reference implementations, used only to cross-check protocol behavior against real source when something in the SeaDrop/OpenSea integration needed independent verification (e.g. the EIP-712 domain, the exact allow-list leaf encoding, the aggregate-supply query safety argument in the security doc). Nothing in `src/` depends on them at build or run time, and `git diff -- .research` is expected to always be empty.
