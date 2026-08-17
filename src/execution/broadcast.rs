@@ -6,9 +6,12 @@
 //! variant, and it never manufactures a second transaction hash for one
 //! intended attempt.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
+use futures_util::stream::{self, StreamExt};
 use time::OffsetDateTime;
 
 use crate::chain::rpc::{PreparedBroadcast, RpcClient, RpcError, TransportError};
@@ -142,46 +145,171 @@ pub async fn broadcast_to_all(
     clients: &[&RpcClient],
     prepared: &PreparedBroadcast,
 ) -> Vec<EndpointBroadcastResult> {
-    let attempts = clients.iter().enumerate().map(|(i, client)| async move {
-        let label = client
-            .label()
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("endpoint[{i}]"));
-        let dispatched_at = OffsetDateTime::now_utc();
-        let started = Instant::now();
-        let result = client.broadcast_prepared(prepared).await;
-        let elapsed = started.elapsed();
-        let responded_at = Some(OffsetDateTime::now_utc());
-        let latency_ms = Some(duration_ms(elapsed));
-
-        let outcome = match result {
-            Ok(reported_hash) if reported_hash == prepared.tx_hash => BroadcastOutcome::Accepted {
-                tx_hash: reported_hash,
-            },
-            Ok(reported_hash) => BroadcastOutcome::FatalRejection {
-                message: format!(
-                    "endpoint returned unexpected tx hash {reported_hash} (expected {})",
-                    prepared.tx_hash
-                ),
-            },
-            Err(e) => classify_send_error(&e),
-        };
-
-        EndpointBroadcastResult {
-            label,
-            role: client.role(),
-            dispatched_at,
-            responded_at,
-            latency_ms,
-            outcome,
-        }
-    });
+    let attempts = clients
+        .iter()
+        .enumerate()
+        .map(|(i, client)| attempt_broadcast(client, prepared, format!("endpoint[{i}]")));
 
     futures_util::future::join_all(attempts).await
 }
 
+/// One endpoint's single `eth_sendRawTransaction` attempt: dispatch, time
+/// it, and classify the result. Shared by [`broadcast_to_all`] (every
+/// endpoint for one wallet, unbounded fan-out — the single-wallet hot path)
+/// and [`dispatch_broadcast_matrix`] (every (wallet, endpoint) pair across
+/// an entire multi-wallet session, bounded).
+async fn attempt_broadcast(
+    client: &RpcClient,
+    prepared: &PreparedBroadcast,
+    default_label: String,
+) -> EndpointBroadcastResult {
+    let label = client.label().map(str::to_string).unwrap_or(default_label);
+    let dispatched_at = OffsetDateTime::now_utc();
+    let started = Instant::now();
+    let result = client.broadcast_prepared(prepared).await;
+    let elapsed = started.elapsed();
+    let responded_at = Some(OffsetDateTime::now_utc());
+    let latency_ms = Some(duration_ms(elapsed));
+
+    let outcome = match result {
+        Ok(reported_hash) if reported_hash == prepared.tx_hash => BroadcastOutcome::Accepted {
+            tx_hash: reported_hash,
+        },
+        Ok(reported_hash) => BroadcastOutcome::FatalRejection {
+            message: format!(
+                "endpoint returned unexpected tx hash {reported_hash} (expected {})",
+                prepared.tx_hash
+            ),
+        },
+        Err(e) => classify_send_error(&e),
+    };
+
+    EndpointBroadcastResult {
+        label,
+        role: client.role(),
+        dispatched_at,
+        responded_at,
+        latency_ms,
+        outcome,
+    }
+}
+
 fn duration_ms(d: Duration) -> u64 {
     d.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// One `(wallet, endpoint)` submission unit in a multi-wallet broadcast
+/// session's precomputed dispatch matrix. The transaction itself
+/// (`prepared`) was already signed and serialized ahead of T=0 — this is
+/// transport scheduling only, never a source of endpoint-specific
+/// transaction variants. `wallet_index` is the stable identity a result is
+/// reassociated by; network completion order carries no identity of its
+/// own.
+pub struct BroadcastJob<'a> {
+    pub wallet_index: usize,
+    pub client: &'a RpcClient,
+    pub prepared: &'a PreparedBroadcast,
+}
+
+/// Real, observed facts about a dispatched [`BroadcastJob`] matrix — not a
+/// formula derived from the configured bound.
+#[derive(Debug, Clone, Default)]
+pub struct BroadcastMatrixMetrics {
+    /// The maximum number of individual `eth_sendRawTransaction` requests
+    /// that were simultaneously in flight across the whole matrix, at any
+    /// instant. Never exceeds the `concurrency` bound passed to
+    /// [`dispatch_broadcast_matrix`].
+    pub peak_concurrency: usize,
+    /// The timestamp of the very first job's dispatch.
+    pub first_dispatch_at: Option<OffsetDateTime>,
+    /// The timestamp of the very last job's response.
+    pub last_responded_at: Option<OffsetDateTime>,
+}
+
+/// Dispatch every `(wallet, endpoint)` job in `jobs`, bounded to at most
+/// `concurrency` individual `eth_sendRawTransaction` requests in flight at
+/// once across the ENTIRE matrix — not merely `concurrency` wallets each
+/// allowed to fan out to every endpoint unboundedly. `jobs`' order controls
+/// dispatch fairness (see the multi-wallet caller, which builds it
+/// endpoint-major round-robin so no wallet's requests are able to
+/// systematically starve another wallet's first opportunity to dispatch).
+///
+/// Results are tagged with their job's `wallet_index` and returned in
+/// completion order (which is *not* dispatch order) — callers must
+/// regroup by `wallet_index`, never rely on position, to reconstruct each
+/// wallet's own [`BroadcastSummary`] independently of every other
+/// wallet's.
+pub async fn dispatch_broadcast_matrix(
+    jobs: Vec<BroadcastJob<'_>>,
+    concurrency: usize,
+) -> (
+    Vec<(usize, EndpointBroadcastResult)>,
+    BroadcastMatrixMetrics,
+) {
+    let active = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let first_dispatch_at = Mutex::new(None::<OffsetDateTime>);
+    let last_responded_at = Mutex::new(None::<OffsetDateTime>);
+
+    let results: Vec<(usize, EndpointBroadcastResult)> =
+        stream::iter(jobs.into_iter().enumerate().map(|(job_index, job)| {
+            let active = &active;
+            let peak = &peak;
+            let first_dispatch_at = &first_dispatch_at;
+            let last_responded_at = &last_responded_at;
+            async move {
+                {
+                    let mut first = first_dispatch_at.lock().expect("mutex poisoned");
+                    if first.is_none() {
+                        *first = Some(OffsetDateTime::now_utc());
+                    }
+                }
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now_active, Ordering::SeqCst);
+
+                let result =
+                    attempt_broadcast(job.client, job.prepared, format!("endpoint[{job_index}]"))
+                        .await;
+
+                active.fetch_sub(1, Ordering::SeqCst);
+                {
+                    let mut last = last_responded_at.lock().expect("mutex poisoned");
+                    *last = Some(OffsetDateTime::now_utc());
+                }
+
+                (job.wallet_index, result)
+            }
+        }))
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    let metrics = BroadcastMatrixMetrics {
+        peak_concurrency: peak.load(Ordering::SeqCst),
+        first_dispatch_at: *first_dispatch_at.lock().expect("mutex poisoned"),
+        last_responded_at: *last_responded_at.lock().expect("mutex poisoned"),
+    };
+
+    (results, metrics)
+}
+
+/// Regroup [`dispatch_broadcast_matrix`]'s flat, completion-ordered results
+/// back into one [`EndpointBroadcastResult`] list per wallet, indexed by
+/// `wallet_index` -- exactly `wallet_count` entries, each possibly empty if
+/// that wallet had zero send-capable endpoints (should not happen given
+/// upstream validation, but never panics either way).
+pub fn group_broadcast_results_by_wallet(
+    results: Vec<(usize, EndpointBroadcastResult)>,
+    wallet_count: usize,
+) -> Vec<Vec<EndpointBroadcastResult>> {
+    let mut by_wallet: Vec<Vec<EndpointBroadcastResult>> =
+        (0..wallet_count).map(|_| Vec::new()).collect();
+    for (wallet_index, result) in results {
+        if let Some(bucket) = by_wallet.get_mut(wallet_index) {
+            bucket.push(result);
+        }
+    }
+    by_wallet
 }
 
 /// The overall verdict across every endpoint's broadcast attempt for one

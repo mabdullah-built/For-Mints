@@ -55,6 +55,25 @@ pub enum ValidatedMintKind {
     ServerSigned,
 }
 
+/// A locally-decoded, locally-validated absolute stage-supply ceiling —
+/// populated ONLY from calldata Kairox itself decoded and validated (an
+/// allow-list/server-signed mint's own `MintParams.maxTokenSupplyForStage`),
+/// never from untrusted OpenSea API metadata. `None` for a public mint,
+/// which carries no such per-stage `MintParams` at all.
+///
+/// Per the official SeaDrop contract (`SeaDropErrorsAndEvents`/`SeaDrop`'s
+/// `_checkMintQuantity`), `maxTokenSupplyForStage` is enforced as an
+/// ABSOLUTE total-supply ceiling for that stage: the contract reverts
+/// unless `currentTotalSupply + quantity <= maxTokenSupplyForStage`. It is
+/// NOT a separate "minted during this stage" counter. Kairox's aggregate
+/// safety check (see [`crate::execution::multi_wallet`]) must apply the
+/// same arithmetic against the same collection-wide `currentTotalSupply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageSupplyConstraint {
+    pub drop_stage_index: U256,
+    pub max_token_supply_for_stage: U256,
+}
+
 /// A validated, safe-to-sign mint transaction derived from an OpenSea
 /// response. Everything on this struct has passed every check this module
 /// implements — see [`validate_opensea_mint_response`].
@@ -64,6 +83,7 @@ pub struct ValidatedOpenSeaMint {
     pub calldata: Bytes,
     pub value: U256,
     pub kind: ValidatedMintKind,
+    pub stage_constraint: Option<StageSupplyConstraint>,
 }
 
 /// Validate an OpenSea `DropMintResponse` against `input`, decoding,
@@ -127,7 +147,7 @@ pub async fn validate_opensea_mint_response(
         }
     })?;
 
-    let kind = match decoded {
+    let (kind, stage_constraint) = match decoded {
         SeaDropMintKind::TokenGated => {
             return Err(OpenSeaError::UnsupportedSelector {
                 selector: "mintAllowedTokenHolder (token-gated, unsupported in Phase 4)".into(),
@@ -142,7 +162,11 @@ pub async fn validate_opensea_mint_response(
                 signed.quantity,
             )?;
             verify_server_signed_mint(input, target, &signed, read_client).await?;
-            ValidatedMintKind::ServerSigned
+            let constraint = StageSupplyConstraint {
+                drop_stage_index: signed.mint_params.drop_stage_index,
+                max_token_supply_for_stage: signed.mint_params.max_token_supply_for_stage,
+            };
+            (ValidatedMintKind::ServerSigned, Some(constraint))
         }
         SeaDropMintKind::Public(public) => {
             validate_common_fields(
@@ -151,7 +175,7 @@ pub async fn validate_opensea_mint_response(
                 public.minter_if_not_payer,
                 public.quantity,
             )?;
-            ValidatedMintKind::Public
+            (ValidatedMintKind::Public, None)
         }
         SeaDropMintKind::AllowList(allow_list) => {
             validate_common_fields(
@@ -161,7 +185,11 @@ pub async fn validate_opensea_mint_response(
                 allow_list.quantity,
             )?;
             verify_allow_list_proof(input, target, &allow_list, read_client).await?;
-            ValidatedMintKind::AllowList
+            let constraint = StageSupplyConstraint {
+                drop_stage_index: allow_list.mint_params.drop_stage_index,
+                max_token_supply_for_stage: allow_list.mint_params.max_token_supply_for_stage,
+            };
+            (ValidatedMintKind::AllowList, Some(constraint))
         }
     };
 
@@ -191,6 +219,7 @@ pub async fn validate_opensea_mint_response(
         calldata,
         value,
         kind,
+        stage_constraint,
     })
 }
 

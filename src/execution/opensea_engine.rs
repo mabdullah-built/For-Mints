@@ -16,8 +16,10 @@ use alloy_primitives::{Address, U256, keccak256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use alloy_primitives::Bytes;
+
 use crate::chain::pool::RpcPool;
-use crate::chain::registry::ChainInfo;
+use crate::chain::registry::{ChainId, ChainInfo};
 use crate::chain::rpc::PreparedBroadcast;
 use crate::domain::fees::{Eip1559Fees, SafetyCaps, worst_case_total_spend};
 use crate::domain::timing::SleepSegment;
@@ -34,7 +36,9 @@ use super::broadcast::{
 use super::errors::{KairoxError, SessionError};
 use super::live::PrewarmScheduling;
 use super::metrics::{LatencyMetrics, Stopwatch};
-use super::opensea_validate::{OpenSeaValidationInput, validate_opensea_mint_response};
+use super::opensea_validate::{
+    OpenSeaValidationInput, StageSupplyConstraint, validate_opensea_mint_response,
+};
 use super::prepared::PreparedTransaction;
 use super::receipt::{ReceiptState, poll_receipt};
 use super::scheduler::sleep_until;
@@ -264,39 +268,73 @@ pub struct OpenSeaWalletMintOutcome {
     pub metrics: LatencyMetrics,
 }
 
+/// Everything [`finalize_and_broadcast_opensea_wallet`] needs to sign,
+/// broadcast, and confirm one wallet's mint — computed by
+/// [`prepare_opensea_wallet_unsigned`] entirely from OpenSea/on-chain state
+/// Kairox already validated. Deliberately does NOT hold the signer or any
+/// key material; `worst_case_total_spend` is the exact real cost a
+/// multi-wallet aggregate session-spend-cap check needs, and
+/// `stage_constraint` is the exact real fact a multi-wallet aggregate
+/// stage-supply check needs -- both available and checkable before this
+/// wallet (or any other wallet in the same session) is ever signed.
+#[derive(Debug, Clone)]
+pub struct PreparedOpenSeaUnsignedWallet {
+    chain_id: ChainId,
+    wallet: Address,
+    nft_contract: Address,
+    nonce: u64,
+    target: Address,
+    value: U256,
+    calldata: Bytes,
+    quantity: u64,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    stage_start: OffsetDateTime,
+    metrics: LatencyMetrics,
+    /// This wallet's exact, real (post-gas-estimate) worst-case total
+    /// spend -- the number an aggregate session-spend cap must be checked
+    /// against, not a declared upper bound.
+    pub worst_case_total_spend: U256,
+    /// Populated only for an allow-list/server-signed mint, from
+    /// LOCALLY-DECODED-AND-VALIDATED calldata -- never from untrusted
+    /// OpenSea API metadata. `None` for a public mint.
+    pub stage_constraint: Option<StageSupplyConstraint>,
+}
+
 /// Request wallet-specific mint data from OpenSea (bounded retry), validate
-/// it locally (untrusted input), revalidate/simulate on-chain, sign once,
-/// fan out the identical raw bytes to every selected send-capable
-/// endpoint, and poll for a receipt — for exactly one wallet.
+/// it locally (untrusted input), and revalidate/simulate on-chain --
+/// everything [`run_opensea_mint_for_wallet`] does up to (but not
+/// including) signing. Split out so a multi-wallet session can compute
+/// every eligible wallet's real, finalized worst-case cost and validated
+/// stage-supply constraint, and check aggregate invariants across the
+/// whole eligible set, strictly BEFORE any wallet is signed (see
+/// [`finalize_and_broadcast_opensea_wallet`]) -- signing is the one step
+/// that must never happen ahead of those checks.
 ///
-/// This is the per-wallet unit [`run_opensea_mint`] (single wallet) and
-/// Kairox's multi-wallet OpenSea orchestrator both call: every wallet in a
-/// multi-wallet session gets its own independent call to this function, so
-/// no wallet's proof/signature/calldata is ever shared with another's (see
-/// `execution::multi_wallet` module docs) and a slow or ineligible wallet
-/// never blocks another wallet's progress.
-pub async fn run_opensea_mint_for_wallet(
+/// `signer_address` is only compared against `params.wallet` (a public key
+/// check, not a signing operation), so a wrong-key wallet still fails fast.
+pub async fn prepare_opensea_wallet_unsigned(
     opensea: &OpenSeaClient,
     read_client: &crate::chain::rpc::RpcClient,
-    send_clients: &[&crate::chain::rpc::RpcClient],
-    signer: &dyn Signer,
+    signer_address: Address,
     params: &OpenSeaWalletMintParams<'_>,
     mut on_progress: impl FnMut(OpenSeaProgress),
-) -> Result<OpenSeaWalletMintOutcome, KairoxError> {
-    if signer.address() != params.wallet {
+) -> Result<PreparedOpenSeaUnsignedWallet, KairoxError> {
+    if signer_address != params.wallet {
         return Err(KairoxError::Session(SessionError(format!(
             "loaded signing key resolves to {}, but wallet was {}; refusing to proceed",
-            signer.address(),
-            params.wallet
+            signer_address, params.wallet
         ))));
     }
 
     let mut metrics = LatencyMetrics::default();
 
-    // CRITICAL PATH START — everything from here to DISPATCH is the
-    // OpenSea-dependent part measured by `api_to_dispatch_ms`.
-    let api_to_dispatch_sw = Stopwatch::start();
-
+    // CRITICAL PATH START — everything from here to DISPATCH (which now
+    // happens in `finalize_and_broadcast_opensea_wallet`) is the
+    // OpenSea-dependent part measured by `api_to_dispatch_ms`; this
+    // function's caller carries the stopwatch across the split so the
+    // measurement stays honest end-to-end in streaming mode.
     on_progress(OpenSeaProgress::RequestingMintTransaction);
     let sw = Stopwatch::start();
     let quantity_u32 = u32::try_from(params.quantity).map_err(|_| {
@@ -381,15 +419,66 @@ pub async fn run_opensea_mint_for_wallet(
         ))));
     }
 
-    let unsigned = UnsignedEip1559Tx {
+    metrics.signed_engine_prepare_ms = Some(prepare_sw.elapsed_ms());
+
+    Ok(PreparedOpenSeaUnsignedWallet {
         chain_id: params.chain.chain_id,
+        wallet: params.wallet,
+        nft_contract: params.nft_contract,
         nonce,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
-        max_fee_per_gas: fees.max_fee_per_gas(),
-        gas_limit,
-        to: validated.target,
+        target: validated.target,
         value: validated.value,
-        data: validated.calldata.clone(),
+        calldata: validated.calldata,
+        quantity: params.quantity,
+        gas_limit,
+        max_fee_per_gas: fees.max_fee_per_gas(),
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
+        stage_start: params
+            .known_stage_start
+            .unwrap_or_else(OffsetDateTime::now_utc),
+        metrics,
+        worst_case_total_spend: worst_case_total,
+        stage_constraint: validated.stage_constraint,
+    })
+}
+
+/// Sign an already-validated [`PreparedOpenSeaUnsignedWallet`], fan the
+/// identical raw bytes out to every selected send-capable endpoint, and
+/// poll for a receipt. The only step in the OpenSea per-wallet pipeline
+/// that touches the private key -- callers that need to check an aggregate
+/// invariant across multiple wallets (a session spend cap, an aggregate
+/// stage-supply ceiling) must do so against the unsigned plan's
+/// `worst_case_total_spend`/`stage_constraint` before calling this, never
+/// after.
+/// Bundles [`finalize_and_broadcast_opensea_wallet`]'s two receipt-polling
+/// knobs so the function stays under clippy's argument-count lint without
+/// losing any of the caller-configurable behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiptPollConfig {
+    pub interval: StdDuration,
+    pub timeout: StdDuration,
+}
+
+pub async fn finalize_and_broadcast_opensea_wallet(
+    signer: &dyn Signer,
+    send_clients: &[&crate::chain::rpc::RpcClient],
+    read_client: &crate::chain::rpc::RpcClient,
+    plan: PreparedOpenSeaUnsignedWallet,
+    receipt_poll: ReceiptPollConfig,
+    api_to_dispatch_sw: &Stopwatch,
+    mut on_progress: impl FnMut(OpenSeaProgress),
+) -> Result<OpenSeaWalletMintOutcome, KairoxError> {
+    let mut metrics = plan.metrics;
+
+    let unsigned = UnsignedEip1559Tx {
+        chain_id: plan.chain_id,
+        nonce: plan.nonce,
+        max_priority_fee_per_gas: plan.max_priority_fee_per_gas,
+        max_fee_per_gas: plan.max_fee_per_gas,
+        gas_limit: plan.gas_limit,
+        to: plan.target,
+        value: plan.value,
+        data: plan.calldata.clone(),
         access_list: Vec::new(),
     };
     let signing_hash = unsigned.signing_hash();
@@ -403,22 +492,19 @@ pub async fn run_opensea_mint_for_wallet(
     let broadcast = PreparedBroadcast::build(tx_hash, raw_signed_bytes.clone());
     let broadcast_prepare_ms = broadcast_prepare_started.elapsed().as_millis() as u64;
     metrics.broadcast_prepare_ms = Some(broadcast_prepare_ms);
-    metrics.signed_engine_prepare_ms = Some(prepare_sw.elapsed_ms());
 
     let prepared = PreparedTransaction {
-        chain_id: params.chain.chain_id,
-        wallet: params.wallet,
-        nonce,
-        target: validated.target,
-        value: validated.value,
-        calldata_hash: keccak256(&validated.calldata),
-        quantity: params.quantity,
-        gas_limit,
-        max_fee_per_gas: fees.max_fee_per_gas(),
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
-        stage_start: params
-            .known_stage_start
-            .unwrap_or_else(OffsetDateTime::now_utc),
+        chain_id: plan.chain_id,
+        wallet: plan.wallet,
+        nonce: plan.nonce,
+        target: plan.target,
+        value: plan.value,
+        calldata_hash: keccak256(&plan.calldata),
+        quantity: plan.quantity,
+        gas_limit: plan.gas_limit,
+        max_fee_per_gas: plan.max_fee_per_gas,
+        max_priority_fee_per_gas: plan.max_priority_fee_per_gas,
+        stage_start: plan.stage_start,
         signing_hash,
         raw_signed_bytes,
         tx_hash,
@@ -454,11 +540,11 @@ pub async fn run_opensea_mint_for_wallet(
         let state = poll_receipt(
             read_client,
             tx_hash,
-            params.nft_contract,
-            params.wallet,
-            params.quantity,
-            params.receipt_poll_interval,
-            params.receipt_timeout,
+            plan.nft_contract,
+            plan.wallet,
+            plan.quantity,
+            receipt_poll.interval,
+            receipt_poll.timeout,
             || on_progress(OpenSeaProgress::ReceiptPending),
         )
         .await;
@@ -475,6 +561,53 @@ pub async fn run_opensea_mint_for_wallet(
         receipt_state,
         metrics,
     })
+}
+
+/// Request wallet-specific mint data from OpenSea (bounded retry), validate
+/// it locally (untrusted input), revalidate/simulate on-chain, sign once,
+/// fan out the identical raw bytes to every selected send-capable
+/// endpoint, and poll for a receipt — for exactly one wallet. Equivalent to
+/// [`prepare_opensea_wallet_unsigned`] immediately followed by
+/// [`finalize_and_broadcast_opensea_wallet`] -- kept as a single call for
+/// the streaming (no aggregate barrier) path, which has no invariant to
+/// check between the two steps.
+///
+/// This is the per-wallet unit [`run_opensea_mint`] (single wallet) and
+/// Kairox's multi-wallet OpenSea orchestrator both call: every wallet in a
+/// multi-wallet session gets its own independent call to this function, so
+/// no wallet's proof/signature/calldata is ever shared with another's (see
+/// `execution::multi_wallet` module docs) and a slow or ineligible wallet
+/// never blocks another wallet's progress.
+pub async fn run_opensea_mint_for_wallet(
+    opensea: &OpenSeaClient,
+    read_client: &crate::chain::rpc::RpcClient,
+    send_clients: &[&crate::chain::rpc::RpcClient],
+    signer: &dyn Signer,
+    params: &OpenSeaWalletMintParams<'_>,
+    mut on_progress: impl FnMut(OpenSeaProgress),
+) -> Result<OpenSeaWalletMintOutcome, KairoxError> {
+    let api_to_dispatch_sw = Stopwatch::start();
+    let plan = prepare_opensea_wallet_unsigned(
+        opensea,
+        read_client,
+        signer.address(),
+        params,
+        &mut on_progress,
+    )
+    .await?;
+    finalize_and_broadcast_opensea_wallet(
+        signer,
+        send_clients,
+        read_client,
+        plan,
+        ReceiptPollConfig {
+            interval: params.receipt_poll_interval,
+            timeout: params.receipt_timeout,
+        },
+        &api_to_dispatch_sw,
+        &mut on_progress,
+    )
+    .await
 }
 
 /// Bounded, conservative retry for the mint-transaction request only —
