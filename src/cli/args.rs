@@ -179,6 +179,17 @@ pub struct PlanArgs {
     /// Override the automatically computed max fee per gas, in gwei (decimal).
     #[arg(long)]
     pub max_fee_gwei: Option<String>,
+    /// Emit a single JSON object on stdout instead of human-readable text.
+    /// Progress/warning text always goes to stderr, never stdout, in this
+    /// mode. Supported by `plan`, and by `mint` for a single `--wallet`
+    /// (not yet for `--wallet-manifest` multi-wallet sessions).
+    #[arg(long)]
+    pub json: bool,
+    /// Also write the same structured report to PATH (via a temp file +
+    /// rename in the same directory, so a write failure never leaves a
+    /// truncated file where a previous successful report used to be).
+    #[arg(long)]
+    pub output: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]

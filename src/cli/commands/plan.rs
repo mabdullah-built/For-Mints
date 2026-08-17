@@ -177,6 +177,36 @@ pub fn print_plan(plan: &MintPlan) {
 
 pub async fn run(args: PlanArgs, config_path: Option<&std::path::Path>) -> Result<(), KairoxError> {
     let plan = build_mint_plan(&args, config_path).await?;
+
+    if args.json || args.output.is_some() {
+        // `kairox plan` only ever builds the pure on-chain PublicSeaDropEngine
+        // plan today (see `build_mint_plan`), regardless of --engine/--slug --
+        // there is no OpenSea plan-preview pipeline yet, so the report's
+        // engine field is always "public" here.
+        let wallet = args
+            .wallet
+            .expect("build_mint_plan already required --wallet");
+        let report =
+            crate::cli::report::build_execution_plan_report(&plan, "public", wallet, config_path);
+        let json =
+            serde_json::to_string(&report).expect("ExecutionPlanReport is always serializable");
+
+        if let Some(path) = &args.output {
+            crate::cli::report::write_report_atomic(path, &json).map_err(|e| {
+                KairoxError::Session(SessionError(format!(
+                    "failed to write report to {}: {e}",
+                    path.display()
+                )))
+            })?;
+        }
+        if args.json {
+            println!("{json}");
+        } else {
+            eprintln!("Plan report written to {}", args.output.unwrap().display());
+        }
+        return Ok(());
+    }
+
     print_plan(&plan);
     Ok(())
 }

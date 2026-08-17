@@ -67,7 +67,13 @@ pub struct MintPlan {
     pub stage_start: OffsetDateTime,
     pub stage_end: OffsetDateTime,
     pub stage_status: StageStatus,
-    /// Always `true` in Phase 1 — no broadcast path exists.
+    /// Always `true`: a [`MintPlan`] is always a preview -- built by
+    /// `kairox plan`, and by `kairox mint` (both dry-run and as the
+    /// pre-signing preview before a real `--send`) -- never a record of an
+    /// actual broadcast. See [`crate::execution::live::run_live_mint`] and
+    /// [`crate::execution::opensea_engine`] for the real signing/broadcast
+    /// path, which builds its own transaction fresh rather than reusing
+    /// this preview.
     pub dry_run: bool,
 }
 
