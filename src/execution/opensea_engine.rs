@@ -334,7 +334,8 @@ pub async fn prepare_opensea_wallet_unsigned(
     // happens in `finalize_and_broadcast_opensea_wallet`) is the
     // OpenSea-dependent part measured by `api_to_dispatch_ms`; this
     // function's caller carries the stopwatch across the split so the
-    // measurement stays honest end-to-end in streaming mode.
+    // measurement stays honest end-to-end even when prepare and finalize
+    // run as separate steps (the multi-wallet aggregate-barrier path).
     on_progress(OpenSeaProgress::RequestingMintTransaction);
     let sw = Stopwatch::start();
     let quantity_u32 = u32::try_from(params.quantity).map_err(|_| {
@@ -585,15 +586,17 @@ pub async fn finalize_and_broadcast_opensea_wallet(
 /// endpoint, and poll for a receipt — for exactly one wallet. Equivalent to
 /// [`prepare_opensea_wallet_unsigned`] immediately followed by
 /// [`finalize_and_broadcast_opensea_wallet`] -- kept as a single call for
-/// the streaming (no aggregate barrier) path, which has no invariant to
-/// check between the two steps.
+/// the single-wallet path, where there is only ever one wallet and
+/// therefore no cross-wallet aggregate invariant to check between the two
+/// steps.
 ///
-/// This is the per-wallet unit [`run_opensea_mint`] (single wallet) and
-/// Kairox's multi-wallet OpenSea orchestrator both call: every wallet in a
-/// multi-wallet session gets its own independent call to this function, so
-/// no wallet's proof/signature/calldata is ever shared with another's (see
-/// `execution::multi_wallet` module docs) and a slow or ineligible wallet
-/// never blocks another wallet's progress.
+/// This is used by [`run_opensea_mint`] (single wallet) only. The
+/// multi-wallet OpenSea orchestrator in `execution::multi_wallet` calls
+/// [`prepare_opensea_wallet_unsigned`] and
+/// [`finalize_and_broadcast_opensea_wallet`] separately instead, so it can
+/// gather every wallet's unsigned response, check aggregate invariants
+/// (session cap / stage supply) across the whole eligible set, and only
+/// then release every wallet's finalize+broadcast together.
 pub async fn run_opensea_mint_for_wallet(
     opensea: &OpenSeaClient,
     read_client: &crate::chain::rpc::RpcClient,

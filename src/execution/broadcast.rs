@@ -151,10 +151,10 @@ pub async fn broadcast_to_all(
 /// A shared, session-scoped bound on the number of individual
 /// `eth_sendRawTransaction` requests allowed in flight at once, usable
 /// across multiple wallets whose broadcasts happen at different times
-/// (e.g. OpenSea streaming mode, where wallets finish independently) --
-/// unlike [`dispatch_broadcast_matrix`], which bounds one precomputed
-/// batch, this bounds an open-ended sequence of per-wallet fan-outs
-/// sharing one limiter for the whole session's lifetime.
+/// (e.g. a multi-wallet session where each wallet's receipt-poll finishes
+/// independently) -- unlike [`dispatch_broadcast_matrix`], which bounds one
+/// precomputed batch, this bounds an open-ended sequence of per-wallet
+/// fan-outs sharing one limiter for the whole session's lifetime.
 pub struct BroadcastLimiter {
     semaphore: tokio::sync::Semaphore,
     active: AtomicUsize,

@@ -842,8 +842,8 @@ pub async fn run_multi_wallet_opensea_mint(
     // Shared, session-scoped bound on the actual number of individual
     // `eth_sendRawTransaction` requests in flight at once, across EVERY
     // wallet's own broadcast -- however many wallets there are, and
-    // whenever each happens to reach its own dispatch (streaming mode's
-    // wallets broadcast at different times, unlike the public engine's
+    // whenever each happens to reach its own dispatch (each wallet's
+    // receipt poll finishes at its own pace, unlike the public engine's
     // single precomputed batch). `--broadcast-concurrency` means the same
     // thing here as it does for the public engine.
     let broadcast_limiter =
@@ -1032,14 +1032,15 @@ pub async fn run_multi_wallet_opensea_mint(
     ))
 }
 
-/// Shared aggregate-safety check for a set of unsigned-ready OpenSea
-/// wallets, used by both BARRIER mode (the whole eligible set) and
-/// STREAMING mode (only the narrow stage-constrained subset). Checks, in
+/// Shared aggregate-safety check run once over the whole eligible set of
+/// unsigned-ready OpenSea wallets, before any of them is signed. Checks, in
 /// order: the session spend cap (if `session_cap` is given) against the
 /// real, finalized `worst_case_total_spend` sum; then the aggregate
 /// stage-supply ceiling (if any wallet carries a `stage_constraint`)
-/// against a freshly-read, verified `currentTotalSupply`. Returns `Err`
-/// (never panics, never signs) the instant either check fails.
+/// against a freshly-read, verified `currentTotalSupply`. A no-op (and
+/// therefore zero extra latency) when neither a session cap nor any stage
+/// constraint applies. Returns `Err` (never panics, never signs) the
+/// instant either check fails.
 async fn check_opensea_aggregate_invariants(
     unsigned_ready: &[(
         WalletMintRequest,

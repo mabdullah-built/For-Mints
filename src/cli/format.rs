@@ -67,6 +67,11 @@ pub fn mask_url(url: &Url) -> String {
     if masked.query().is_some() {
         masked.set_query(Some("REDACTED"));
     }
+    // Basic-auth-style credentials embedded in the URL itself
+    // (`https://user:pass@host/...`) are exactly as sensitive as a query
+    // token and must never reach a doctor/bench/report output either.
+    let _ = masked.set_username("");
+    let _ = masked.set_password(None);
     masked.to_string()
 }
 
@@ -219,6 +224,14 @@ mod tests {
     fn mask_url_leaves_url_without_query_unchanged() {
         let url = Url::parse("https://example.com/v1").unwrap();
         assert_eq!(mask_url(&url), "https://example.com/v1");
+    }
+
+    #[test]
+    fn mask_url_redacts_embedded_userinfo_credentials() {
+        let url = Url::parse("https://api-user:api-secret@rpc.example.com/v1").unwrap();
+        let masked = mask_url(&url);
+        assert!(!masked.contains("api-user"));
+        assert!(!masked.contains("api-secret"));
     }
 
     #[test]
