@@ -1,11 +1,13 @@
 //! Kairox: an independent, low-latency public SeaDrop mint execution CLI.
 //!
-//! Phase 1 implements the foundation and a dry-run-only public-mint
-//! pipeline. There is no transaction-broadcasting path anywhere in this
-//! crate yet.
+//! Supports pure on-chain public SeaDrop mints and OpenSea-hosted
+//! (wallet-specific/allowlist/server-signed) drops, single-wallet and
+//! multi-wallet (self-funded only), with dry-run as the default mode --
+//! `--send` opts into live broadcast.
 
 pub mod chain;
 pub mod cli;
+pub mod config;
 pub mod domain;
 pub mod execution;
 pub mod opensea;

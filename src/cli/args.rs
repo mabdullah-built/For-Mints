@@ -8,9 +8,18 @@ use url::Url;
 #[command(
     name = "kairox",
     version,
-    about = "Independent public SeaDrop mint execution CLI (Phase 2: pre-signing + multi-RPC broadcast; dry-run by default, --send opts into live broadcast)"
+    about = "Independent public SeaDrop mint execution CLI (dry-run by default, --send opts into live broadcast)"
 )]
 pub struct Cli {
+    /// Path to a Kairox config file (see `kairox init`). Overrides
+    /// KAIROX_CONFIG and the conventional ~/.config/kairox/config.toml
+    /// path. The config file only ever names environment VARIABLES for
+    /// secrets, never secret values themselves. Currently consulted by
+    /// `kairox doctor` (which reports its parse/validation status and
+    /// contents); RPC endpoint resolution for other commands still comes
+    /// directly from --rpc-url/KAIROX_RPC_* as before.
+    #[arg(long, global = true)]
+    pub config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -18,7 +27,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Inspect the local Kairox environment. Never broadcasts anything.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Report system UTC timing information. Never modifies the system clock.
     Clock,
     /// Inspect normalized public SeaDrop state for a collection.
@@ -29,6 +38,58 @@ pub enum Command {
     Mint(MintArgs),
     /// Connect to every configured RPC endpoint for a chain and report latency/role/capability. Never signs or broadcasts.
     Bench(BenchArgs),
+    /// Write a safe starter config file. Never generates wallets, private keys, or API key values.
+    Init(InitArgs),
+    /// Read-only recheck of a known transaction's receipt and expected mint evidence. Never submits a transaction.
+    Receipt(ReceiptArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct DoctorArgs {
+    /// Emit a single JSON object on stdout instead of human-readable text.
+    /// Progress/diagnostic text (if any) goes to stderr, never stdout, so
+    /// `kairox doctor --json > report.json` always produces valid JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
+    /// Where to write the starter config. Defaults to the conventional
+    /// ~/.config/kairox/config.toml path.
+    #[arg(long)]
+    pub path: Option<std::path::PathBuf>,
+    /// Overwrite an existing file at the target path. Without this flag,
+    /// `init` refuses to touch an existing file.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ReceiptArgs {
+    #[command(flatten)]
+    pub chain_args: ChainArgs,
+    /// The transaction hash to recheck (0x...).
+    #[arg(long)]
+    pub tx: alloy_primitives::B256,
+    /// The NFT collection contract address expected to have emitted the mint Transfer event(s).
+    #[arg(long)]
+    pub collection: Address,
+    /// The wallet address expected to be the mint recipient.
+    #[arg(long)]
+    pub wallet: Address,
+    /// The number of tokens the original mint attempt requested.
+    #[arg(long, default_value_t = 1)]
+    pub quantity: u64,
+    /// How long to wait for the receipt to appear before reporting it as
+    /// still unknown, in seconds. A short bounded wait, not an open-ended
+    /// poll -- this command is for rechecking a transaction that may
+    /// already have landed, not for watching a brand-new one.
+    #[arg(long, default_value_t = 10)]
+    pub timeout_secs: u64,
+    /// Emit a single JSON object on stdout instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug, Clone)]

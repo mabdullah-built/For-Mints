@@ -17,13 +17,13 @@ use args::{Cli, Command};
 /// process exit code.
 pub async fn run() -> i32 {
     let cli = Cli::parse();
-    run_with(cli.command).await
+    run_with(cli.config, cli.command).await
 }
 
-async fn run_with(command: Command) -> i32 {
+async fn run_with(config_path: Option<std::path::PathBuf>, command: Command) -> i32 {
     let result = match command {
-        Command::Doctor => {
-            commands::doctor::run().await;
+        Command::Doctor(args) => {
+            commands::doctor::run(args, config_path.as_deref()).await;
             Ok(())
         }
         Command::Clock => {
@@ -34,6 +34,8 @@ async fn run_with(command: Command) -> i32 {
         Command::Plan(args) => commands::plan::run(args).await,
         Command::Mint(args) => commands::mint::run(args).await,
         Command::Bench(args) => commands::bench::run(args).await,
+        Command::Init(args) => commands::init::run(args),
+        Command::Receipt(args) => commands::receipt::run(args).await,
     };
 
     match result {
