@@ -13,7 +13,7 @@ use crate::chain::pool::{ConnectOutcome, RpcPool};
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::{EngineSelection, MintArgs};
 use crate::cli::commands::mint::confirmation_satisfied;
-use crate::cli::context::resolve_chain;
+use crate::cli::context::resolve_chain_and_runtime;
 use crate::cli::format::parse_wei;
 use crate::domain::fees::SafetyCaps;
 use crate::execution::errors::{KairoxError, SessionError};
@@ -25,7 +25,10 @@ use crate::execution::multi_wallet::{
 use crate::opensea::client::{OPENSEA_API_KEY_ENV, OpenSeaClient};
 use crate::opensea::errors::OpenSeaError;
 
-pub async fn run_manifest(args: MintArgs) -> Result<(), KairoxError> {
+pub async fn run_manifest(
+    args: MintArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     let manifest_path = args
         .wallet_manifest
         .as_ref()
@@ -49,9 +52,9 @@ pub async fn run_manifest(args: MintArgs) -> Result<(), KairoxError> {
     };
 
     if args.send {
-        run_manifest_send(args, manifest, engine).await
+        run_manifest_send(args, manifest, engine, config_path).await
     } else {
-        run_manifest_dry_run(args, manifest, engine).await
+        run_manifest_dry_run(args, manifest, engine, config_path).await
     }
 }
 
@@ -119,13 +122,23 @@ fn multi_wallet_config(args: &MintArgs) -> Result<MultiWalletConfig, KairoxError
 
 async fn connect_pool_for_manifest(
     args: &MintArgs,
+    config_path: Option<&std::path::Path>,
 ) -> Result<(crate::cli::context::ResolvedChain, RpcPool), KairoxError> {
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.plan_args.chain_args)?;
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
     let endpoints: Vec<RpcEndpoint> = if let Some(url) = &args.plan_args.chain_args.rpc_url {
         vec![RpcEndpoint::new(url.clone(), EndpointRole::ReadWrite)]
     } else {
-        load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+        let from_config = crate::cli::context::config_endpoints_for_chain(
+            &resolved.info,
+            runtime.config.as_ref(),
+        );
+        if !from_config.is_empty() {
+            from_config
+        } else {
+            load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+        }
     };
     let (pool, reports) = RpcPool::connect_all(resolved.info.chain_id, &endpoints).await;
     for report in &reports {
@@ -144,13 +157,14 @@ async fn run_manifest_dry_run(
     args: MintArgs,
     manifest: WalletManifest,
     engine: Engine,
+    config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
     println!("=================================================");
     println!(" MULTI-WALLET DRY RUN — NO TRANSACTION BROADCAST");
     println!("=================================================");
     println!();
 
-    let (resolved, mut pool) = connect_pool_for_manifest(&args).await?;
+    let (resolved, mut pool) = connect_pool_for_manifest(&args, config_path).await?;
     pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::default())
         .await;
 
@@ -233,8 +247,9 @@ async fn run_manifest_send(
     args: MintArgs,
     manifest: WalletManifest,
     engine: Engine,
+    config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
-    let (resolved, mut pool) = connect_pool_for_manifest(&args).await?;
+    let (resolved, mut pool) = connect_pool_for_manifest(&args, config_path).await?;
     if pool.send_capable().is_empty() {
         return Err(KairoxError::Session(SessionError(
             "no send-capable RPC endpoint connected; cannot broadcast live".into(),

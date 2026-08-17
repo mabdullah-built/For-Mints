@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::PlanArgs;
-use crate::cli::context::{connect_read_client, resolve_chain};
+use crate::cli::context::{connect_read_client, resolve_chain_and_runtime};
 use crate::cli::format::{format_selector, format_unix, parse_gwei_to_wei, parse_wei};
 use crate::cli::gather;
 use crate::domain::fees::SafetyCaps;
@@ -16,15 +16,23 @@ use crate::protocol::seadrop::{encode_mint_public, select_fee_recipient};
 
 /// Fetch on-chain state and produce a validated [`MintPlan`]. Shared by
 /// both `kairox plan` and `kairox mint` (which stops before any broadcast).
-pub async fn build_mint_plan(args: &PlanArgs) -> Result<MintPlan, KairoxError> {
+pub async fn build_mint_plan(
+    args: &PlanArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<MintPlan, KairoxError> {
     let wallet = args.wallet.ok_or_else(|| {
         KairoxError::Session(SessionError(
             "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
         ))
     })?;
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.chain_args)?;
-    let client = connect_read_client(&resolved.info, args.chain_args.rpc_url.as_ref()).await?;
+    let (resolved, runtime) = resolve_chain_and_runtime(&registry, &args.chain_args, config_path)?;
+    let client = connect_read_client(
+        &resolved.info,
+        args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
 
     // Required state: fail closed (propagate) on any of these three.
     let public_drop =
@@ -167,8 +175,8 @@ pub fn print_plan(plan: &MintPlan) {
     println!("stage status:              {:?}", plan.stage_status);
 }
 
-pub async fn run(args: PlanArgs) -> Result<(), KairoxError> {
-    let plan = build_mint_plan(&args).await?;
+pub async fn run(args: PlanArgs, config_path: Option<&std::path::Path>) -> Result<(), KairoxError> {
+    let plan = build_mint_plan(&args, config_path).await?;
     print_plan(&plan);
     Ok(())
 }

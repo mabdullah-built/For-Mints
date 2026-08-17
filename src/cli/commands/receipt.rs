@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::ReceiptArgs;
-use crate::cli::context::{connect_read_client, resolve_chain};
+use crate::cli::context::{connect_read_client, resolve_chain_and_runtime};
 use crate::execution::errors::KairoxError;
 use crate::execution::receipt::{ReceiptState, poll_receipt};
 
@@ -20,6 +20,10 @@ pub struct ReceiptCheckReport {
     pub wallet: String,
     pub expected_quantity: u64,
     pub state: String,
+    /// Stable error code for the outcome (see
+    /// [`crate::execution::errors::KairoxErrorCode`]); `None` only for
+    /// `CONFIRMED_SUCCESS`, which is not an error.
+    pub error_code: Option<String>,
     pub minted: Vec<MintedTokenReport>,
 }
 
@@ -29,10 +33,18 @@ pub struct MintedTokenReport {
     pub amount: String,
 }
 
-pub async fn run(args: ReceiptArgs) -> Result<(), KairoxError> {
+pub async fn run(
+    args: ReceiptArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.chain_args)?;
-    let read_client = connect_read_client(&resolved.info, args.chain_args.rpc_url.as_ref()).await?;
+    let (resolved, runtime) = resolve_chain_and_runtime(&registry, &args.chain_args, config_path)?;
+    let read_client = connect_read_client(
+        &resolved.info,
+        args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
 
     let state = poll_receipt(
         &read_client,
@@ -62,6 +74,7 @@ pub async fn run(args: ReceiptArgs) -> Result<(), KairoxError> {
         wallet: format!("{:#x}", args.wallet),
         expected_quantity: args.quantity,
         state: state_name.to_string(),
+        error_code: state.error_code().map(|c| c.to_string()),
         minted: minted
             .iter()
             .map(|m| MintedTokenReport {

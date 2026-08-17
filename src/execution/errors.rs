@@ -78,6 +78,139 @@ impl Categorize for SessionError {
     }
 }
 
+/// A stable, external-facing classification for a [`KairoxError`] --
+/// intended for SessionReport/`--json` output and other tooling that
+/// should match on a fixed code, never on `Display` text (which may change
+/// wording without notice). Deliberately coarser than the internal error
+/// types: several internal variants collapse onto the same code when they
+/// represent the same actionable category from an operator's perspective.
+///
+/// Two related outcome families are represented by their own typed enums
+/// instead of routing through `KairoxError` at all, because they are not
+/// errors: [`crate::execution::broadcast::BroadcastOutcome::error_code`]
+/// covers `BROADCAST_FATAL`/`BROADCAST_UNCERTAIN`, and
+/// [`crate::execution::receipt::ReceiptState::error_code`] covers
+/// `RECEIPT_REVERT`/`RECEIPT_MINT_MISMATCH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum KairoxErrorCode {
+    ConfigInvalid,
+    ChainMismatch,
+    RpcTransportError,
+    FeeInvariantViolated,
+    SafetyCapExceeded,
+    AllocationExceeded,
+    SupplyExhausted,
+    SupplyStateInvalid,
+    ProtocolDecodeError,
+    SigningError,
+    OpenSeaAuthFailed,
+    OpenSeaRateLimited,
+    NotEligible,
+    SimulationRevert,
+    OpenSeaApiError,
+    /// A [`SessionError`] not otherwise classified. `SessionError` today
+    /// carries only a human message (no structured kind), so several
+    /// conditions the Phase 6 error-code list names as their own codes --
+    /// `WALLET_KEY_MISMATCH`, `INSUFFICIENT_BALANCE`,
+    /// `SESSION_CAP_EXCEEDED`, `NO_VERIFIED_READ_RPC` -- currently surface
+    /// through this fallback rather than a dedicated variant. Giving
+    /// `SessionError` a structured kind field (so every one of its many
+    /// call sites carries a code) is real follow-up work, not done here.
+    SessionAborted,
+}
+
+impl std::fmt::Display for KairoxErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::ConfigInvalid => "CONFIG_INVALID",
+            Self::ChainMismatch => "CHAIN_MISMATCH",
+            Self::RpcTransportError => "RPC_TRANSPORT_ERROR",
+            Self::FeeInvariantViolated => "FEE_INVARIANT_VIOLATED",
+            Self::SafetyCapExceeded => "SAFETY_CAP_EXCEEDED",
+            Self::AllocationExceeded => "ALLOCATION_EXCEEDED",
+            Self::SupplyExhausted => "SUPPLY_EXHAUSTED",
+            Self::SupplyStateInvalid => "SUPPLY_STATE_INVALID",
+            Self::ProtocolDecodeError => "PROTOCOL_DECODE_ERROR",
+            Self::SigningError => "SIGNING_ERROR",
+            Self::OpenSeaAuthFailed => "OPENSEA_AUTH_FAILED",
+            Self::OpenSeaRateLimited => "OPENSEA_RATE_LIMITED",
+            Self::NotEligible => "NOT_ELIGIBLE",
+            Self::SimulationRevert => "SIMULATION_REVERT",
+            Self::OpenSeaApiError => "OPENSEA_API_ERROR",
+            Self::SessionAborted => "SESSION_ABORTED",
+        };
+        f.write_str(s)
+    }
+}
+
+impl KairoxError {
+    /// Map this error onto a stable [`KairoxErrorCode`]. Never panics.
+    pub fn code(&self) -> KairoxErrorCode {
+        use crate::domain::supply::SupplyError;
+        use crate::opensea::errors::OpenSeaError;
+
+        match self {
+            KairoxError::Config(_) => KairoxErrorCode::ConfigInvalid,
+            KairoxError::Rpc(crate::chain::rpc::RpcError::ChainIdMismatch { .. }) => {
+                KairoxErrorCode::ChainMismatch
+            }
+            KairoxError::Rpc(_) => KairoxErrorCode::RpcTransportError,
+            KairoxError::Fee(_) => KairoxErrorCode::FeeInvariantViolated,
+            KairoxError::SafetyCap(_) => KairoxErrorCode::SafetyCapExceeded,
+            KairoxError::Supply(e) => match e {
+                SupplyError::WalletAllocationExhausted
+                | SupplyError::ExceedsWalletAllocation { .. } => {
+                    KairoxErrorCode::AllocationExceeded
+                }
+                SupplyError::CollectionSoldOut | SupplyError::ExceedsCollectionSupply { .. } => {
+                    KairoxErrorCode::SupplyExhausted
+                }
+                SupplyError::WalletStateInconsistent { .. }
+                | SupplyError::CollectionStateInconsistent { .. }
+                | SupplyError::ZeroQuantity
+                | SupplyError::UnknownCollectionSupply => KairoxErrorCode::SupplyStateInvalid,
+            },
+            KairoxError::SeaDrop(_) | KairoxError::Log(_) => KairoxErrorCode::ProtocolDecodeError,
+            KairoxError::Signing(_) => KairoxErrorCode::SigningError,
+            KairoxError::OpenSea(e) => match e {
+                OpenSeaError::ApiKeyMissing | OpenSeaError::AuthenticationFailed => {
+                    KairoxErrorCode::OpenSeaAuthFailed
+                }
+                OpenSeaError::RateLimited => KairoxErrorCode::OpenSeaRateLimited,
+                OpenSeaError::DropNotFound { .. }
+                | OpenSeaError::StageInactive { .. }
+                | OpenSeaError::EligibilityRejected { .. } => KairoxErrorCode::NotEligible,
+                OpenSeaError::AllocationExceeded { .. } => KairoxErrorCode::AllocationExceeded,
+                OpenSeaError::SupplyExhausted { .. } => KairoxErrorCode::SupplyExhausted,
+                OpenSeaError::SimulationFailure { .. } => KairoxErrorCode::SimulationRevert,
+                OpenSeaError::MerkleProofInvalid
+                | OpenSeaError::SignerNotAuthorized { .. }
+                | OpenSeaError::SignerValidationParamsRejected { .. }
+                | OpenSeaError::UnexpectedTarget { .. }
+                | OpenSeaError::CollectionMismatch { .. }
+                | OpenSeaError::WalletMismatch { .. }
+                | OpenSeaError::QuantityMismatch { .. }
+                | OpenSeaError::UnsafeValue { .. }
+                | OpenSeaError::UnsupportedSelector { .. }
+                | OpenSeaError::MalformedSignature
+                | OpenSeaError::FeeRecipientNotAllowed { .. } => {
+                    KairoxErrorCode::ProtocolDecodeError
+                }
+                OpenSeaError::BadRequest { .. }
+                | OpenSeaError::MalformedApiResponse { .. }
+                | OpenSeaError::ApiTimeout
+                | OpenSeaError::ApiUnavailable { .. }
+                | OpenSeaError::ServerError { .. }
+                | OpenSeaError::UnsupportedChain { .. }
+                | OpenSeaError::SlugRequired
+                | OpenSeaError::OnChainStateUnavailable { .. } => KairoxErrorCode::OpenSeaApiError,
+            },
+            KairoxError::Session(_) => KairoxErrorCode::SessionAborted,
+        }
+    }
+}
+
 impl Categorize for KairoxError {
     fn category(&self) -> ErrorCategory {
         match self {

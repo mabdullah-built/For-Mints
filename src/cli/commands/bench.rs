@@ -7,14 +7,17 @@ use crate::chain::endpoint::RpcEndpoint;
 use crate::chain::pool::RpcPool;
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::BenchArgs;
-use crate::cli::context::resolve_chain;
+use crate::cli::context::resolve_chain_and_runtime;
 use crate::cli::format::{format_benchmark_report, mask_url};
 use crate::execution::errors::KairoxError;
 use crate::execution::profile::ExecutionProfile;
 
-pub async fn run(args: BenchArgs) -> Result<(), KairoxError> {
+pub async fn run(
+    args: BenchArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.chain_args)?;
+    let (resolved, runtime) = resolve_chain_and_runtime(&registry, &args.chain_args, config_path)?;
 
     let endpoints: Vec<RpcEndpoint> = if let Some(url) = &args.chain_args.rpc_url {
         vec![RpcEndpoint::new(
@@ -22,7 +25,15 @@ pub async fn run(args: BenchArgs) -> Result<(), KairoxError> {
             crate::chain::endpoint::EndpointRole::ReadWrite,
         )]
     } else {
-        load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+        let from_config = crate::cli::context::config_endpoints_for_chain(
+            &resolved.info,
+            runtime.config.as_ref(),
+        );
+        if !from_config.is_empty() {
+            from_config
+        } else {
+            load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+        }
     };
 
     println!(

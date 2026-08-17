@@ -41,6 +41,22 @@ pub enum ReceiptState {
     ReceiptUnknown,
 }
 
+impl ReceiptState {
+    /// Stable external error code for this outcome, or `None` for
+    /// `ConfirmedSuccess`, which is not an error. `ReceiptUnknown` has no
+    /// dedicated code in the Phase 6 minimum list -- it is reported via its
+    /// own state name (`RECEIPT_UNKNOWN`) rather than an error code, since
+    /// it is explicitly "genuinely unknown," not a definite failure.
+    pub fn error_code(&self) -> Option<&'static str> {
+        match self {
+            ReceiptState::ConfirmedSuccess { .. } => None,
+            ReceiptState::ConfirmedExecutionMismatch { .. } => Some("RECEIPT_MINT_MISMATCH"),
+            ReceiptState::ConfirmedRevert => Some("RECEIPT_REVERT"),
+            ReceiptState::ReceiptUnknown => Some("RECEIPT_UNKNOWN"),
+        }
+    }
+}
+
 /// `minted` proves the expected mint iff it contains exactly
 /// `expected_quantity` entries with pairwise-distinct token ids. (Wrong
 /// contract, wrong recipient, and non-mint transfers are already excluded by

@@ -5,17 +5,25 @@ use alloy_primitives::Address;
 use crate::chain::config::{EnvSource, ProcessEnv};
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::InspectArgs;
-use crate::cli::context::{connect_read_client, resolve_chain};
+use crate::cli::context::{connect_read_client, resolve_chain_and_runtime};
 use crate::cli::format::format_unix;
 use crate::cli::gather;
 use crate::execution::errors::KairoxError;
 use crate::opensea::client::{OPENSEA_API_KEY_ENV, OpenSeaClient};
 use crate::opensea::errors::OpenSeaError;
 
-pub async fn run(args: InspectArgs) -> Result<(), KairoxError> {
+pub async fn run(
+    args: InspectArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.chain_args)?;
-    let client = connect_read_client(&resolved.info, args.chain_args.rpc_url.as_ref()).await?;
+    let (resolved, runtime) = resolve_chain_and_runtime(&registry, &args.chain_args, config_path)?;
+    let client = connect_read_client(
+        &resolved.info,
+        args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
 
     println!(
         "Chain: {} (chain id {})",

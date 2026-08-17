@@ -94,9 +94,13 @@ pub struct ReceiptArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct ChainArgs {
-    /// Chain name ("ethereum", "base", "robinhood chain") or numeric chain id.
-    #[arg(long, default_value = "ethereum")]
-    pub chain: String,
+    /// Chain name ("ethereum", "base", "robinhood chain") or numeric chain
+    /// id. When omitted, resolved with the documented precedence: the
+    /// KAIROX_CHAIN environment variable, then a config file's
+    /// [defaults].chain, then the compiled default "ethereum". See
+    /// `kairox init` / `--config`.
+    #[arg(long)]
+    pub chain: Option<String>,
     /// RPC endpoint URL. Overrides any KAIROX_RPC_<chainId>_* environment configuration.
     #[arg(long)]
     pub rpc_url: Option<Url>,

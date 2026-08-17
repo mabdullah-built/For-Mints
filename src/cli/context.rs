@@ -1,5 +1,7 @@
 //! Chain/RPC resolution shared by every CLI command that touches the
-//! network.
+//! network. [`resolve_chain_and_runtime`] is the ONE place command-level
+//! config/env/CLI precedence is decided -- individual commands never
+//! re-implement that ordering themselves.
 
 use url::Url;
 
@@ -7,6 +9,7 @@ use crate::chain::config::{ProcessEnv, load_chain_endpoints};
 use crate::chain::endpoint::{EndpointRole, RpcEndpoint};
 use crate::chain::registry::{ChainInfo, ChainRegistry};
 use crate::chain::rpc::{HttpTransport, RpcClient};
+use crate::config::{KairoxConfig, ResolvedRuntimeConfig, resolve_chain_rpc_endpoints};
 use crate::execution::errors::{KairoxError, SessionError};
 
 use super::args::ChainArgs;
@@ -16,22 +19,24 @@ pub struct ResolvedChain {
     pub seadrop_contract: alloy_primitives::Address,
 }
 
-/// Resolve `--chain`/`--seadrop-contract` against the built-in chain
-/// registry.
+/// Resolve a chain (by name or numeric id) and its SeaDrop contract against
+/// the built-in chain registry. `chain` is expected to already be the
+/// fully precedence-resolved value (see [`resolve_chain_and_runtime`]).
 pub fn resolve_chain(
     registry: &ChainRegistry,
-    args: &ChainArgs,
+    chain: &str,
+    seadrop_override: Option<alloy_primitives::Address>,
 ) -> Result<ResolvedChain, KairoxError> {
-    let info = if let Ok(id) = args.chain.parse::<u64>() {
+    let info = if let Ok(id) = chain.parse::<u64>() {
         registry.by_id(id)
     } else {
-        registry.by_name(&args.chain)
+        registry.by_name(chain)
     }
     .cloned()
     .ok_or_else(|| {
         KairoxError::Session(SessionError(format!(
             "unknown chain '{}'; known chains: {}",
-            args.chain,
+            chain,
             registry
                 .all()
                 .iter()
@@ -41,8 +46,7 @@ pub fn resolve_chain(
         )))
     })?;
 
-    let seadrop_contract = args
-        .seadrop_contract
+    let seadrop_contract = seadrop_override
         .or(info.default_seadrop_address)
         .ok_or_else(|| {
             KairoxError::Session(SessionError(format!(
@@ -57,32 +61,108 @@ pub fn resolve_chain(
     })
 }
 
-/// Resolve which RPC endpoint to use: an explicit `--rpc-url` override, else
-/// the first endpoint configured via `KAIROX_RPC_<chainId>_*` that permits
-/// reads.
+/// Resolve the effective config (per [`crate::config::resolve_runtime_config`])
+/// and the chain it names, in one call. This is the single entry point
+/// every network-touching command should use instead of calling
+/// [`resolve_chain`] directly with a raw CLI string, so `--config`/
+/// `KAIROX_CHAIN`/`defaults.chain` precedence is applied uniformly.
+pub fn resolve_chain_and_runtime(
+    registry: &ChainRegistry,
+    chain_args: &ChainArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(ResolvedChain, ResolvedRuntimeConfig), KairoxError> {
+    let runtime = crate::config::resolve_runtime_config(
+        config_path,
+        chain_args.chain.as_deref(),
+        None,
+        &ProcessEnv,
+    )
+    .map_err(|e| KairoxError::Session(SessionError(format!("config error: {e}"))))?;
+    let resolved = resolve_chain(registry, &runtime.chain, chain_args.seadrop_contract)?;
+    Ok((resolved, runtime))
+}
+
+/// Resolve which RPC endpoint to use for reads, in priority order: an
+/// explicit `--rpc-url` override, else the first read-capable endpoint
+/// named by the resolved config's `[chains.*].read_rpc_env`, else the
+/// first endpoint configured via `KAIROX_RPC_<chainId>_*`.
 pub fn resolve_read_endpoint(
     chain: &ChainInfo,
     rpc_url_override: Option<&Url>,
+    config: Option<&KairoxConfig>,
 ) -> Result<RpcEndpoint, KairoxError> {
     if let Some(url) = rpc_url_override {
         return Ok(RpcEndpoint::new(url.clone(), EndpointRole::ReadWrite));
     }
 
+    if let Some(config) = config
+        && let Some(entry) = config_chain_entry(config, chain)
+    {
+        let endpoints = resolve_chain_rpc_endpoints(entry, &ProcessEnv)
+            .map_err(|e| KairoxError::Session(SessionError(format!("config error: {e}"))))?;
+        if let Some(endpoint) = endpoints
+            .iter()
+            .find(|e| e.role.can_read())
+            .or_else(|| endpoints.first())
+        {
+            return Ok(endpoint.clone());
+        }
+    }
+
     let endpoints = load_chain_endpoints(&ProcessEnv, chain.chain_id)?;
     endpoints.preferred_read_endpoint().cloned().ok_or_else(|| {
         KairoxError::Session(SessionError(format!(
-            "no RPC endpoint configured for chain '{}' (chain id {}); pass --rpc-url or set KAIROX_RPC_{}_0_URL",
+            "no RPC endpoint configured for chain '{}' (chain id {}); pass --rpc-url, add a [chains.*] entry to your config, or set KAIROX_RPC_{}_0_URL",
             chain.name, chain.chain_id, chain.chain_id
         )))
     })
+}
+
+/// Find the config chain entry matching `chain`, by lowercase name or by
+/// numeric chain id (config keys like `[chains.ethereum]` are names, not
+/// ids -- matched case-insensitively against the chain's registry name).
+fn config_chain_entry<'a>(
+    config: &'a KairoxConfig,
+    chain: &ChainInfo,
+) -> Option<&'a crate::config::ChainConfigEntry> {
+    config
+        .chains
+        .iter()
+        .find(|(name, _)| {
+            name.eq_ignore_ascii_case(chain.name) || **name == chain.chain_id.to_string()
+        })
+        .map(|(_, entry)| entry)
+}
+
+/// Resolve every endpoint the resolved config names for `chain` (both read
+/// and send), or an empty list when there is no config, no matching
+/// `[chains.*]` entry, or none of its named variables are actually set.
+/// The ONE place `bench`/`mint`/`mint --wallet-manifest` look up
+/// config-driven endpoint sets, so none of them re-implement this lookup.
+/// Never errors: an unparseable URL in a config-named variable is reported
+/// by `doctor`, not silently surfaced here as a fatal failure of an
+/// unrelated command -- callers fall back to `KAIROX_RPC_*` when this
+/// returns empty.
+pub fn config_endpoints_for_chain(
+    chain: &ChainInfo,
+    config: Option<&KairoxConfig>,
+) -> Vec<RpcEndpoint> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let Some(entry) = config_chain_entry(config, chain) else {
+        return Vec::new();
+    };
+    resolve_chain_rpc_endpoints(entry, &ProcessEnv).unwrap_or_default()
 }
 
 /// Resolve an endpoint and connect a chain-id-verified [`RpcClient`] to it.
 pub async fn connect_read_client(
     chain: &ChainInfo,
     rpc_url_override: Option<&Url>,
+    config: Option<&KairoxConfig>,
 ) -> Result<RpcClient, KairoxError> {
-    let endpoint = resolve_read_endpoint(chain, rpc_url_override)?;
+    let endpoint = resolve_read_endpoint(chain, rpc_url_override, config)?;
     let transport = HttpTransport::new(endpoint.url.clone(), endpoint.timeout);
     let client = RpcClient::connect(
         Box::new(transport),
@@ -101,48 +181,28 @@ mod tests {
     #[test]
     fn resolve_chain_by_name() {
         let registry = ChainRegistry::builtin();
-        let args = ChainArgs {
-            chain: "base".into(),
-            rpc_url: None,
-            seadrop_contract: None,
-        };
-        let resolved = resolve_chain(&registry, &args).unwrap();
+        let resolved = resolve_chain(&registry, "base", None).unwrap();
         assert_eq!(resolved.info.chain_id, 8453);
     }
 
     #[test]
     fn resolve_chain_by_numeric_id() {
         let registry = ChainRegistry::builtin();
-        let args = ChainArgs {
-            chain: "4663".into(),
-            rpc_url: None,
-            seadrop_contract: None,
-        };
-        let resolved = resolve_chain(&registry, &args).unwrap();
+        let resolved = resolve_chain(&registry, "4663", None).unwrap();
         assert_eq!(resolved.info.name, "Robinhood Chain");
     }
 
     #[test]
     fn resolve_chain_rejects_unknown_chain() {
         let registry = ChainRegistry::builtin();
-        let args = ChainArgs {
-            chain: "not-a-chain".into(),
-            rpc_url: None,
-            seadrop_contract: None,
-        };
-        assert!(resolve_chain(&registry, &args).is_err());
+        assert!(resolve_chain(&registry, "not-a-chain", None).is_err());
     }
 
     #[test]
     fn resolve_chain_honors_seadrop_contract_override() {
         let registry = ChainRegistry::builtin();
         let custom = alloy_primitives::address!("0000000000000000000000000000000000012345");
-        let args = ChainArgs {
-            chain: "ethereum".into(),
-            rpc_url: None,
-            seadrop_contract: Some(custom),
-        };
-        let resolved = resolve_chain(&registry, &args).unwrap();
+        let resolved = resolve_chain(&registry, "ethereum", Some(custom)).unwrap();
         assert_eq!(resolved.seadrop_contract, custom);
     }
 
@@ -150,7 +210,7 @@ mod tests {
     fn resolve_read_endpoint_uses_explicit_override() {
         let chain = ChainRegistry::builtin().by_id(1).unwrap().clone();
         let url = Url::parse("https://example.invalid").unwrap();
-        let endpoint = resolve_read_endpoint(&chain, Some(&url)).unwrap();
+        let endpoint = resolve_read_endpoint(&chain, Some(&url), None).unwrap();
         assert_eq!(endpoint.url, url);
     }
 
@@ -159,6 +219,74 @@ mod tests {
         // NOTE: this test depends on no KAIROX_RPC_1_* variables being set
         // in the test process environment, which is true for a clean CI/dev run.
         let chain = ChainRegistry::builtin().by_id(1).unwrap().clone();
-        assert!(resolve_read_endpoint(&chain, None).is_err());
+        assert!(resolve_read_endpoint(&chain, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_chain_and_runtime_applies_config_default_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n[defaults]\nchain = \"base\"\n").unwrap();
+        let registry = ChainRegistry::builtin();
+        let chain_args = ChainArgs {
+            chain: None,
+            rpc_url: None,
+            seadrop_contract: None,
+        };
+        let (resolved, runtime) =
+            resolve_chain_and_runtime(&registry, &chain_args, Some(&path)).unwrap();
+        assert_eq!(resolved.info.chain_id, 8453);
+        assert_eq!(runtime.chain, "base");
+    }
+
+    #[test]
+    fn resolve_chain_and_runtime_explicit_cli_chain_overrides_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n[defaults]\nchain = \"base\"\n").unwrap();
+        let registry = ChainRegistry::builtin();
+        let chain_args = ChainArgs {
+            chain: Some("ethereum".into()),
+            rpc_url: None,
+            seadrop_contract: None,
+        };
+        let (resolved, runtime) =
+            resolve_chain_and_runtime(&registry, &chain_args, Some(&path)).unwrap();
+        assert_eq!(resolved.info.chain_id, 1);
+        assert_eq!(runtime.chain, "ethereum");
+    }
+
+    #[test]
+    fn resolve_read_endpoint_uses_config_named_env_var() {
+        // SAFETY (test-only): scoped tightly around the assertion; no other
+        // test in this process reads/writes this specific variable name
+        // concurrently.
+        unsafe {
+            std::env::set_var(
+                "KAIROX_CONTEXT_TEST_READ_URL",
+                "https://from-config.example",
+            );
+        }
+        let mut chains = std::collections::BTreeMap::new();
+        chains.insert(
+            "Ethereum".to_string(),
+            crate::config::ChainConfigEntry {
+                read_rpc_env: vec!["KAIROX_CONTEXT_TEST_READ_URL".into()],
+                send_rpc_env: vec![],
+            },
+        );
+        let config = KairoxConfig {
+            version: 1,
+            defaults: Default::default(),
+            chains,
+            opensea: Default::default(),
+        };
+        let chain = ChainRegistry::builtin().by_id(1).unwrap().clone();
+        let endpoint = resolve_read_endpoint(&chain, None, Some(&config));
+        unsafe {
+            std::env::remove_var("KAIROX_CONTEXT_TEST_READ_URL");
+        }
+        let endpoint = endpoint.unwrap();
+        assert_eq!(endpoint.url.as_str(), "https://from-config.example/");
     }
 }

@@ -56,6 +56,23 @@ impl BroadcastOutcome {
     pub fn is_uncertain(&self) -> bool {
         matches!(self, Self::TimeoutUnknown | Self::TransportUnknown { .. })
     }
+
+    /// Stable external error code for this outcome, or `None` when it is
+    /// evidence of propagation (`Accepted`/`AlreadyKnown`), which is not an
+    /// error. `RetryableRejection` maps to `BROADCAST_FATAL` too -- Kairox
+    /// never automatically retries a broadcast either way (see module
+    /// docs), so from a reporting/exit-code perspective both rejection
+    /// kinds are simply "this endpoint definitely did not accept it,"
+    /// distinct only from `BROADCAST_UNCERTAIN` (no response at all).
+    pub fn error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Accepted { .. } | Self::AlreadyKnown => None,
+            Self::FatalRejection { .. } | Self::RetryableRejection { .. } => {
+                Some("BROADCAST_FATAL")
+            }
+            Self::TimeoutUnknown | Self::TransportUnknown { .. } => Some("BROADCAST_UNCERTAIN"),
+        }
+    }
 }
 
 /// Classify a failed `eth_sendRawTransaction` call. `Ok` responses are

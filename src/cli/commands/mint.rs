@@ -14,7 +14,7 @@ use crate::chain::pool::{ConnectOutcome, RpcPool};
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::{EngineSelection, MintArgs};
 use crate::cli::commands::plan::{build_mint_plan, print_plan};
-use crate::cli::context::resolve_chain;
+use crate::cli::context::resolve_chain_and_runtime;
 use crate::cli::format::{format_unix, parse_wei};
 use crate::domain::fees::SafetyCaps;
 use crate::domain::timing::{SleepSegment, StageStatus};
@@ -51,7 +51,10 @@ enum SelectedEngine {
 /// that a wallet-specific/off-chain-gated stage needs OpenSea's
 /// transaction data. `Explicit Public`/`Explicit Opensea` always win
 /// outright.
-async fn select_engine(args: &MintArgs) -> Result<SelectedEngine, KairoxError> {
+async fn select_engine(
+    args: &MintArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<SelectedEngine, KairoxError> {
     match args.plan_args.engine {
         EngineSelection::Public => Ok(SelectedEngine::Public),
         EngineSelection::Opensea => {
@@ -66,7 +69,7 @@ async fn select_engine(args: &MintArgs) -> Result<SelectedEngine, KairoxError> {
             let Some(slug) = args.plan_args.slug.clone() else {
                 return Ok(SelectedEngine::Public);
             };
-            let public_active = build_mint_plan(&args.plan_args)
+            let public_active = build_mint_plan(&args.plan_args, config_path)
                 .await
                 .map(|plan| matches!(plan.stage_status, StageStatus::Active { .. }))
                 .unwrap_or(false);
@@ -86,28 +89,31 @@ fn load_opensea_client(timeout: StdDuration) -> Result<OpenSeaClient, KairoxErro
     Ok(OpenSeaClient::new_http(api_key, timeout))
 }
 
-pub async fn run(args: MintArgs) -> Result<(), KairoxError> {
+pub async fn run(args: MintArgs, config_path: Option<&std::path::Path>) -> Result<(), KairoxError> {
     if args.wallet_manifest.is_some() {
-        return crate::cli::commands::mint_multi::run_manifest(args).await;
+        return crate::cli::commands::mint_multi::run_manifest(args, config_path).await;
     }
     if !args.send {
-        return run_dry_run(args).await;
+        return run_dry_run(args, config_path).await;
     }
 
-    run_send(args).await
+    run_send(args, config_path).await
 }
 
-async fn run_dry_run(args: MintArgs) -> Result<(), KairoxError> {
+async fn run_dry_run(
+    args: MintArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     println!("=================================================");
     println!(" DRY RUN — NO TRANSACTION BROADCAST");
     println!("=================================================");
     println!();
 
-    match select_engine(&args).await? {
+    match select_engine(&args, config_path).await? {
         SelectedEngine::Public => {
             println!("selected engine: PUBLIC (pure on-chain PublicSeaDropEngine)");
             println!();
-            let plan = build_mint_plan(&args.plan_args).await?;
+            let plan = build_mint_plan(&args.plan_args, config_path).await?;
             print_plan(&plan);
         }
         SelectedEngine::OpenSea { slug } => {
@@ -143,10 +149,13 @@ async fn run_dry_run(args: MintArgs) -> Result<(), KairoxError> {
     Ok(())
 }
 
-async fn run_send(args: MintArgs) -> Result<(), KairoxError> {
-    match select_engine(&args).await? {
-        SelectedEngine::Public => run_send_public(args).await,
-        SelectedEngine::OpenSea { slug } => run_send_opensea(args, slug).await,
+async fn run_send(
+    args: MintArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
+    match select_engine(&args, config_path).await? {
+        SelectedEngine::Public => run_send_public(args, config_path).await,
+        SelectedEngine::OpenSea { slug } => run_send_opensea(args, slug, config_path).await,
     }
 }
 
@@ -156,11 +165,17 @@ async fn run_send(args: MintArgs) -> Result<(), KairoxError> {
 async fn connect_send_pool(
     resolved: &crate::cli::context::ResolvedChain,
     rpc_url_override: Option<&url::Url>,
+    config: Option<&crate::config::KairoxConfig>,
 ) -> Result<RpcPool, KairoxError> {
     let endpoints: Vec<RpcEndpoint> = if let Some(url) = rpc_url_override {
         vec![RpcEndpoint::new(url.clone(), EndpointRole::ReadWrite)]
     } else {
-        load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+        let from_config = crate::cli::context::config_endpoints_for_chain(&resolved.info, config);
+        if !from_config.is_empty() {
+            from_config
+        } else {
+            load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+        }
     };
     let (pool, reports) = RpcPool::connect_all(resolved.info.chain_id, &endpoints).await;
     for report in &reports {
@@ -180,22 +195,31 @@ async fn connect_send_pool(
     Ok(pool)
 }
 
-async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
+async fn run_send_public(
+    args: MintArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     let wallet = args.plan_args.wallet.ok_or_else(|| {
         KairoxError::Session(SessionError(
             "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
         ))
     })?;
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.plan_args.chain_args)?;
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
 
     // Preview plan for the confirmation summary. Uses the same lenient
     // gather pipeline as `kairox plan` — purely informational here; the
     // actual transaction that gets signed is built fresh, strictly, by the
     // live pipeline below.
-    let preview = build_mint_plan(&args.plan_args).await?;
+    let preview = build_mint_plan(&args.plan_args, config_path).await?;
 
-    let mut pool = connect_send_pool(&resolved, args.plan_args.chain_args.rpc_url.as_ref()).await?;
+    let mut pool = connect_send_pool(
+        &resolved,
+        args.plan_args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
 
     println!("selected engine: PUBLIC (pure on-chain PublicSeaDropEngine)");
     println!("=================================================");
@@ -297,17 +321,27 @@ async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
     Ok(())
 }
 
-async fn run_send_opensea(args: MintArgs, slug: String) -> Result<(), KairoxError> {
+async fn run_send_opensea(
+    args: MintArgs,
+    slug: String,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
     let wallet = args.plan_args.wallet.ok_or_else(|| {
         KairoxError::Session(SessionError(
             "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
         ))
     })?;
     let registry = ChainRegistry::builtin();
-    let resolved = resolve_chain(&registry, &args.plan_args.chain_args)?;
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
     let opensea = load_opensea_client(StdDuration::from_secs(10))?;
 
-    let mut pool = connect_send_pool(&resolved, args.plan_args.chain_args.rpc_url.as_ref()).await?;
+    let mut pool = connect_send_pool(
+        &resolved,
+        args.plan_args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
 
     let drop_details = opensea.get_drop_details(&slug).await?;
 
