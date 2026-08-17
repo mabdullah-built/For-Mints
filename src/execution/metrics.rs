@@ -59,6 +59,41 @@ pub struct LatencyMetrics {
     pub dispatch_ms: Option<u64>,
     pub rpc_accept_ms: Option<u64>,
     pub receipt_inclusion_ms: Option<u64>,
+
+    // OpenSea engine only (Phase 4) — all `None` for the pure on-chain
+    // public engine, which never touches the OpenSea API.
+    /// Time spent fetching `GET /api/v2/drops/{slug}` drop details.
+    pub opensea_drop_details_ms: Option<u64>,
+    /// Time spent warming the reused OpenSea HTTPS connection ahead of the
+    /// critical-path mint request (see `opensea_engine`'s pre-stage
+    /// preparation step).
+    pub opensea_prewarm_ms: Option<u64>,
+    /// Time spent on the actual `POST /api/v2/drops/{slug}/mint` request —
+    /// this is the OpenSea-dependent part of the critical path that has no
+    /// equivalent in the pure on-chain engine.
+    pub opensea_mint_request_ms: Option<u64>,
+    /// How many bounded retries the mint request needed (0 = succeeded on
+    /// the first attempt).
+    pub opensea_retry_count: Option<u32>,
+    /// Time spent in `validate_opensea_mint_response` — local validation of
+    /// the untrusted OpenSea response, before any on-chain revalidation.
+    pub opensea_validation_ms: Option<u64>,
+    /// Time spent on the on-chain `eth_estimateGas` simulation of the
+    /// OpenSea-provided (validated) transaction, specifically for the
+    /// OpenSea engine's revalidation step.
+    pub signed_engine_simulation_ms: Option<u64>,
+    /// Time spent on nonce/fee/balance gathering plus signing/serializing
+    /// for the OpenSea engine, combined (see `opensea_engine` for why this
+    /// is tracked as one figure rather than split like the public engine's
+    /// `nonce_ms`/`fee_ms`/`sign_ms`: this path only runs once state is
+    /// already known to be live, right before dispatch).
+    pub signed_engine_prepare_ms: Option<u64>,
+    /// Honest end-to-end measurement of the OpenSea-dependent critical
+    /// path: from the mint-transaction API call to dispatch. This is the
+    /// actual latency budget for an eligible stage using this engine —
+    /// never claimed to equal the pure on-chain engine's T=0 without this
+    /// number backing it up.
+    pub api_to_dispatch_ms: Option<u64>,
 }
 
 impl LatencyMetrics {
@@ -90,6 +125,34 @@ impl LatencyMetrics {
         lines.push(field("dispatch_ms", self.dispatch_ms));
         lines.push(field("rpc_accept_ms", self.rpc_accept_ms));
         lines.push(field("receipt_inclusion_ms", self.receipt_inclusion_ms));
+        if self.opensea_drop_details_ms.is_some()
+            || self.opensea_mint_request_ms.is_some()
+            || self.opensea_validation_ms.is_some()
+        {
+            lines.push(field(
+                "opensea_drop_details_ms",
+                self.opensea_drop_details_ms,
+            ));
+            lines.push(field("opensea_prewarm_ms", self.opensea_prewarm_ms));
+            lines.push(field(
+                "opensea_mint_request_ms",
+                self.opensea_mint_request_ms,
+            ));
+            lines.push(match self.opensea_retry_count {
+                Some(v) => format!("  {:<24} {v}", "opensea_retry_count"),
+                None => format!("  {:<24} n/a", "opensea_retry_count"),
+            });
+            lines.push(field("opensea_validation_ms", self.opensea_validation_ms));
+            lines.push(field(
+                "signed_engine_simulation_ms",
+                self.signed_engine_simulation_ms,
+            ));
+            lines.push(field(
+                "signed_engine_prepare_ms",
+                self.signed_engine_prepare_ms,
+            ));
+            lines.push(field("api_to_dispatch_ms", self.api_to_dispatch_ms));
+        }
         lines.join("\n")
     }
 }

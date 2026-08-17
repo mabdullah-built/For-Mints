@@ -3,7 +3,7 @@
 //! interface is fixed, well-known, and encoded here directly from the ABI
 //! signature.
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::{SolCall, sol};
 use thiserror::Error;
 
@@ -29,6 +29,59 @@ sol! {
         external
         view
         returns (uint256 minterNumMinted, uint256 currentTotalSupply, uint256 maxSupply);
+
+    // The official SeaDrop ABI (ProjectOpenSea/seadrop, `src/SeaDrop.sol`),
+    // verified directly against the current repository during Phase 4
+    // research. `MintParams` is shared by the allow-list and server-signed
+    // mint paths.
+    struct MintParamsAbi {
+        uint256 mintPrice;
+        uint256 maxTotalMintableByWallet;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 dropStageIndex;
+        uint256 maxTokenSupplyForStage;
+        uint256 feeBps;
+        bool restrictFeeRecipients;
+    }
+
+    function mintAllowList(
+        address nftContract,
+        address feeRecipient,
+        address minterIfNotPayer,
+        uint256 quantity,
+        MintParamsAbi calldata mintParams,
+        bytes32[] calldata proof
+    ) external payable;
+
+    function mintSigned(
+        address nftContract,
+        address feeRecipient,
+        address minterIfNotPayer,
+        uint256 quantity,
+        MintParamsAbi calldata mintParams,
+        uint256 salt,
+        bytes calldata signature
+    ) external payable;
+
+    struct TokenGatedMintParamsAbi {
+        address allowedNftToken;
+        uint256[] allowedNftTokenIds;
+    }
+
+    /// The real official signature (needed so the 4-byte selector matches
+    /// exactly) — but only the selector is ever used, to recognize (and
+    /// immediately treat as Phase-4-unsupported, see
+    /// [`SeaDropMintKind::TokenGated`]) a token-gated mint transaction.
+    /// Kairox never decodes its full argument list in this phase.
+    function mintAllowedTokenHolder(
+        address nftContract,
+        address feeRecipient,
+        address minterIfNotPayer,
+        TokenGatedMintParamsAbi calldata mintParams
+    ) external payable;
+
+    function getAllowListMerkleRoot(address nftContract) external view returns (bytes32);
 }
 
 /// Basis-point denominator; a `feeBps` above this is not a valid percentage.
@@ -56,6 +109,11 @@ pub enum SeaDropError {
     PreferredFeeRecipientNotAllowed { preferred: Address },
     #[error("collection maximum supply does not fit safely in a u64 conversion")]
     SupplyOverflow,
+    #[error(
+        "calldata selector 0x{} does not match any recognized SeaDrop mint function; refusing to decode",
+        hex::encode(.0)
+    )]
+    UnrecognizedSelector([u8; 4]),
 }
 
 /// Normalized, validated `PublicDrop` state.
@@ -230,6 +288,163 @@ pub fn mint_public_selector() -> [u8; 4] {
     mintPublicCall::SELECTOR
 }
 
+/// Normalized `MintParams` (shared by allow-list and server-signed mint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MintParams {
+    pub mint_price: U256,
+    pub max_total_mintable_by_wallet: U256,
+    pub start_time: U256,
+    pub end_time: U256,
+    pub drop_stage_index: U256,
+    pub max_token_supply_for_stage: U256,
+    pub fee_bps: U256,
+    pub restrict_fee_recipients: bool,
+}
+
+impl From<&MintParamsAbi> for MintParams {
+    fn from(p: &MintParamsAbi) -> Self {
+        Self {
+            mint_price: p.mintPrice,
+            max_total_mintable_by_wallet: p.maxTotalMintableByWallet,
+            start_time: p.startTime,
+            end_time: p.endTime,
+            drop_stage_index: p.dropStageIndex,
+            max_token_supply_for_stage: p.maxTokenSupplyForStage,
+            fee_bps: p.feeBps,
+            restrict_fee_recipients: p.restrictFeeRecipients,
+        }
+    }
+}
+
+/// A decoded `mintAllowList(...)` call. Kept fully structural — Kairox
+/// decodes it, but does not itself cryptographically verify `proof`
+/// against an on-chain Merkle root in Phase 4 (see the caller-side
+/// validator for what *is* checked, and why the full proof-to-root
+/// verification was judged not practical to safely reimplement this
+/// phase).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAllowListMint {
+    pub nft_contract: Address,
+    pub fee_recipient: Address,
+    pub minter_if_not_payer: Address,
+    pub quantity: U256,
+    pub mint_params: MintParams,
+    pub proof: Vec<B256>,
+}
+
+/// A decoded `mintSigned(...)` call. Kairox does not implement independent
+/// cryptographic verification of the server signature in Phase 4 — see
+/// [`SeaDropMintKind::ServerSigned`]'s docs. Decoded purely so the request
+/// can be inspected/audited and so every other structural check (target,
+/// collection, wallet, quantity, value) can still run before failing
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSignedMint {
+    pub nft_contract: Address,
+    pub fee_recipient: Address,
+    pub minter_if_not_payer: Address,
+    pub quantity: U256,
+    pub mint_params: MintParams,
+    pub salt: U256,
+    pub signature: Bytes,
+}
+
+/// Which SeaDrop mint function a piece of calldata invokes, reasoned from
+/// the calldata's own 4-byte selector — never from an OpenSea stage label
+/// (`"WL"`, `"FCFS"`, `"GTD"` are marketing names, not protocol truth).
+/// A decoded `mintPublic(...)` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPublicMint {
+    pub nft_contract: Address,
+    pub fee_recipient: Address,
+    pub minter_if_not_payer: Address,
+    pub quantity: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeaDropMintKind {
+    Public(DecodedPublicMint),
+    AllowList(DecodedAllowListMint),
+    /// Decoded structurally, but Kairox does not implement independent
+    /// verification of the server signature — see
+    /// [`decode_seadrop_mint_calldata`]'s caller-side handling.
+    ServerSigned(DecodedSignedMint),
+    /// Recognized by its correct selector, but Phase 4 does not implement
+    /// token-gated mint validation at all — always Unsupported.
+    TokenGated,
+}
+
+/// Decode arbitrary calldata (as returned by an untrusted external source,
+/// e.g. the OpenSea Drops mint API) into a recognized SeaDrop mint call by
+/// inspecting its 4-byte selector against the official ABI. An unknown
+/// selector — including anything that isn't one of the four function
+/// signatures above — fails closed with
+/// [`SeaDropError::UnrecognizedSelector`]. Never partial-matches or
+/// guesses from calldata length alone.
+pub fn decode_seadrop_mint_calldata(calldata: &Bytes) -> Result<SeaDropMintKind, SeaDropError> {
+    if calldata.len() < 4 {
+        return Err(SeaDropError::UnrecognizedSelector([0; 4]));
+    }
+    let selector: [u8; 4] = calldata[0..4].try_into().expect("checked length >= 4");
+
+    if selector == mintPublicCall::SELECTOR {
+        let call = mintPublicCall::abi_decode(calldata)
+            .map_err(|e| SeaDropError::AbiDecode(e.to_string()))?;
+        return Ok(SeaDropMintKind::Public(DecodedPublicMint {
+            nft_contract: call.nftContract,
+            fee_recipient: call.feeRecipient,
+            minter_if_not_payer: call.minterIfNotPayer,
+            quantity: call.quantity,
+        }));
+    }
+    if selector == mintAllowListCall::SELECTOR {
+        let call = mintAllowListCall::abi_decode(calldata)
+            .map_err(|e| SeaDropError::AbiDecode(e.to_string()))?;
+        return Ok(SeaDropMintKind::AllowList(DecodedAllowListMint {
+            nft_contract: call.nftContract,
+            fee_recipient: call.feeRecipient,
+            minter_if_not_payer: call.minterIfNotPayer,
+            quantity: call.quantity,
+            mint_params: MintParams::from(&call.mintParams),
+            proof: call.proof,
+        }));
+    }
+    if selector == mintSignedCall::SELECTOR {
+        let call = mintSignedCall::abi_decode(calldata)
+            .map_err(|e| SeaDropError::AbiDecode(e.to_string()))?;
+        return Ok(SeaDropMintKind::ServerSigned(DecodedSignedMint {
+            nft_contract: call.nftContract,
+            fee_recipient: call.feeRecipient,
+            minter_if_not_payer: call.minterIfNotPayer,
+            quantity: call.quantity,
+            mint_params: MintParams::from(&call.mintParams),
+            salt: call.salt,
+            signature: call.signature,
+        }));
+    }
+    if selector == mintAllowedTokenHolderCall::SELECTOR {
+        return Ok(SeaDropMintKind::TokenGated);
+    }
+    Err(SeaDropError::UnrecognizedSelector(selector))
+}
+
+/// Build the calldata for `getAllowListMerkleRoot(nftContract)`.
+pub fn encode_get_allow_list_merkle_root(nft_contract: Address) -> Bytes {
+    Bytes::from(
+        getAllowListMerkleRootCall {
+            nftContract: nft_contract,
+        }
+        .abi_encode(),
+    )
+}
+
+/// Decode `getAllowListMerkleRoot`'s return value.
+pub fn decode_get_allow_list_merkle_root(raw: &Bytes) -> Result<B256, SeaDropError> {
+    getAllowListMerkleRootCall::abi_decode_returns(raw)
+        .map(|root| B256::from(root.0))
+        .map_err(|e| SeaDropError::AbiDecode(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +590,128 @@ mod tests {
         let fallback = address!("0000000000000000000000000000000000000eee");
         let chosen = select_fee_recipient(&[], false, None, fallback).unwrap();
         assert_eq!(chosen, fallback);
+    }
+
+    fn nft() -> Address {
+        address!("000000000000000000000000000000000000c0de")
+    }
+    fn fee_recipient() -> Address {
+        address!("0000000000000000000000000000000000fee000")
+    }
+
+    #[test]
+    fn decode_seadrop_mint_calldata_recognizes_public_mint() {
+        let calldata = encode_mint_public(nft(), fee_recipient(), Address::ZERO, 2).unwrap();
+        let decoded = decode_seadrop_mint_calldata(&calldata).unwrap();
+        match decoded {
+            SeaDropMintKind::Public(p) => {
+                assert_eq!(p.nft_contract, nft());
+                assert_eq!(p.quantity, U256::from(2u64));
+            }
+            other => panic!("expected Public, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_seadrop_mint_calldata_recognizes_allow_list_mint() {
+        let call = mintAllowListCall {
+            nftContract: nft(),
+            feeRecipient: fee_recipient(),
+            minterIfNotPayer: Address::ZERO,
+            quantity: U256::from(1u64),
+            mintParams: MintParamsAbi {
+                mintPrice: U256::from(1_000u64),
+                maxTotalMintableByWallet: U256::from(5u64),
+                startTime: U256::from(0u64),
+                endTime: U256::from(9_999_999_999u64),
+                dropStageIndex: U256::from(1u64),
+                maxTokenSupplyForStage: U256::from(1_000u64),
+                feeBps: U256::from(0u64),
+                restrictFeeRecipients: false,
+            },
+            proof: vec![B256::repeat_byte(0xAB)],
+        };
+        let calldata = Bytes::from(call.abi_encode());
+        let decoded = decode_seadrop_mint_calldata(&calldata).unwrap();
+        match decoded {
+            SeaDropMintKind::AllowList(a) => {
+                assert_eq!(a.nft_contract, nft());
+                assert_eq!(a.proof.len(), 1);
+                assert_eq!(a.mint_params.drop_stage_index, U256::from(1u64));
+            }
+            other => panic!("expected AllowList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_seadrop_mint_calldata_recognizes_server_signed_mint() {
+        let call = mintSignedCall {
+            nftContract: nft(),
+            feeRecipient: fee_recipient(),
+            minterIfNotPayer: Address::ZERO,
+            quantity: U256::from(1u64),
+            mintParams: MintParamsAbi {
+                mintPrice: U256::from(1_000u64),
+                maxTotalMintableByWallet: U256::from(5u64),
+                startTime: U256::from(0u64),
+                endTime: U256::from(9_999_999_999u64),
+                dropStageIndex: U256::from(2u64),
+                maxTokenSupplyForStage: U256::from(1_000u64),
+                feeBps: U256::from(0u64),
+                restrictFeeRecipients: false,
+            },
+            salt: U256::from(42u64),
+            signature: Bytes::from(vec![0xAA; 65]),
+        };
+        let calldata = Bytes::from(call.abi_encode());
+        let decoded = decode_seadrop_mint_calldata(&calldata).unwrap();
+        match decoded {
+            SeaDropMintKind::ServerSigned(s) => {
+                assert_eq!(s.salt, U256::from(42u64));
+                assert_eq!(s.signature.len(), 65);
+            }
+            other => panic!("expected ServerSigned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_seadrop_mint_calldata_recognizes_token_gated_mint_as_unsupported() {
+        let call = mintAllowedTokenHolderCall {
+            nftContract: nft(),
+            feeRecipient: fee_recipient(),
+            minterIfNotPayer: Address::ZERO,
+            mintParams: TokenGatedMintParamsAbi {
+                allowedNftToken: nft(),
+                allowedNftTokenIds: vec![U256::from(1u64)],
+            },
+        };
+        let calldata = Bytes::from(call.abi_encode());
+        let decoded = decode_seadrop_mint_calldata(&calldata).unwrap();
+        assert_eq!(decoded, SeaDropMintKind::TokenGated);
+    }
+
+    #[test]
+    fn decode_seadrop_mint_calldata_fails_closed_on_unknown_selector() {
+        let calldata = Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00]);
+        let err = decode_seadrop_mint_calldata(&calldata).unwrap_err();
+        assert!(matches!(err, SeaDropError::UnrecognizedSelector(_)));
+    }
+
+    #[test]
+    fn decode_seadrop_mint_calldata_fails_closed_on_too_short_calldata() {
+        let calldata = Bytes::from(vec![0x01, 0x02]);
+        let err = decode_seadrop_mint_calldata(&calldata).unwrap_err();
+        assert!(matches!(err, SeaDropError::UnrecognizedSelector(_)));
+    }
+
+    #[test]
+    fn encode_and_decode_get_allow_list_merkle_root_round_trips() {
+        let calldata = encode_get_allow_list_merkle_root(nft());
+        assert_eq!(&calldata[0..4], getAllowListMerkleRootCall::SELECTOR);
+
+        let root = B256::repeat_byte(0x77);
+        let raw = Bytes::from(getAllowListMerkleRootCall::abi_encode_returns(&root));
+        let decoded = decode_get_allow_list_merkle_root(&raw).unwrap();
+        assert_eq!(decoded, root);
     }
 }

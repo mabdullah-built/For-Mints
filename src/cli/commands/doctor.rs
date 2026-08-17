@@ -8,6 +8,7 @@ use crate::chain::config::{
 use crate::chain::pool::RpcPool;
 use crate::chain::registry::ChainRegistry;
 use crate::cli::format::{format_endpoint_status, mask_url};
+use crate::opensea::client::OPENSEA_API_KEY_ENV;
 
 pub async fn run() {
     println!("Kairox v{}", crate::VERSION);
@@ -22,6 +23,17 @@ pub async fn run() {
     println!(
         "Signing key configured: {} (only read for `mint --send`; never logged)",
         if signing_key_configured { "yes" } else { "no" }
+    );
+
+    let opensea_api_key_configured =
+        secret_env_var_present(&ProcessEnv, OPENSEA_API_KEY_ENV).unwrap_or(false);
+    println!(
+        "OpenSea API key configured: {} (only used for --engine opensea; never logged)",
+        if opensea_api_key_configured {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!();
 

@@ -53,6 +53,25 @@ pub struct InspectArgs {
     /// Wallet address to check per-wallet allocation for (optional; a plain address, never a private key).
     #[arg(long)]
     pub wallet: Option<Address>,
+    /// OpenSea collection slug. When provided, also fetches and displays
+    /// official OpenSea drop metadata, clearly separated from on-chain
+    /// verified state.
+    #[arg(long)]
+    pub slug: Option<String>,
+}
+
+/// Which mint execution engine to use.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineSelection {
+    /// Choose deterministically: the pure on-chain public engine when a
+    /// public on-chain stage is active and can fully prepare the mint,
+    /// otherwise the OpenSea engine (which requires --slug).
+    #[default]
+    Auto,
+    /// Pure on-chain PublicSeaDropEngine only.
+    Public,
+    /// Official OpenSea Drops API engine only (requires --slug).
+    Opensea,
 }
 
 #[derive(Args, Debug)]
@@ -61,6 +80,13 @@ pub struct PlanArgs {
     pub collection: Address,
     #[command(flatten)]
     pub chain_args: ChainArgs,
+    /// Which mint execution engine to use.
+    #[arg(long, value_enum, default_value_t = EngineSelection::Auto)]
+    pub engine: EngineSelection,
+    /// OpenSea collection slug. Required for --engine opensea; used by
+    /// --engine auto only when the public on-chain stage is not active.
+    #[arg(long)]
+    pub slug: Option<String>,
     /// Wallet address to plan a mint for. A plain address only — never a private key (that is loaded separately via KAIROX_SIGNING_KEY or interactive prompt, only when --send is used).
     #[arg(long)]
     pub wallet: Address,

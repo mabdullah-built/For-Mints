@@ -4,6 +4,8 @@ pub mod broadcast;
 pub mod errors;
 pub mod live;
 pub mod metrics;
+pub mod opensea_engine;
+pub mod opensea_validate;
 pub mod plan;
 pub mod prepared;
 pub mod profile;

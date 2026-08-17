@@ -2,12 +2,15 @@
 
 use alloy_primitives::Address;
 
+use crate::chain::config::{EnvSource, ProcessEnv};
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::InspectArgs;
 use crate::cli::context::{connect_read_client, resolve_chain};
 use crate::cli::format::format_unix;
 use crate::cli::gather;
 use crate::execution::errors::KairoxError;
+use crate::opensea::client::{OPENSEA_API_KEY_ENV, OpenSeaClient};
+use crate::opensea::errors::OpenSeaError;
 
 pub async fn run(args: InspectArgs) -> Result<(), KairoxError> {
     let registry = ChainRegistry::builtin();
@@ -82,6 +85,46 @@ pub async fn run(args: InspectArgs) -> Result<(), KairoxError> {
             }
         }
         Err(e) => println!("Supply: COULD NOT BE SAFELY DETERMINED ({e})"),
+    }
+
+    if let Some(slug) = &args.slug {
+        println!();
+        println!("=================================================");
+        println!(" OPENSEA API METADATA (off-chain, informational only)");
+        println!(" Never treated as stronger than the on-chain verified state above.");
+        println!("=================================================");
+        match ProcessEnv.get(OPENSEA_API_KEY_ENV) {
+            Ok(Some(api_key)) => {
+                let opensea = OpenSeaClient::new_http(api_key, std::time::Duration::from_secs(10));
+                match opensea.get_drop_details(slug).await {
+                    Ok(details) => {
+                        println!("collection_slug:  {}", details.collection_slug);
+                        println!("chain:            {}", details.chain);
+                        println!("contract_address: {}", details.contract_address);
+                        println!("drop_type:        {}", details.drop_type);
+                        println!("is_minting:       {}", details.is_minting);
+                        println!("stages:           {}", details.stages.len());
+                        for stage in &details.stages {
+                            println!(
+                                "  - {} ({}): start={} end={} max_per_wallet={}",
+                                stage.stage_type,
+                                stage.label.as_deref().unwrap_or("(unlabeled)"),
+                                stage.start_time,
+                                stage.end_time,
+                                stage.max_per_wallet
+                            );
+                        }
+                    }
+                    Err(e) => println!("OpenSea drop details: COULD NOT BE FETCHED ({e})"),
+                }
+            }
+            Ok(None) | Err(_) => {
+                println!(
+                    "OpenSea drop details: NOT FETCHED ({})",
+                    OpenSeaError::ApiKeyMissing
+                );
+            }
+        }
     }
 
     Ok(())

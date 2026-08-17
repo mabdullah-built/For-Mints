@@ -55,6 +55,8 @@ pub enum KairoxError {
     Log(#[from] crate::protocol::logs::LogError),
     #[error(transparent)]
     Signing(#[from] crate::signing::signer::SigningError),
+    #[error(transparent)]
+    OpenSea(#[from] crate::opensea::errors::OpenSeaError),
     #[error("{0}")]
     Session(SessionError),
 }
@@ -87,6 +89,7 @@ impl Categorize for KairoxError {
             KairoxError::SeaDrop(_) => ErrorCategory::Fatal,
             KairoxError::Log(_) => ErrorCategory::Fatal,
             KairoxError::Signing(_) => ErrorCategory::Fatal,
+            KairoxError::OpenSea(e) => e.category(),
             KairoxError::Session(e) => e.category(),
         }
     }

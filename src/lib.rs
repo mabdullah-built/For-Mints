@@ -8,6 +8,7 @@ pub mod chain;
 pub mod cli;
 pub mod domain;
 pub mod execution;
+pub mod opensea;
 pub mod protocol;
 pub mod signing;
 
