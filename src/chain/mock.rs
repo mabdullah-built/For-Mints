@@ -56,6 +56,17 @@ impl CaptureHandle {
 
 type DynamicResponder = Box<dyn Fn(&Value) -> Value + Send + Sync>;
 
+/// Like [`DynamicResponder`], but able to express a JSON-RPC error
+/// envelope (`(code, message)`) as well as a success `result` -- so a test
+/// can make a specific call (e.g. `eth_sendRawTransaction` for one
+/// particular wallet, decoded from the raw tx itself) fail with a fatal
+/// on-chain rejection while every other call to the same method still
+/// succeeds. [`respond`]/[`error`] can only set one fixed outcome per
+/// method name; this is for the "one call, computed per-request" case
+/// [`respond_dynamic`] already covers for successes only.
+type DynamicResultResponder =
+    Box<dyn Fn(&Value) -> (Duration, Result<Value, (i64, String)>) + Send + Sync>;
+
 struct RoutedEntry {
     method: String,
     matcher: Box<dyn Fn(&Value) -> bool + Send + Sync>,
@@ -75,6 +86,7 @@ pub struct MockTransport {
     entries: HashMap<String, MockEntry>,
     routed: Vec<RoutedEntry>,
     dynamic: HashMap<String, DynamicResponder>,
+    dynamic_result: HashMap<String, DynamicResultResponder>,
     call_timeout: Duration,
     capture: CaptureHandle,
 }
@@ -83,6 +95,7 @@ pub struct MockTransportBuilder {
     entries: HashMap<String, MockEntry>,
     routed: Vec<RoutedEntry>,
     dynamic: HashMap<String, DynamicResponder>,
+    dynamic_result: HashMap<String, DynamicResultResponder>,
 }
 
 impl MockTransport {
@@ -91,6 +104,7 @@ impl MockTransport {
             entries: HashMap::new(),
             routed: Vec::new(),
             dynamic: HashMap::new(),
+            dynamic_result: HashMap::new(),
         }
     }
 
@@ -146,6 +160,26 @@ impl MockTransportBuilder {
         self
     }
 
+    /// Like [`Self::respond_matching`], but for a canned error instead of a
+    /// canned success -- e.g. making `eth_estimateGas` revert for one
+    /// specific wallet's `from` address while every other wallet's
+    /// estimate still succeeds.
+    pub fn error_matching(
+        mut self,
+        method: &str,
+        matcher: impl Fn(&Value) -> bool + Send + Sync + 'static,
+        code: i64,
+        message: &str,
+    ) -> Self {
+        self.routed.push(RoutedEntry {
+            method: method.to_string(),
+            matcher: Box::new(matcher),
+            response: None,
+            error: Some((code, message.to_string())),
+        });
+        self
+    }
+
     /// Convenience for the common `eth_call` case: respond to calls whose
     /// `params[0].data` starts with the given 4-byte ABI function selector,
     /// regardless of which contract address they target.
@@ -194,11 +228,42 @@ impl MockTransportBuilder {
         })
     }
 
+    /// Respond to every call to `method` by computing either a success
+    /// `result` or a JSON-RPC `(code, message)` error from its params --
+    /// e.g. rejecting `eth_sendRawTransaction` for one specific decoded
+    /// wallet with a fatal on-chain error while every other wallet's send
+    /// still succeeds.
+    pub fn respond_dynamic_result(
+        mut self,
+        method: &str,
+        f: impl Fn(&Value) -> Result<Value, (i64, String)> + Send + Sync + 'static,
+    ) -> Self {
+        self.dynamic_result.insert(
+            method.to_string(),
+            Box::new(move |p| (Duration::ZERO, f(p))),
+        );
+        self
+    }
+
+    /// Like [`Self::respond_dynamic_result`], but the closure also chooses
+    /// this call's own delay before it resolves -- used to prove
+    /// concurrency bounds (peak in-flight requests) across multiple
+    /// wallets/endpoints sharing one mock transport.
+    pub fn respond_dynamic_result_delayed(
+        mut self,
+        method: &str,
+        f: impl Fn(&Value) -> (Duration, Result<Value, (i64, String)>) + Send + Sync + 'static,
+    ) -> Self {
+        self.dynamic_result.insert(method.to_string(), Box::new(f));
+        self
+    }
+
     pub fn build(self) -> MockTransport {
         MockTransport {
             entries: self.entries,
             routed: self.routed,
             dynamic: self.dynamic,
+            dynamic_result: self.dynamic_result,
             call_timeout: Duration::from_secs(3600),
             capture: CaptureHandle::default(),
         }
@@ -213,6 +278,19 @@ impl Transport for MockTransport {
             .lock()
             .expect("capture mutex poisoned")
             .push((method.to_string(), params.clone()));
+
+        if let Some(f) = self.dynamic_result.get(method) {
+            let (delay, outcome) = f(&params);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            return Ok(match outcome {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": 1, "result": result}),
+                Err((code, message)) => {
+                    json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": message}})
+                }
+            });
+        }
 
         if let Some(f) = self.dynamic.get(method) {
             let result = f(&params);

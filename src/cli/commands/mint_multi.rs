@@ -60,6 +60,29 @@ enum Engine {
     OpenSea,
 }
 
+/// Concurrency limits gate a `futures_util::stream::buffered(n)` pipeline,
+/// which requires `n >= 1` to make any progress at all -- `buffered(0)`
+/// never yields anything, silently hanging the whole session rather than
+/// failing closed. Zero is therefore a configuration error, not something
+/// to silently clamp to 1. An upper bound guards against a mistyped huge
+/// value turning a "bounded concurrency" safety feature into an effectively
+/// unbounded fan-out.
+const MAX_CONCURRENCY: usize = 256;
+
+fn validate_concurrency(flag: &str, n: usize) -> Result<usize, KairoxError> {
+    if n == 0 {
+        return Err(KairoxError::Session(SessionError(format!(
+            "{flag} must be at least 1 (0 would never make progress)"
+        ))));
+    }
+    if n > MAX_CONCURRENCY {
+        return Err(KairoxError::Session(SessionError(format!(
+            "{flag} must be at most {MAX_CONCURRENCY}, got {n}"
+        ))));
+    }
+    Ok(n)
+}
+
 fn multi_wallet_config(args: &MintArgs) -> Result<MultiWalletConfig, KairoxError> {
     let mut config = MultiWalletConfig {
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
@@ -77,10 +100,10 @@ fn multi_wallet_config(args: &MintArgs) -> Result<MultiWalletConfig, KairoxError
         config.max_session_total_spend = Some(parse_wei("--max-session-total-spend-wei", raw)?);
     }
     if let Some(n) = args.broadcast_concurrency {
-        config.broadcast_concurrency = n.max(1);
+        config.broadcast_concurrency = validate_concurrency("--broadcast-concurrency", n)?;
     }
     if let Some(n) = args.opensea_api_concurrency {
-        config.opensea_api_concurrency = n.max(1);
+        config.opensea_api_concurrency = validate_concurrency("--opensea-api-concurrency", n)?;
     }
     if let Some(samples) = args.benchmark_samples {
         config.benchmark.sample_count = samples;
@@ -388,4 +411,43 @@ fn read_stdin_confirmation() -> Option<String> {
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).ok()?;
     Some(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_broadcast_concurrency_is_a_clean_config_error() {
+        let err = validate_concurrency("--broadcast-concurrency", 0).unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+    }
+
+    #[test]
+    fn zero_opensea_api_concurrency_is_a_clean_config_error() {
+        let err = validate_concurrency("--opensea-api-concurrency", 0).unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+    }
+
+    #[test]
+    fn valid_concurrency_values_pass_through_unchanged() {
+        assert_eq!(
+            validate_concurrency("--broadcast-concurrency", 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            validate_concurrency("--broadcast-concurrency", 8).unwrap(),
+            8
+        );
+        assert_eq!(
+            validate_concurrency("--broadcast-concurrency", MAX_CONCURRENCY).unwrap(),
+            MAX_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn concurrency_above_hard_upper_bound_is_rejected() {
+        let err = validate_concurrency("--broadcast-concurrency", MAX_CONCURRENCY + 1).unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+    }
 }

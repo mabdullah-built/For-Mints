@@ -456,6 +456,7 @@ pub async fn run_opensea_mint_for_wallet(
             tx_hash,
             params.nft_contract,
             params.wallet,
+            params.quantity,
             params.receipt_poll_interval,
             params.receipt_timeout,
             || on_progress(OpenSeaProgress::ReceiptPending),

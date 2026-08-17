@@ -13,6 +13,8 @@ use serde_json::Value;
 use super::transport::{HttpResponse, OpenSeaTransport, OpenSeaTransportError};
 
 type DynamicResponder = std::sync::Arc<dyn Fn(&Value) -> (u16, Value) + Send + Sync>;
+type DynamicDelayedResponder =
+    std::sync::Arc<dyn Fn(&Value) -> (Duration, u16, Value) + Send + Sync>;
 
 enum Canned {
     Response {
@@ -25,6 +27,20 @@ enum Canned {
     /// wallet-specific mint responses (routed by e.g. the `minter` field)
     /// without needing a separate mock per wallet address.
     Dynamic(DynamicResponder),
+    /// A response that only resolves after `delay` -- used to prove
+    /// concurrency bounds (peak in-flight requests) and independent
+    /// per-wallet progress (a slow wallet must not block a fast one).
+    Delayed {
+        delay: Duration,
+        status: u16,
+        body: Value,
+    },
+    /// Like [`Canned::Dynamic`], but the computed response also carries its
+    /// own per-request delay -- e.g. making exactly one wallet's mint POST
+    /// slow (routed by the `minter` field) while every other wallet's mint
+    /// POST resolves immediately, to prove a slow wallet never blocks a
+    /// fast one.
+    DynamicDelayed(DynamicDelayedResponder),
 }
 
 impl Clone for Canned {
@@ -37,6 +53,16 @@ impl Clone for Canned {
             Self::Timeout => Self::Timeout,
             Self::Network(msg) => Self::Network(msg.clone()),
             Self::Dynamic(f) => Self::Dynamic(f.clone()),
+            Self::Delayed {
+                delay,
+                status,
+                body,
+            } => Self::Delayed {
+                delay: *delay,
+                status: *status,
+                body: body.clone(),
+            },
+            Self::DynamicDelayed(f) => Self::DynamicDelayed(f.clone()),
         }
     }
 }
@@ -99,7 +125,7 @@ impl MockOpenSeaTransport {
             .push((method.to_string(), path.to_string(), body.cloned()));
     }
 
-    fn resolve(
+    async fn resolve(
         &self,
         method: &str,
         path: &str,
@@ -115,6 +141,26 @@ impl MockOpenSeaTransport {
             Some(Canned::Dynamic(f)) => {
                 let request_body = body.cloned().unwrap_or(Value::Null);
                 let (status, response_body) = f(&request_body);
+                Ok(HttpResponse {
+                    status,
+                    body: response_body,
+                })
+            }
+            Some(Canned::Delayed {
+                delay,
+                status,
+                body,
+            }) => {
+                tokio::time::sleep(*delay).await;
+                Ok(HttpResponse {
+                    status: *status,
+                    body: body.clone(),
+                })
+            }
+            Some(Canned::DynamicDelayed(f)) => {
+                let request_body = body.cloned().unwrap_or(Value::Null);
+                let (delay, status, response_body) = f(&request_body);
+                tokio::time::sleep(delay).await;
                 Ok(HttpResponse {
                     status,
                     body: response_body,
@@ -166,6 +212,46 @@ impl MockOpenSeaTransportBuilder {
         self
     }
 
+    /// Respond to `method path` with `status`/`body`, but only after
+    /// `delay` elapses -- used to prove concurrency bounds (peak in-flight
+    /// requests never exceed the configured limit) and independent
+    /// per-wallet progress (a slow wallet must not block a fast one).
+    pub fn respond_delayed(
+        mut self,
+        method: &str,
+        path: &str,
+        delay: Duration,
+        status: u16,
+        body: Value,
+    ) -> Self {
+        self.entries.insert(
+            MockOpenSeaTransport::key(method, path),
+            Canned::Delayed {
+                delay,
+                status,
+                body,
+            },
+        );
+        self
+    }
+
+    /// Like [`Self::respond_dynamic`], but the closure also chooses this
+    /// request's own delay -- e.g. making one specific wallet's mint POST
+    /// slow (by inspecting the `minter` field) while every other wallet's
+    /// mint POST resolves immediately.
+    pub fn respond_dynamic_delayed(
+        mut self,
+        method: &str,
+        path: &str,
+        f: impl Fn(&Value) -> (Duration, u16, Value) + Send + Sync + 'static,
+    ) -> Self {
+        self.entries.insert(
+            MockOpenSeaTransport::key(method, path),
+            Canned::DynamicDelayed(std::sync::Arc::new(f)),
+        );
+        self
+    }
+
     pub fn build(self) -> MockOpenSeaTransport {
         MockOpenSeaTransport {
             entries: self.entries,
@@ -178,7 +264,7 @@ impl MockOpenSeaTransportBuilder {
 impl OpenSeaTransport for MockOpenSeaTransport {
     async fn get(&self, path: &str) -> Result<HttpResponse, OpenSeaTransportError> {
         self.record("GET", path, None);
-        self.resolve("GET", path, None)
+        self.resolve("GET", path, None).await
     }
 
     async fn post_json(
@@ -187,6 +273,6 @@ impl OpenSeaTransport for MockOpenSeaTransport {
         body: &Value,
     ) -> Result<HttpResponse, OpenSeaTransportError> {
         self.record("POST", path, Some(body));
-        self.resolve("POST", path, Some(body))
+        self.resolve("POST", path, Some(body)).await
     }
 }

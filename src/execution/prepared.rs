@@ -67,19 +67,50 @@ pub struct LiveMintRequest {
     pub safety_caps: SafetyCaps,
 }
 
-/// Gather fresh live state, validate every Phase-2 safety invariant, sign,
-/// and serialize — producing a [`PreparedTransaction`]. Fails closed (no
-/// broadcast-eligible output) on any missing or invalid required input.
-pub async fn prepare_live_transaction(
+/// Everything [`gather_unsigned_plan`] validates and computes from fresh
+/// live chain state, before any signing happens. Carries the exact
+/// worst-case total spend Kairox computed for this one wallet — the number
+/// a multi-wallet aggregate spend cap must be checked against, using real
+/// post-gas-estimate costs rather than a declared upper bound, and checked
+/// strictly before any wallet in the session is signed.
+#[derive(Debug, Clone)]
+pub struct PreparedUnsignedPlan {
+    chain: ChainInfo,
+    wallet: Address,
+    nonce: u64,
+    seadrop_contract: Address,
+    mint_value: U256,
+    calldata: Bytes,
+    quantity: u64,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    stage_start: OffsetDateTime,
+    pub worst_case_total_spend: U256,
+}
+
+/// Gather fresh live state and validate every Phase-2 safety invariant —
+/// everything [`prepare_live_transaction`] does except the actual signing.
+/// Fails closed on any missing or invalid required input, exactly like the
+/// combined function. Split out so a multi-wallet session can compute every
+/// eligible wallet's real, finalized worst-case cost and check an aggregate
+/// session spend cap *before* any wallet is signed (see
+/// [`finalize_signed_transaction`]) — signing is the one step that must
+/// never happen ahead of that check.
+///
+/// `signer_address` is only compared against `request.wallet` (a public
+/// key check, not a signing operation) so a wrong-key wallet still fails
+/// fast, before spending any RPC round trip, exactly as the combined
+/// function always has.
+pub async fn gather_unsigned_plan(
     client: &RpcClient,
-    signer: &dyn Signer,
+    signer_address: Address,
     request: &LiveMintRequest,
-) -> Result<PreparedTransaction, KairoxError> {
-    if signer.address() != request.wallet {
+) -> Result<PreparedUnsignedPlan, KairoxError> {
+    if signer_address != request.wallet {
         return Err(KairoxError::Session(SessionError(format!(
             "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
-            signer.address(),
-            request.wallet
+            signer_address, request.wallet
         ))));
     }
 
@@ -199,15 +230,41 @@ pub async fn prepare_live_transaction(
         ))));
     }
 
-    let unsigned = UnsignedEip1559Tx {
-        chain_id: request.chain.chain_id,
+    Ok(PreparedUnsignedPlan {
+        chain: request.chain.clone(),
+        wallet: request.wallet,
         nonce,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
-        max_fee_per_gas: fees.max_fee_per_gas(),
+        seadrop_contract: request.seadrop_contract,
+        mint_value,
+        calldata,
+        quantity: request.quantity,
         gas_limit,
-        to: request.seadrop_contract,
-        value: mint_value,
-        data: calldata.clone(),
+        max_fee_per_gas: fees.max_fee_per_gas(),
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
+        stage_start: plan.stage_start,
+        worst_case_total_spend: worst_case_total,
+    })
+}
+
+/// Sign an already-validated [`PreparedUnsignedPlan`] and serialize it into
+/// a broadcast-ready [`PreparedTransaction`]. The only step in the live
+/// pipeline that touches the private key — callers that need to check an
+/// aggregate invariant across multiple wallets (e.g. a multi-wallet session
+/// spend cap) must do so against [`PreparedUnsignedPlan::worst_case_total_spend`]
+/// before calling this, never after.
+pub fn finalize_signed_transaction(
+    signer: &dyn Signer,
+    plan: PreparedUnsignedPlan,
+) -> Result<PreparedTransaction, KairoxError> {
+    let unsigned = UnsignedEip1559Tx {
+        chain_id: plan.chain.chain_id,
+        nonce: plan.nonce,
+        max_priority_fee_per_gas: plan.max_priority_fee_per_gas,
+        max_fee_per_gas: plan.max_fee_per_gas,
+        gas_limit: plan.gas_limit,
+        to: plan.seadrop_contract,
+        value: plan.mint_value,
+        data: plan.calldata.clone(),
         access_list: Vec::new(),
     };
     let signing_hash = unsigned.signing_hash();
@@ -228,16 +285,16 @@ pub async fn prepare_live_transaction(
     let broadcast_prepare_ms = broadcast_prepare_started.elapsed().as_millis() as u64;
 
     Ok(PreparedTransaction {
-        chain_id: request.chain.chain_id,
-        wallet: request.wallet,
-        nonce,
-        target: request.seadrop_contract,
-        value: mint_value,
-        calldata_hash: keccak256(&calldata),
-        quantity: request.quantity,
-        gas_limit,
-        max_fee_per_gas: fees.max_fee_per_gas(),
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
+        chain_id: plan.chain.chain_id,
+        wallet: plan.wallet,
+        nonce: plan.nonce,
+        target: plan.seadrop_contract,
+        value: plan.mint_value,
+        calldata_hash: keccak256(&plan.calldata),
+        quantity: plan.quantity,
+        gas_limit: plan.gas_limit,
+        max_fee_per_gas: plan.max_fee_per_gas,
+        max_priority_fee_per_gas: plan.max_priority_fee_per_gas,
         stage_start: plan.stage_start,
         signing_hash,
         raw_signed_bytes,
@@ -246,6 +303,22 @@ pub async fn prepare_live_transaction(
         broadcast_prepare_ms,
         prepared_at: OffsetDateTime::now_utc(),
     })
+}
+
+/// Gather fresh live state, validate every Phase-2 safety invariant, sign,
+/// and serialize — producing a [`PreparedTransaction`]. Fails closed (no
+/// broadcast-eligible output) on any missing or invalid required input.
+/// Equivalent to [`gather_unsigned_plan`] immediately followed by
+/// [`finalize_signed_transaction`] — kept as a single call for the
+/// single-wallet path, which has no aggregate invariant to check between
+/// the two steps.
+pub async fn prepare_live_transaction(
+    client: &RpcClient,
+    signer: &dyn Signer,
+    request: &LiveMintRequest,
+) -> Result<PreparedTransaction, KairoxError> {
+    let plan = gather_unsigned_plan(client, signer.address(), request).await?;
+    finalize_signed_transaction(signer, plan)
 }
 
 #[cfg(test)]

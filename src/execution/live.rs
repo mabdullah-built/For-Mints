@@ -311,6 +311,7 @@ pub async fn run_live_mint(
                 prepared.tx_hash,
                 request.nft_contract,
                 request.wallet,
+                request.quantity,
                 config.receipt_poll_interval,
                 config.receipt_timeout,
                 || on_progress(LiveProgress::ReceiptPending),

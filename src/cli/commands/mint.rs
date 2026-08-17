@@ -443,6 +443,24 @@ fn print_broadcast_result(
                 );
             }
         }
+        Some(ReceiptState::ConfirmedExecutionMismatch {
+            minted,
+            expected_quantity,
+        }) => {
+            println!(
+                "receipt: CONFIRMED_EXECUTION_MISMATCH -- blockchain execution confirmed, but expected mint not proven"
+            );
+            println!(
+                "  expected {expected_quantity} attributable mint transfer(s), observed {}",
+                minted.len()
+            );
+            for asset in minted {
+                println!(
+                    "  observed mint token id {} (amount {})",
+                    asset.token_id, asset.amount
+                );
+            }
+        }
         Some(ReceiptState::ConfirmedRevert) => println!("receipt: CONFIRMED_REVERT"),
         Some(ReceiptState::ReceiptUnknown) => {
             println!("receipt: RECEIPT_UNKNOWN (timed out waiting)")
