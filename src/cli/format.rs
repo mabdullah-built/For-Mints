@@ -14,19 +14,20 @@ use crate::execution::errors::{KairoxError, SessionError};
 /// Parse a base-10 wei amount from a CLI argument, with a clear error
 /// message naming the offending field.
 pub fn parse_wei(field: &str, value: &str) -> Result<U256, KairoxError> {
-    U256::from_str_radix(value, 10)
-        .map_err(|e| KairoxError::Session(SessionError(format!("invalid {field} '{value}': {e}"))))
+    U256::from_str_radix(value, 10).map_err(|e| {
+        KairoxError::Session(SessionError::new(format!("invalid {field} '{value}': {e}")))
+    })
 }
 
 /// Parse an integer-gwei CLI argument into wei.
 pub fn parse_gwei_to_wei(field: &str, value: &str) -> Result<u128, KairoxError> {
     let gwei: u128 = value.parse().map_err(|_| {
-        KairoxError::Session(SessionError(format!(
+        KairoxError::Session(SessionError::new(format!(
             "invalid {field} '{value}': expected an integer number of gwei"
         )))
     })?;
     gwei.checked_mul(1_000_000_000).ok_or_else(|| {
-        KairoxError::Session(SessionError(format!(
+        KairoxError::Session(SessionError::new(format!(
             "{field} '{value}' overflows when converted to wei"
         )))
     })

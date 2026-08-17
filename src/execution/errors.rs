@@ -61,14 +61,86 @@ pub enum KairoxError {
     Session(SessionError),
 }
 
+/// A structured classification for [`SessionError`], so callers that need
+/// to react differently to specific session-abort reasons (e.g.
+/// `execution::multi_wallet::classify_prepare_error`) can match on this
+/// instead of parsing the human `message` text -- and so
+/// [`KairoxError::code`] can report a precise [`KairoxErrorCode`] for the
+/// cases that matter most, rather than collapsing every `SessionError`
+/// into one generic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionErrorKind {
+    /// Not otherwise classified. Still a real, specific human message --
+    /// only the *machine-readable* kind is generic.
+    Generic,
+    /// A loaded/derived signing key resolves to a different address than
+    /// the wallet it was meant to sign for.
+    WalletKeyMismatch,
+    /// A wallet's balance cannot cover the worst-case total spend its own
+    /// finalized plan requires.
+    InsufficientBalance,
+    /// A multi-wallet session's configured aggregate spend ceiling would
+    /// be exceeded by the real, finalized worst-case cost across every
+    /// eligible wallet.
+    SessionCapExceeded,
+    /// The aggregate requested quantity across a wallet set would exceed
+    /// verified remaining collection/stage supply.
+    AggregateSupplyExceeded,
+    /// No RPC endpoint configured/connected for the requested chain, so no
+    /// verified read was possible at all.
+    NoVerifiedReadRpc,
+    /// A manifest file failed to load or validate.
+    InvalidManifest,
+    /// A multi-wallet participant skipped due to another wallet's shared
+    /// resource (e.g. the OpenSea API key) having already failed -- never
+    /// this wallet's own eligibility, so callers must not classify it the
+    /// same way as an `Ineligible` outcome.
+    SkippedSharedResourceFailure,
+}
+
 /// An error representing a state Kairox has explicitly decided must halt
 /// the whole session, independent of any single underlying operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionError(pub String);
+pub struct SessionError {
+    pub message: String,
+    pub kind: SessionErrorKind,
+}
+
+impl SessionError {
+    /// A session error with no specific structured kind -- still a
+    /// specific, real message, just not one of the classified cases.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: SessionErrorKind::Generic,
+        }
+    }
+
+    /// A session error carrying a specific, structured kind for callers
+    /// that need to react to it (see [`SessionErrorKind`]).
+    pub fn with_kind(kind: SessionErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
+    }
+}
+
+impl From<String> for SessionError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for SessionError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "session must stop: {}", self.0)
+        write!(f, "session must stop: {}", self.message)
     }
 }
 
@@ -109,14 +181,12 @@ pub enum KairoxErrorCode {
     NotEligible,
     SimulationRevert,
     OpenSeaApiError,
-    /// A [`SessionError`] not otherwise classified. `SessionError` today
-    /// carries only a human message (no structured kind), so several
-    /// conditions the Phase 6 error-code list names as their own codes --
-    /// `WALLET_KEY_MISMATCH`, `INSUFFICIENT_BALANCE`,
-    /// `SESSION_CAP_EXCEEDED`, `NO_VERIFIED_READ_RPC` -- currently surface
-    /// through this fallback rather than a dedicated variant. Giving
-    /// `SessionError` a structured kind field (so every one of its many
-    /// call sites carries a code) is real follow-up work, not done here.
+    WalletKeyMismatch,
+    InsufficientBalance,
+    SessionCapExceeded,
+    NoVerifiedReadRpc,
+    /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
+    /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
     SessionAborted,
 }
 
@@ -138,6 +208,10 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::NotEligible => "NOT_ELIGIBLE",
             Self::SimulationRevert => "SIMULATION_REVERT",
             Self::OpenSeaApiError => "OPENSEA_API_ERROR",
+            Self::WalletKeyMismatch => "WALLET_KEY_MISMATCH",
+            Self::InsufficientBalance => "INSUFFICIENT_BALANCE",
+            Self::SessionCapExceeded => "SESSION_CAP_EXCEEDED",
+            Self::NoVerifiedReadRpc => "NO_VERIFIED_READ_RPC",
             Self::SessionAborted => "SESSION_ABORTED",
         };
         f.write_str(s)
@@ -206,7 +280,16 @@ impl KairoxError {
                 | OpenSeaError::SlugRequired
                 | OpenSeaError::OnChainStateUnavailable { .. } => KairoxErrorCode::OpenSeaApiError,
             },
-            KairoxError::Session(_) => KairoxErrorCode::SessionAborted,
+            KairoxError::Session(e) => match e.kind {
+                SessionErrorKind::WalletKeyMismatch => KairoxErrorCode::WalletKeyMismatch,
+                SessionErrorKind::InsufficientBalance => KairoxErrorCode::InsufficientBalance,
+                SessionErrorKind::SessionCapExceeded => KairoxErrorCode::SessionCapExceeded,
+                SessionErrorKind::AggregateSupplyExceeded => KairoxErrorCode::SupplyExhausted,
+                SessionErrorKind::NoVerifiedReadRpc => KairoxErrorCode::NoVerifiedReadRpc,
+                SessionErrorKind::Generic
+                | SessionErrorKind::InvalidManifest
+                | SessionErrorKind::SkippedSharedResourceFailure => KairoxErrorCode::SessionAborted,
+            },
         }
     }
 }
@@ -252,7 +335,7 @@ mod tests {
 
     #[test]
     fn session_error_is_must_stop_session() {
-        let err = KairoxError::Session(SessionError("broadcast outcome uncertain".into()));
+        let err = KairoxError::Session(SessionError::new("broadcast outcome uncertain"));
         assert_eq!(err.category(), ErrorCategory::MustStopSession);
     }
 }

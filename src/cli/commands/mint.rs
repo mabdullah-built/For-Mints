@@ -19,7 +19,7 @@ use crate::cli::format::{format_unix, parse_wei};
 use crate::domain::fees::SafetyCaps;
 use crate::domain::timing::{SleepSegment, StageStatus};
 use crate::execution::broadcast::BroadcastSummary;
-use crate::execution::errors::{KairoxError, SessionError};
+use crate::execution::errors::{KairoxError, SessionError, SessionErrorKind};
 use crate::execution::live::{LiveMintConfig, LiveProgress, run_live_mint};
 use crate::execution::opensea_engine::{OpenSeaMintRequest, OpenSeaProgress, run_opensea_mint};
 use crate::execution::prepared::LiveMintRequest;
@@ -144,8 +144,8 @@ async fn run_dry_run(
                 // metadata, never a validated on-chain plan) -- fail
                 // clearly rather than emit a JSON object with a different,
                 // undocumented shape.
-                return Err(KairoxError::Session(SessionError(
-                    "--json/--output for a dry run is only supported for the PUBLIC engine today; the OpenSea engine's dry-run preview has no structured report yet".into(),
+                return Err(KairoxError::Session(SessionError::new(
+                    "--json/--output for a dry run is only supported for the PUBLIC engine today; the OpenSea engine's dry-run preview has no structured report yet",
                 )));
             }
             eprintln!("selected engine: OPENSEA (official OpenSea Drops API)");
@@ -192,7 +192,7 @@ fn emit_report<T: serde::Serialize>(
     let text = serde_json::to_string(report).expect("report types are always serializable");
     if let Some(path) = output {
         crate::cli::report::write_report_atomic(path, &text).map_err(|e| {
-            KairoxError::Session(SessionError(format!(
+            KairoxError::Session(SessionError::new(format!(
                 "failed to write report to {}: {e}",
                 path.display()
             )))
@@ -244,8 +244,8 @@ async fn connect_send_pool(
         }
     }
     if pool.send_capable().is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no send-capable RPC endpoint connected; cannot broadcast live".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no send-capable RPC endpoint connected; cannot broadcast live",
         )));
     }
     Ok(pool)
@@ -260,8 +260,8 @@ async fn run_send_public(
     let started_at = OffsetDateTime::now_utc();
 
     let wallet = args.plan_args.wallet.ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
+        KairoxError::Session(SessionError::new(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)",
         ))
     })?;
     let registry = ChainRegistry::builtin();
@@ -353,14 +353,19 @@ async fn run_send_public(
     }
 
     let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
-        KairoxError::Session(SessionError(format!("failed to load signing key: {e}")))
+        KairoxError::Session(SessionError::new(format!(
+            "failed to load signing key: {e}"
+        )))
     })?;
     if signer.address() != wallet {
-        return Err(KairoxError::Session(SessionError(format!(
-            "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
-            signer.address(),
-            wallet
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer.address(),
+                wallet
+            ),
+        )));
     }
 
     let safety_caps = SafetyCaps {
@@ -458,8 +463,8 @@ async fn run_send_opensea(
     let started_at = OffsetDateTime::now_utc();
 
     let wallet = args.plan_args.wallet.ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
+        KairoxError::Session(SessionError::new(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)",
         ))
     })?;
     let registry = ChainRegistry::builtin();
@@ -544,14 +549,19 @@ async fn run_send_opensea(
     }
 
     let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
-        KairoxError::Session(SessionError(format!("failed to load signing key: {e}")))
+        KairoxError::Session(SessionError::new(format!(
+            "failed to load signing key: {e}"
+        )))
     })?;
     if signer.address() != wallet {
-        return Err(KairoxError::Session(SessionError(format!(
-            "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
-            signer.address(),
-            wallet
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer.address(),
+                wallet
+            ),
+        )));
     }
 
     let safety_caps = SafetyCaps {

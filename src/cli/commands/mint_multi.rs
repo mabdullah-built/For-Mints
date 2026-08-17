@@ -16,7 +16,7 @@ use crate::cli::commands::mint::confirmation_satisfied;
 use crate::cli::context::resolve_chain_and_runtime;
 use crate::cli::format::parse_wei;
 use crate::domain::fees::SafetyCaps;
-use crate::execution::errors::{KairoxError, SessionError};
+use crate::execution::errors::{KairoxError, SessionError, SessionErrorKind};
 use crate::execution::manifest::{WalletManifest, load_manifest_file};
 use crate::execution::multi_wallet::{
     MultiWalletConfig, OpenSeaMultiWalletTarget, WalletExecutionState, WalletMintRequest,
@@ -33,8 +33,12 @@ pub async fn run_manifest(
         .wallet_manifest
         .as_ref()
         .expect("run_manifest is only called when --wallet-manifest is set");
-    let manifest = load_manifest_file(manifest_path)
-        .map_err(|e| KairoxError::Session(SessionError(format!("manifest error: {e}"))))?;
+    let manifest = load_manifest_file(manifest_path).map_err(|e| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::InvalidManifest,
+            format!("manifest error: {e}"),
+        ))
+    })?;
 
     // Deterministic scope reduction for Phase 5: multi-wallet sessions
     // require an explicit engine choice. `auto` would need to check
@@ -45,8 +49,8 @@ pub async fn run_manifest(
         EngineSelection::Public => Engine::Public,
         EngineSelection::Opensea => Engine::OpenSea,
         EngineSelection::Auto => {
-            return Err(KairoxError::Session(SessionError(
-                "--engine auto is not supported with --wallet-manifest; pass --engine public or --engine opensea explicitly".into(),
+            return Err(KairoxError::Session(SessionError::new(
+                "--engine auto is not supported with --wallet-manifest; pass --engine public or --engine opensea explicitly",
             )));
         }
     };
@@ -74,12 +78,12 @@ const MAX_CONCURRENCY: usize = 256;
 
 fn validate_concurrency(flag: &str, n: usize) -> Result<usize, KairoxError> {
     if n == 0 {
-        return Err(KairoxError::Session(SessionError(format!(
+        return Err(KairoxError::Session(SessionError::new(format!(
             "{flag} must be at least 1 (0 would never make progress)"
         ))));
     }
     if n > MAX_CONCURRENCY {
-        return Err(KairoxError::Session(SessionError(format!(
+        return Err(KairoxError::Session(SessionError::new(format!(
             "{flag} must be at most {MAX_CONCURRENCY}, got {n}"
         ))));
     }
@@ -251,8 +255,8 @@ async fn run_manifest_send(
 ) -> Result<(), KairoxError> {
     let (resolved, mut pool) = connect_pool_for_manifest(&args, config_path).await?;
     if pool.send_capable().is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no send-capable RPC endpoint connected; cannot broadcast live".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no send-capable RPC endpoint connected; cannot broadcast live",
         )));
     }
 
@@ -310,8 +314,8 @@ async fn run_manifest_send(
         }
     }
     if wallets.is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no manifest wallet's key loaded and verified successfully; nothing to do".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no manifest wallet's key loaded and verified successfully; nothing to do",
         )));
     }
 

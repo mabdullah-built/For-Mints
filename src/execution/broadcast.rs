@@ -462,7 +462,7 @@ pub fn uncertain_outcome_error(results: &[EndpointBroadcastResult]) -> KairoxErr
         .map(|r| format!("{}: {:?}", r.label, r.outcome))
         .collect::<Vec<_>>()
         .join("; ");
-    KairoxError::Session(SessionError(format!(
+    KairoxError::Session(SessionError::new(format!(
         "broadcast outcome uncertain across all endpoints — refusing to construct a replacement \
          transaction until this is manually resolved. Per-endpoint results: {detail}"
     )))

@@ -10,7 +10,7 @@ use crate::chain::endpoint::{EndpointRole, RpcEndpoint};
 use crate::chain::registry::{ChainInfo, ChainRegistry};
 use crate::chain::rpc::{HttpTransport, RpcClient};
 use crate::config::{KairoxConfig, ResolvedRuntimeConfig, resolve_chain_rpc_endpoints};
-use crate::execution::errors::{KairoxError, SessionError};
+use crate::execution::errors::{KairoxError, SessionError, SessionErrorKind};
 
 use super::args::ChainArgs;
 
@@ -34,7 +34,7 @@ pub fn resolve_chain(
     }
     .cloned()
     .ok_or_else(|| {
-        KairoxError::Session(SessionError(format!(
+        KairoxError::Session(SessionError::new(format!(
             "unknown chain '{}'; known chains: {}",
             chain,
             registry
@@ -49,7 +49,7 @@ pub fn resolve_chain(
     let seadrop_contract = seadrop_override
         .or(info.default_seadrop_address)
         .ok_or_else(|| {
-            KairoxError::Session(SessionError(format!(
+            KairoxError::Session(SessionError::new(format!(
                 "no SeaDrop contract configured for chain '{}'; pass --seadrop-contract",
                 info.name
             )))
@@ -77,7 +77,7 @@ pub fn resolve_chain_and_runtime(
         None,
         &ProcessEnv,
     )
-    .map_err(|e| KairoxError::Session(SessionError(format!("config error: {e}"))))?;
+    .map_err(|e| KairoxError::Session(SessionError::new(format!("config error: {e}"))))?;
     let resolved = resolve_chain(registry, &runtime.chain, chain_args.seadrop_contract)?;
     Ok((resolved, runtime))
 }
@@ -99,7 +99,7 @@ pub fn resolve_read_endpoint(
         && let Some(entry) = config_chain_entry(config, chain)
     {
         let endpoints = resolve_chain_rpc_endpoints(entry, &ProcessEnv)
-            .map_err(|e| KairoxError::Session(SessionError(format!("config error: {e}"))))?;
+            .map_err(|e| KairoxError::Session(SessionError::new(format!("config error: {e}"))))?;
         if let Some(endpoint) = endpoints
             .iter()
             .find(|e| e.role.can_read())
@@ -111,10 +111,13 @@ pub fn resolve_read_endpoint(
 
     let endpoints = load_chain_endpoints(&ProcessEnv, chain.chain_id)?;
     endpoints.preferred_read_endpoint().cloned().ok_or_else(|| {
-        KairoxError::Session(SessionError(format!(
-            "no RPC endpoint configured for chain '{}' (chain id {}); pass --rpc-url, add a [chains.*] entry to your config, or set KAIROX_RPC_{}_0_URL",
-            chain.name, chain.chain_id, chain.chain_id
-        )))
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            format!(
+                "no RPC endpoint configured for chain '{}' (chain id {}); pass --rpc-url, add a [chains.*] entry to your config, or set KAIROX_RPC_{}_0_URL",
+                chain.name, chain.chain_id, chain.chain_id
+            ),
+        ))
     })
 }
 

@@ -10,14 +10,14 @@ pub fn run(args: InitArgs) -> Result<(), KairoxError> {
     let path = match args.path {
         Some(p) => p,
         None => conventional_config_path().ok_or_else(|| {
-            KairoxError::Session(SessionError(
-                "could not determine a conventional config path (neither HOME nor USERPROFILE is set); pass --path explicitly".into(),
+            KairoxError::Session(SessionError::new(
+                "could not determine a conventional config path (neither HOME nor USERPROFILE is set); pass --path explicitly",
             ))
         })?,
     };
 
     if path.exists() && !args.force {
-        return Err(KairoxError::Session(SessionError(format!(
+        return Err(KairoxError::Session(SessionError::new(format!(
             "{} already exists; pass --force to overwrite it",
             path.display()
         ))));
@@ -27,7 +27,7 @@ pub fn run(args: InitArgs) -> Result<(), KairoxError> {
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|e| {
-            KairoxError::Session(SessionError(format!(
+            KairoxError::Session(SessionError::new(format!(
                 "failed to create directory {}: {e}",
                 parent.display()
             )))
@@ -35,7 +35,7 @@ pub fn run(args: InitArgs) -> Result<(), KairoxError> {
     }
 
     std::fs::write(&path, default_config_toml()).map_err(|e| {
-        KairoxError::Session(SessionError(format!(
+        KairoxError::Session(SessionError::new(format!(
             "failed to write {}: {e}",
             path.display()
         )))

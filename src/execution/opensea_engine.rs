@@ -33,7 +33,7 @@ use super::broadcast::{
     BroadcastSummary, EndpointBroadcastResult, broadcast_to_all_with_limiter, summarize_broadcast,
     uncertain_outcome_error,
 };
-use super::errors::{KairoxError, SessionError};
+use super::errors::{KairoxError, SessionError, SessionErrorKind};
 use super::live::PrewarmScheduling;
 use super::metrics::{LatencyMetrics, Stopwatch};
 use super::opensea_validate::{
@@ -107,11 +107,14 @@ pub async fn run_opensea_mint(
     mut on_progress: impl FnMut(OpenSeaProgress),
 ) -> Result<OpenSeaMintOutcome, KairoxError> {
     if signer.address() != request.wallet {
-        return Err(KairoxError::Session(SessionError(format!(
-            "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
-            signer.address(),
-            request.wallet
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer.address(),
+                request.wallet
+            ),
+        )));
     }
 
     let mut metrics = LatencyMetrics::default();
@@ -169,16 +172,16 @@ pub async fn run_opensea_mint(
     // finalized before the OpenSea-dependent critical path below.
     let selection_sw = Stopwatch::start();
     let read_client = pool.preferred_read().ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely validate or simulate an OpenSea-provided transaction"
-                .into(),
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely validate or simulate an OpenSea-provided transaction",
         ))
     })?;
     let send_clients = pool.select_send_endpoints(&request.health);
     metrics.endpoint_selection_ms = Some(selection_sw.elapsed_ms());
     if send_clients.is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no healthy send-capable RPC endpoint available; refusing to prepare a transaction with nowhere to broadcast it".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no healthy send-capable RPC endpoint available; refusing to prepare a transaction with nowhere to broadcast it",
         )));
     }
 
@@ -322,10 +325,13 @@ pub async fn prepare_opensea_wallet_unsigned(
     mut on_progress: impl FnMut(OpenSeaProgress),
 ) -> Result<PreparedOpenSeaUnsignedWallet, KairoxError> {
     if signer_address != params.wallet {
-        return Err(KairoxError::Session(SessionError(format!(
-            "loaded signing key resolves to {}, but wallet was {}; refusing to proceed",
-            signer_address, params.wallet
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but wallet was {}; refusing to proceed",
+                signer_address, params.wallet
+            ),
+        )));
     }
 
     let mut metrics = LatencyMetrics::default();
@@ -339,7 +345,7 @@ pub async fn prepare_opensea_wallet_unsigned(
     on_progress(OpenSeaProgress::RequestingMintTransaction);
     let sw = Stopwatch::start();
     let quantity_u32 = u32::try_from(params.quantity).map_err(|_| {
-        KairoxError::Session(SessionError(format!(
+        KairoxError::Session(SessionError::new(format!(
             "quantity {} does not fit the OpenSea mint API's u32 range",
             params.quantity
         )))
@@ -393,9 +399,9 @@ pub async fn prepare_opensea_wallet_unsigned(
 
     let block = read_client.latest_block().await?;
     let base_fee_per_gas = block.base_fee_per_gas.ok_or_else(|| {
-        KairoxError::Session(SessionError(
+        KairoxError::Session(SessionError::new(
             "chain does not report an EIP-1559 baseFeePerGas; cannot safely price a live transaction"
-                .into(),
+                ,
         ))
     })?;
     let max_priority_fee_per_gas = read_client.max_priority_fee_per_gas().await?;
@@ -415,9 +421,12 @@ pub async fn prepare_opensea_wallet_unsigned(
         .safety_caps
         .check(validated.value, worst_case_gas_cost, worst_case_total)?;
     if balance < worst_case_total {
-        return Err(KairoxError::Session(SessionError(format!(
-            "wallet balance {balance} wei is insufficient for worst-case total spend {worst_case_total} wei"
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::InsufficientBalance,
+            format!(
+                "wallet balance {balance} wei is insufficient for worst-case total spend {worst_case_total} wei"
+            ),
+        )));
     }
 
     metrics.signed_engine_prepare_ms = Some(prepare_sw.elapsed_ms());

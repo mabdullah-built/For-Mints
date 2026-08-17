@@ -35,7 +35,9 @@ use crate::chain::config::EnvSource;
 use crate::chain::pool::RpcPool;
 use crate::chain::registry::ChainInfo;
 use crate::domain::fees::SafetyCaps;
-use crate::execution::errors::{Categorize, ErrorCategory, KairoxError, SessionError};
+use crate::execution::errors::{
+    Categorize, ErrorCategory, KairoxError, SessionError, SessionErrorKind,
+};
 use crate::execution::manifest::WalletManifestEntry;
 use crate::execution::metrics::{LatencyMetrics, Stopwatch};
 use crate::execution::opensea_engine::{
@@ -305,19 +307,19 @@ fn classify_prepare_error(err: &KairoxError) -> WalletExecutionState {
                 },
             }
         }
-        KairoxError::Session(SessionError(msg)) if msg.contains("insufficient") => {
+        KairoxError::Session(e) if e.kind == SessionErrorKind::InsufficientBalance => {
             WalletExecutionState::InsufficientBalance
         }
         // A shared-auth-failure skip (see `run_multi_wallet_opensea_mint`'s
         // `auth_failed` flag) is never wallet eligibility -- it must not be
         // classified `Ineligible`.
-        KairoxError::Session(SessionError(msg)) if msg.starts_with("skipped:") => {
+        KairoxError::Session(e) if e.kind == SessionErrorKind::SkippedSharedResourceFailure => {
             WalletExecutionState::Failed {
-                reason: msg.clone(),
+                reason: e.message.clone(),
             }
         }
-        KairoxError::Session(SessionError(msg)) => WalletExecutionState::Ineligible {
-            reason: msg.clone(),
+        KairoxError::Session(e) => WalletExecutionState::Ineligible {
+            reason: e.message.clone(),
         },
         KairoxError::OpenSea(e) => {
             use crate::opensea::errors::OpenSeaError;
@@ -395,15 +397,15 @@ pub async fn run_multi_wallet_public_mint(
     pool.benchmark_all(&config.benchmark).await;
 
     let read_client = pool.preferred_read().ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely run a multi-wallet session"
-                .into(),
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely run a multi-wallet session",
         ))
     })?;
     let send_clients = pool.select_send_endpoints(&config.health);
     if send_clients.is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no healthy send-capable RPC endpoint available; refusing to prepare any wallet with nowhere to broadcast to".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no healthy send-capable RPC endpoint available; refusing to prepare any wallet with nowhere to broadcast to",
         )));
     }
 
@@ -431,9 +433,12 @@ pub async fn run_multi_wallet_public_mint(
         .max_supply
         .saturating_sub(mint_stats.current_total_supply);
     if aggregate_requested > remaining_supply {
-        return Err(KairoxError::Session(SessionError(format!(
-            "aggregate requested quantity {aggregate_requested} exceeds verified remaining supply {remaining_supply}; refusing to sign any wallet in this session (external participants may still consume supply after this check -- that race is unavoidable and not something Kairox can lock)"
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::AggregateSupplyExceeded,
+            format!(
+                "aggregate requested quantity {aggregate_requested} exceeds verified remaining supply {remaining_supply}; refusing to sign any wallet in this session (external participants may still consume supply after this check -- that race is unavoidable and not something Kairox can lock)"
+            ),
+        )));
     }
 
     // Section 18/21: `theoretical_upper_bound` (every wallet's *declared*
@@ -523,10 +528,13 @@ pub async fn run_multi_wallet_public_mint(
                 acc.saturating_add(plan.worst_case_total_spend)
             });
         if finalized_worst_case > session_cap {
-            return Err(KairoxError::Session(SessionError(format!(
-                "finalized aggregate worst-case spend across {} eligible wallets ({finalized_worst_case} wei) exceeds the configured session cap ({session_cap} wei); refusing to sign any wallet",
-                unsigned_plans.len()
-            ))));
+            return Err(KairoxError::Session(SessionError::with_kind(
+                SessionErrorKind::SessionCapExceeded,
+                format!(
+                    "finalized aggregate worst-case spend across {} eligible wallets ({finalized_worst_case} wei) exceeds the configured session cap ({session_cap} wei); refusing to sign any wallet",
+                    unsigned_plans.len()
+                ),
+            )));
         }
     }
 
@@ -815,15 +823,15 @@ pub async fn run_multi_wallet_opensea_mint(
         .and_then(|p| U256::from_str_radix(p, 10).ok());
 
     let read_client = pool.preferred_read().ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely run a multi-wallet OpenSea session"
-                .into(),
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely run a multi-wallet OpenSea session",
         ))
     })?;
     let send_clients = pool.select_send_endpoints(&config.health);
     if send_clients.is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no healthy send-capable RPC endpoint available; refusing to prepare any wallet with nowhere to broadcast to".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no healthy send-capable RPC endpoint available; refusing to prepare any wallet with nowhere to broadcast to",
         )));
     }
 
@@ -892,8 +900,9 @@ pub async fn run_multi_wallet_opensea_mint(
             if auth_failed.load(std::sync::atomic::Ordering::SeqCst) {
                 return (
                     request.clone(),
-                    Err(KairoxError::Session(SessionError(
-                        "skipped: the shared OpenSea API key was rejected (401/403) while processing another wallet in this session".into(),
+                    Err(KairoxError::Session(SessionError::with_kind(
+                        SessionErrorKind::SkippedSharedResourceFailure,
+                        "skipped: the shared OpenSea API key was rejected (401/403) while processing another wallet in this session",
                     ))),
                 );
             }
@@ -1067,10 +1076,13 @@ async fn check_opensea_aggregate_invariants(
                 acc.saturating_add(plan.worst_case_total_spend)
             });
         if finalized_worst_case > session_cap {
-            return Err(KairoxError::Session(SessionError(format!(
-                "finalized aggregate worst-case spend across {} eligible OpenSea wallets ({finalized_worst_case} wei) exceeds the configured session cap ({session_cap} wei); refusing to sign any wallet",
-                unsigned_ready.len()
-            ))));
+            return Err(KairoxError::Session(SessionError::with_kind(
+                SessionErrorKind::SessionCapExceeded,
+                format!(
+                    "finalized aggregate worst-case spend across {} eligible OpenSea wallets ({finalized_worst_case} wei) exceeds the configured session cap ({session_cap} wei); refusing to sign any wallet",
+                    unsigned_ready.len()
+                ),
+            )));
         }
     }
 
@@ -1131,11 +1143,14 @@ async fn check_opensea_aggregate_invariants(
             .saturating_add(U256::from(aggregate_quantity));
 
         if projected_total_supply > min_max_token_supply_for_stage {
-            return Err(KairoxError::Session(SessionError(format!(
-                "aggregate requested quantity across {} eligible OpenSea wallets ({aggregate_quantity}) would bring total supply to {projected_total_supply}, exceeding the verified stage cap ({min_max_token_supply_for_stage}, current supply {}); refusing to sign any wallet -- the operator must edit the manifest to fit within the remaining stage capacity",
-                unsigned_ready.len(),
-                mint_stats.current_total_supply
-            ))));
+            return Err(KairoxError::Session(SessionError::with_kind(
+                SessionErrorKind::AggregateSupplyExceeded,
+                format!(
+                    "aggregate requested quantity across {} eligible OpenSea wallets ({aggregate_quantity}) would bring total supply to {projected_total_supply}, exceeding the verified stage cap ({min_max_token_supply_for_stage}, current supply {}); refusing to sign any wallet -- the operator must edit the manifest to fit within the remaining stage capacity",
+                    unsigned_ready.len(),
+                    mint_stats.current_total_supply
+                ),
+            )));
         }
     }
 
@@ -4066,7 +4081,7 @@ mod tests {
         // Sanity check the classification helper this module relies on:
         // an uncertain post-signing broadcast outcome must categorize as
         // MustStopSession, exactly like the single-wallet engines.
-        let err = KairoxError::Session(SessionError("uncertain".into()));
+        let err = KairoxError::Session(SessionError::new("uncertain"));
         assert_eq!(err.category(), ErrorCategory::MustStopSession);
     }
 }

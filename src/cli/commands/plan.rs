@@ -21,8 +21,8 @@ pub async fn build_mint_plan(
     config_path: Option<&std::path::Path>,
 ) -> Result<MintPlan, KairoxError> {
     let wallet = args.wallet.ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
+        KairoxError::Session(SessionError::new(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)",
         ))
     })?;
     let registry = ChainRegistry::builtin();
@@ -193,7 +193,7 @@ pub async fn run(args: PlanArgs, config_path: Option<&std::path::Path>) -> Resul
 
         if let Some(path) = &args.output {
             crate::cli::report::write_report_atomic(path, &json).map_err(|e| {
-                KairoxError::Session(SessionError(format!(
+                KairoxError::Session(SessionError::new(format!(
                     "failed to write report to {}: {e}",
                     path.display()
                 )))

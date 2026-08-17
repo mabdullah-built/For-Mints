@@ -19,7 +19,7 @@ use super::broadcast::{
     BroadcastSummary, EndpointBroadcastResult, broadcast_to_all, summarize_broadcast,
     uncertain_outcome_error,
 };
-use super::errors::{KairoxError, SessionError};
+use super::errors::{KairoxError, SessionError, SessionErrorKind};
 use super::metrics::{LatencyMetrics, Stopwatch};
 use super::prepared::{LiveMintRequest, PreparedTransaction, prepare_live_transaction};
 use super::profile::ExecutionProfile;
@@ -196,16 +196,16 @@ pub async fn run_live_mint(
     // re-chooses endpoints.
     let selection_sw = Stopwatch::start();
     let read_client = pool.preferred_read().ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely prepare a live transaction"
-                .into(),
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely prepare a live transaction",
         ))
     })?;
     let send_clients = pool.select_send_endpoints(&config.health);
     metrics.endpoint_selection_ms = Some(selection_sw.elapsed_ms());
     if send_clients.is_empty() {
-        return Err(KairoxError::Session(SessionError(
-            "no healthy send-capable RPC endpoint available; refusing to prepare a transaction with nowhere to broadcast it".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "no healthy send-capable RPC endpoint available; refusing to prepare a transaction with nowhere to broadcast it",
         )));
     }
 
@@ -240,11 +240,11 @@ pub async fn run_live_mint(
                 let now = OffsetDateTime::now_utc();
                 let end = OffsetDateTime::from_unix_timestamp(public_drop.end_time as i64)
                     .map_err(|e| {
-                        KairoxError::Session(SessionError(format!("invalid endTime: {e}")))
+                        KairoxError::Session(SessionError::new(format!("invalid endTime: {e}")))
                     })?;
                 if now >= end {
-                    return Err(KairoxError::Session(SessionError(
-                        "public mint stage has already ended; refusing to schedule a live broadcast".into(),
+                    return Err(KairoxError::Session(SessionError::new(
+                        "public mint stage has already ended; refusing to schedule a live broadcast",
                     )));
                 }
             }
@@ -264,8 +264,8 @@ pub async fn run_live_mint(
     }
 
     let prepared = prepared.ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "scheduler completed without producing a prepared transaction".into(),
+        KairoxError::Session(SessionError::new(
+            "scheduler completed without producing a prepared transaction",
         ))
     })?;
 

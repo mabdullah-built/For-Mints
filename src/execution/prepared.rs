@@ -20,7 +20,7 @@ use crate::protocol::seadrop::{self, encode_mint_public, select_fee_recipient};
 use crate::signing::signer::Signer;
 use crate::signing::transaction::UnsignedEip1559Tx;
 
-use super::errors::{KairoxError, SessionError};
+use super::errors::{KairoxError, SessionError, SessionErrorKind};
 use super::plan::PlanInputs;
 use super::plan::build_plan;
 
@@ -108,10 +108,13 @@ pub async fn gather_unsigned_plan(
     request: &LiveMintRequest,
 ) -> Result<PreparedUnsignedPlan, KairoxError> {
     if signer_address != request.wallet {
-        return Err(KairoxError::Session(SessionError(format!(
-            "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
-            signer_address, request.wallet
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer_address, request.wallet
+            ),
+        )));
     }
 
     // Required on-chain reads: SeaDrop public-drop config, allowed fee
@@ -146,9 +149,9 @@ pub async fn gather_unsigned_plan(
     // below — every one of these must succeed.
     let block = client.latest_block().await?;
     let base_fee_per_gas = block.base_fee_per_gas.ok_or_else(|| {
-        KairoxError::Session(SessionError(
+        KairoxError::Session(SessionError::new(
             "chain does not report an EIP-1559 baseFeePerGas; cannot safely price a live transaction"
-                .into(),
+                ,
         ))
     })?;
     let max_priority_fee_per_gas = client.max_priority_fee_per_gas().await?;
@@ -215,8 +218,8 @@ pub async fn gather_unsigned_plan(
     // preparing ahead of the stage opening — so only `Ended` is rejected
     // here.)
     if matches!(plan.stage_status, StageStatus::Ended) {
-        return Err(KairoxError::Session(SessionError(
-            "public mint stage has already ended; refusing to prepare a live transaction".into(),
+        return Err(KairoxError::Session(SessionError::new(
+            "public mint stage has already ended; refusing to prepare a live transaction",
         )));
     }
 
@@ -225,9 +228,12 @@ pub async fn gather_unsigned_plan(
     let worst_case_gas_cost = fees.worst_case_gas_cost(gas_limit);
     let worst_case_total = worst_case_total_spend(mint_value, worst_case_gas_cost);
     if balance < worst_case_total {
-        return Err(KairoxError::Session(SessionError(format!(
-            "wallet balance {balance} wei is insufficient for worst-case total spend {worst_case_total} wei"
-        ))));
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::InsufficientBalance,
+            format!(
+                "wallet balance {balance} wei is insufficient for worst-case total spend {worst_case_total} wei"
+            ),
+        )));
     }
 
     Ok(PreparedUnsignedPlan {

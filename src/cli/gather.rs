@@ -61,8 +61,8 @@ pub struct FeeHint {
 pub async fn fetch_fee_hint(client: &RpcClient) -> Result<FeeHint, KairoxError> {
     let block = client.latest_block().await?;
     let base_fee_per_gas = block.base_fee_per_gas.ok_or_else(|| {
-        KairoxError::Session(SessionError(
-            "chain does not report an EIP-1559 baseFeePerGas on its latest block".into(),
+        KairoxError::Session(SessionError::new(
+            "chain does not report an EIP-1559 baseFeePerGas on its latest block",
         ))
     })?;
     // Best-effort: some nodes don't implement eth_maxPriorityFeePerGas.

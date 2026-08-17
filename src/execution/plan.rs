@@ -78,11 +78,11 @@ pub struct MintPlan {
 }
 
 fn unix_timestamp(seconds: u64, what: &str) -> Result<OffsetDateTime, KairoxError> {
-    let seconds: i64 = seconds
-        .try_into()
-        .map_err(|_| KairoxError::Session(SessionError(format!("{what} does not fit in i64"))))?;
+    let seconds: i64 = seconds.try_into().map_err(|_| {
+        KairoxError::Session(SessionError::new(format!("{what} does not fit in i64")))
+    })?;
     OffsetDateTime::from_unix_timestamp(seconds).map_err(|e| {
-        KairoxError::Session(SessionError(format!(
+        KairoxError::Session(SessionError::new(format!(
             "{what} is not a valid timestamp: {e}"
         )))
     })
