@@ -3,3 +3,4 @@
 
 pub mod logs;
 pub mod seadrop;
+pub mod seadrop_crypto;

@@ -82,6 +82,28 @@ sol! {
     ) external payable;
 
     function getAllowListMerkleRoot(address nftContract) external view returns (bytes32);
+
+    // Verified directly against ProjectOpenSea/seadrop `src/lib/SeaDropStructs.sol`
+    // and `src/SeaDrop.sol` during Phase 4 hardening.
+    struct SignedMintValidationParamsAbi {
+        uint80 minMintPrice;
+        uint24 maxMaxTotalMintableByWallet;
+        uint40 minStartTime;
+        uint40 maxEndTime;
+        uint40 maxMaxTokenSupplyForStage;
+        uint16 minFeeBps;
+        uint16 maxFeeBps;
+    }
+
+    function getSigners(address nftContract) external view returns (address[] memory);
+    function getSignedMintValidationParams(address nftContract, address signer)
+        external
+        view
+        returns (SignedMintValidationParamsAbi memory);
+    function getFeeRecipientIsAllowed(address nftContract, address feeRecipient)
+        external
+        view
+        returns (bool);
 }
 
 /// Basis-point denominator; a `feeBps` above this is not a valid percentage.
@@ -442,6 +464,85 @@ pub fn encode_get_allow_list_merkle_root(nft_contract: Address) -> Bytes {
 pub fn decode_get_allow_list_merkle_root(raw: &Bytes) -> Result<B256, SeaDropError> {
     getAllowListMerkleRootCall::abi_decode_returns(raw)
         .map(|root| B256::from(root.0))
+        .map_err(|e| SeaDropError::AbiDecode(e.to_string()))
+}
+
+/// Normalized `SignedMintValidationParams`, verified field-for-field against
+/// `SeaDropStructs.sol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedMintValidationParams {
+    pub min_mint_price: U256,
+    pub max_max_total_mintable_by_wallet: U256,
+    pub min_start_time: U256,
+    pub max_end_time: U256,
+    pub max_max_token_supply_for_stage: U256,
+    pub min_fee_bps: U256,
+    pub max_fee_bps: U256,
+}
+
+impl From<SignedMintValidationParamsAbi> for SignedMintValidationParams {
+    fn from(p: SignedMintValidationParamsAbi) -> Self {
+        Self {
+            min_mint_price: U256::from(p.minMintPrice),
+            max_max_total_mintable_by_wallet: U256::from(p.maxMaxTotalMintableByWallet),
+            min_start_time: U256::from(p.minStartTime),
+            max_end_time: U256::from(p.maxEndTime),
+            max_max_token_supply_for_stage: U256::from(p.maxMaxTokenSupplyForStage),
+            min_fee_bps: U256::from(p.minFeeBps),
+            max_fee_bps: U256::from(p.maxFeeBps),
+        }
+    }
+}
+
+/// Build the calldata for `getSigners(nftContract)`.
+pub fn encode_get_signers(nft_contract: Address) -> Bytes {
+    Bytes::from(
+        getSignersCall {
+            nftContract: nft_contract,
+        }
+        .abi_encode(),
+    )
+}
+
+/// Decode `getSigners`' return value.
+pub fn decode_get_signers(raw: &Bytes) -> Result<Vec<Address>, SeaDropError> {
+    getSignersCall::abi_decode_returns(raw).map_err(|e| SeaDropError::AbiDecode(e.to_string()))
+}
+
+/// Build the calldata for `getSignedMintValidationParams(nftContract, signer)`.
+pub fn encode_get_signed_mint_validation_params(nft_contract: Address, signer: Address) -> Bytes {
+    Bytes::from(
+        getSignedMintValidationParamsCall {
+            nftContract: nft_contract,
+            signer,
+        }
+        .abi_encode(),
+    )
+}
+
+/// Decode `getSignedMintValidationParams`' return value.
+pub fn decode_get_signed_mint_validation_params(
+    raw: &Bytes,
+) -> Result<SignedMintValidationParams, SeaDropError> {
+    getSignedMintValidationParamsCall::abi_decode_returns(raw)
+        .map(SignedMintValidationParams::from)
+        .map_err(|e| SeaDropError::AbiDecode(e.to_string()))
+}
+
+/// Build the calldata for `getFeeRecipientIsAllowed(nftContract, feeRecipient)`.
+pub fn encode_get_fee_recipient_is_allowed(nft_contract: Address, fee_recipient: Address) -> Bytes {
+    Bytes::from(
+        getFeeRecipientIsAllowedCall {
+            nftContract: nft_contract,
+            feeRecipient: fee_recipient,
+        }
+        .abi_encode(),
+    )
+}
+
+/// Decode `getFeeRecipientIsAllowed`'s return value.
+pub fn decode_get_fee_recipient_is_allowed(raw: &Bytes) -> Result<bool, SeaDropError> {
+    getFeeRecipientIsAllowedCall::abi_decode_returns(raw)
         .map_err(|e| SeaDropError::AbiDecode(e.to_string()))
 }
 

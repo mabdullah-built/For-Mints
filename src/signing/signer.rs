@@ -125,6 +125,43 @@ pub fn recover_signer(
     Ok(Address::from_slice(&hash[12..32]))
 }
 
+/// Recover an Ethereum address from an arbitrary 32-byte prehash digest and
+/// a standard 65-byte `r || s || v` signature — the general form needed to
+/// verify a signature over something other than an
+/// [`UnsignedEip1559Tx`] (e.g. an EIP-712 digest). Accepts both the `v ∈
+/// {0, 1}` and legacy `v ∈ {27, 28}` recovery-byte conventions.
+///
+/// Uses `k256`'s own (well-tested) ECDSA recovery — never a hand-rolled
+/// secp256k1 implementation.
+pub fn recover_from_prehash(
+    digest: alloy_primitives::B256,
+    signature: &[u8],
+) -> Result<Address, SigningError> {
+    if signature.len() != 65 {
+        return Err(SigningError::SignFailed);
+    }
+    let v = signature[64];
+    let y_parity = match v {
+        0 | 1 => v == 1,
+        27 | 28 => v == 28,
+        _ => return Err(SigningError::SignFailed),
+    };
+    let recovery_id = k256::ecdsa::RecoveryId::new(y_parity, false);
+    let sig = k256::ecdsa::Signature::from_slice(&signature[0..64])
+        .map_err(|_| SigningError::SignFailed)?;
+    let verifying_key =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(digest.as_slice(), &sig, recovery_id)
+            .map_err(|_| SigningError::SignFailed)?;
+
+    let encoded = verifying_key.to_sec1_point(false);
+    let hash = keccak256(&encoded.as_bytes()[1..]);
+    let address = Address::from_slice(&hash[12..32]);
+    if address == Address::ZERO {
+        return Err(SigningError::SignFailed);
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +236,82 @@ mod tests {
     fn rejects_all_zero_key_bytes() {
         let err = LocalSigner::from_bytes([0u8; 32]).unwrap_err();
         assert!(matches!(err, SigningError::InvalidKeyBytes));
+    }
+
+    fn sign_arbitrary_digest(signer: &LocalSigner, digest: alloy_primitives::B256) -> [u8; 65] {
+        let (signature, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) = signer
+            .key
+            .sign_prehash(digest.as_slice())
+            .expect("sign_prehash never fails for a valid digest");
+        let mut out = [0u8; 65];
+        out[0..64].copy_from_slice(&signature.to_bytes());
+        out[64] = if recovery_id.is_y_odd() { 1 } else { 0 };
+        out
+    }
+
+    #[test]
+    fn recover_from_prehash_recovers_the_correct_signer() {
+        let signer = LocalSigner::from_bytes(test_key_bytes()).unwrap();
+        let digest = keccak256(b"arbitrary eip-712 digest");
+        let signature = sign_arbitrary_digest(&signer, digest);
+
+        let recovered = recover_from_prehash(digest, &signature).unwrap();
+        assert_eq!(recovered, signer.address());
+    }
+
+    #[test]
+    fn recover_from_prehash_accepts_legacy_v_27_28_convention() {
+        let signer = LocalSigner::from_bytes(test_key_bytes()).unwrap();
+        let digest = keccak256(b"legacy-v-convention digest");
+        let mut signature = sign_arbitrary_digest(&signer, digest);
+        signature[64] += 27;
+
+        let recovered = recover_from_prehash(digest, &signature).unwrap();
+        assert_eq!(recovered, signer.address());
+    }
+
+    #[test]
+    fn recover_from_prehash_rejects_wrong_length_signature() {
+        let digest = keccak256(b"digest");
+        let err = recover_from_prehash(digest, &[0u8; 64]).unwrap_err();
+        assert!(matches!(err, SigningError::SignFailed));
+    }
+
+    #[test]
+    fn recover_from_prehash_rejects_invalid_recovery_byte() {
+        let signer = LocalSigner::from_bytes(test_key_bytes()).unwrap();
+        let digest = keccak256(b"digest");
+        let mut signature = sign_arbitrary_digest(&signer, digest);
+        signature[64] = 99;
+
+        let err = recover_from_prehash(digest, &signature).unwrap_err();
+        assert!(matches!(err, SigningError::SignFailed));
+    }
+
+    #[test]
+    fn recover_from_prehash_mutated_signature_recovers_a_different_address() {
+        let signer = LocalSigner::from_bytes(test_key_bytes()).unwrap();
+        let digest = keccak256(b"digest");
+        let mut signature = sign_arbitrary_digest(&signer, digest);
+        signature[0] ^= 0xff;
+
+        // A one-byte mutation either fails recovery outright or recovers to
+        // a different (garbage) address -- either way it must never
+        // recover to the real signer.
+        if let Ok(addr) = recover_from_prehash(digest, &signature) {
+            assert_ne!(addr, signer.address());
+        }
+    }
+
+    #[test]
+    fn recover_from_prehash_wrong_digest_recovers_a_different_address() {
+        let signer = LocalSigner::from_bytes(test_key_bytes()).unwrap();
+        let digest = keccak256(b"original digest");
+        let signature = sign_arbitrary_digest(&signer, digest);
+
+        let wrong_digest = keccak256(b"a different digest entirely");
+        if let Ok(addr) = recover_from_prehash(wrong_digest, &signature) {
+            assert_ne!(addr, signer.address());
+        }
     }
 }

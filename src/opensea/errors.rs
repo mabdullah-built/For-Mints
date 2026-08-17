@@ -77,6 +77,24 @@ pub enum OpenSeaError {
         "this mint stage requires server-signed-mint signature verification, which Kairox does not implement in Phase 4; refusing to sign an unverifiable server signature"
     )]
     SignatureValidationUnavailable,
+    #[error(
+        "locally recomputed Merkle proof does not resolve to the on-chain allow-list root for this collection"
+    )]
+    MerkleProofInvalid,
+    #[error("could not read required on-chain state before signing: {detail}")]
+    OnChainStateUnavailable { detail: String },
+    #[error(
+        "recovered server-mint signer {signer} is not an authorized signer for this collection (maxMaxTotalMintableByWallet sentinel is zero)"
+    )]
+    SignerNotAuthorized { signer: alloy_primitives::Address },
+    #[error("recovered signer's SignedMintValidationParams reject this mint: {detail}")]
+    SignerValidationParamsRejected { detail: String },
+    #[error("fee recipient {fee_recipient} is not on-chain-allowed for this collection")]
+    FeeRecipientNotAllowed {
+        fee_recipient: alloy_primitives::Address,
+    },
+    #[error("malformed or wrong-length server-mint signature")]
+    MalformedSignature,
     #[error("on-chain simulation of the OpenSea-provided transaction failed: {detail}")]
     SimulationFailure { detail: String },
     #[error("the requested chain is not supported by the official OpenSea Drops API: {chain}")]
@@ -121,7 +139,13 @@ impl Categorize for OpenSeaError {
             | OpenSeaError::SignatureValidationUnavailable
             | OpenSeaError::SimulationFailure { .. }
             | OpenSeaError::UnsupportedChain { .. }
-            | OpenSeaError::SlugRequired => ErrorCategory::Fatal,
+            | OpenSeaError::SlugRequired
+            | OpenSeaError::MerkleProofInvalid
+            | OpenSeaError::OnChainStateUnavailable { .. }
+            | OpenSeaError::SignerNotAuthorized { .. }
+            | OpenSeaError::SignerValidationParamsRejected { .. }
+            | OpenSeaError::FeeRecipientNotAllowed { .. }
+            | OpenSeaError::MalformedSignature => ErrorCategory::Fatal,
         }
     }
 }

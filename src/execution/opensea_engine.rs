@@ -219,7 +219,8 @@ pub async fn run_opensea_mint(
         safety_caps: request.safety_caps,
         expected_price_per_token,
     };
-    let validated = validate_opensea_mint_response(&mint_response, &validation_input)?;
+    let validated =
+        validate_opensea_mint_response(&mint_response, &validation_input, read_client).await?;
     metrics.opensea_validation_ms = Some(sw.elapsed_ms());
 
     // ON-CHAIN REVALIDATION: only a verified read-capable endpoint is ever
