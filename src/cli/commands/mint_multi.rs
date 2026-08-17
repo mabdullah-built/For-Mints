@@ -163,10 +163,15 @@ async fn run_manifest_dry_run(
     engine: Engine,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
-    println!("=================================================");
-    println!(" MULTI-WALLET DRY RUN — NO TRANSACTION BROADCAST");
-    println!("=================================================");
-    println!();
+    let json = args.plan_args.json;
+    let output = args.plan_args.output.clone();
+
+    if !json {
+        println!("=================================================");
+        println!(" MULTI-WALLET DRY RUN — NO TRANSACTION BROADCAST");
+        println!("=================================================");
+        println!();
+    }
 
     let (resolved, mut pool) = connect_pool_for_manifest(&args, config_path).await?;
     pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::default())
@@ -176,7 +181,83 @@ async fn run_manifest_dry_run(
         Engine::Public => "PUBLIC",
         Engine::OpenSea => "OPENSEA",
     };
-    let aggregate_quantity: u64 = manifest.wallets.iter().map(|w| w.quantity).sum();
+    let aggregate_quantity: u64 = manifest
+        .wallets
+        .iter()
+        .fold(0u64, |acc, w| acc.saturating_add(w.quantity));
+
+    if json || output.is_some() {
+        let session_id = crate::cli::report::generate_session_id();
+        let plan_id = Some(crate::cli::report::compute_plan_id(
+            crate::cli::report::PlanIdInputs {
+                chain_id: resolved.info.chain_id,
+                collection: args.plan_args.collection,
+                engine: if matches!(engine, Engine::Public) {
+                    "public"
+                } else {
+                    "opensea"
+                },
+                wallets: &manifest
+                    .wallets
+                    .iter()
+                    .map(|w| w.address)
+                    .collect::<Vec<_>>(),
+                quantities: &manifest
+                    .wallets
+                    .iter()
+                    .map(|w| w.quantity)
+                    .collect::<Vec<_>>(),
+                stage_start_unix: 0,
+                stage_end_unix: 0,
+                config_fingerprint: &crate::cli::report::config_fingerprint(config_path),
+            },
+        ));
+        let wallets: Vec<crate::cli::report::WalletReport> = manifest
+            .wallets
+            .iter()
+            .map(|w| crate::cli::report::WalletReport {
+                label: w.label.clone(),
+                address: format!("{:#x}", w.address),
+                quantity: w.quantity,
+                state: "PLANNED".to_string(),
+                error_code: None,
+                detail: None,
+                tx_hash: None,
+                token_ids: Vec::new(),
+                broadcast: Vec::new(),
+            })
+            .collect();
+        let report = crate::cli::report::build_session_report(
+            session_id,
+            plan_id,
+            time::OffsetDateTime::now_utc(),
+            resolved.info.name,
+            resolved.info.chain_id,
+            args.plan_args.collection,
+            if matches!(engine, Engine::Public) {
+                "public"
+            } else {
+                "opensea"
+            },
+            true,
+            wallets,
+            None,
+        );
+        let text = serde_json::to_string(&report).expect("SessionReport is always serializable");
+        if let Some(path) = &output {
+            crate::cli::report::write_report_atomic(path, &text).map_err(|e| {
+                KairoxError::Session(SessionError::new(format!(
+                    "failed to write report to {}: {e}",
+                    path.display()
+                )))
+            })?;
+            eprintln!("Report written to {}", path.display());
+        }
+        if json {
+            println!("{text}");
+        }
+        return Ok(());
+    }
 
     println!(
         "chain:               {} (chain id {})",
@@ -253,6 +334,10 @@ async fn run_manifest_send(
     engine: Engine,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
+    let json = args.plan_args.json;
+    let output = args.plan_args.output.clone();
+    let started_at = time::OffsetDateTime::now_utc();
+
     let (resolved, mut pool) = connect_pool_for_manifest(&args, config_path).await?;
     if pool.send_capable().is_empty() {
         return Err(KairoxError::Session(SessionError::new(
@@ -261,41 +346,74 @@ async fn run_manifest_send(
     }
 
     let config = multi_wallet_config(&args)?;
-    let aggregate_quantity: u64 = manifest.wallets.iter().map(|w| w.quantity).sum();
+    let aggregate_quantity: u64 = manifest
+        .wallets
+        .iter()
+        .fold(0u64, |acc, w| acc.saturating_add(w.quantity));
     let worst_case_session_spend = config
         .safety_caps
         .max_total_spend
         .saturating_mul(U256::from(manifest.wallets.len() as u64));
 
-    println!("=================================================");
-    println!(" MULTI-WALLET LIVE SEND CONFIRMATION");
-    println!("=================================================");
-    println!(
+    // session_id/plan_id are generated here -- before any signing key is
+    // loaded or used.
+    let session_id = crate::cli::report::generate_session_id();
+    let engine_str = if matches!(engine, Engine::Public) {
+        "public"
+    } else {
+        "opensea"
+    };
+    let plan_id = Some(crate::cli::report::compute_plan_id(
+        crate::cli::report::PlanIdInputs {
+            chain_id: resolved.info.chain_id,
+            collection: args.plan_args.collection,
+            engine: engine_str,
+            wallets: &manifest
+                .wallets
+                .iter()
+                .map(|w| w.address)
+                .collect::<Vec<_>>(),
+            quantities: &manifest
+                .wallets
+                .iter()
+                .map(|w| w.quantity)
+                .collect::<Vec<_>>(),
+            stage_start_unix: 0,
+            stage_end_unix: 0,
+            config_fingerprint: &crate::cli::report::config_fingerprint(config_path),
+        },
+    ));
+
+    eprintln!("=================================================");
+    eprintln!(" MULTI-WALLET LIVE SEND CONFIRMATION");
+    eprintln!("session_id: {session_id}");
+    eprintln!("=================================================");
+    eprintln!(
         "chain:                {} (chain id {})",
         resolved.info.name, resolved.info.chain_id
     );
-    println!("collection:           {}", args.plan_args.collection);
-    println!("wallets configured:   {}", manifest.wallets.len());
-    println!("aggregate quantity:   {aggregate_quantity}");
-    println!(
+    eprintln!("collection:           {}", args.plan_args.collection);
+    eprintln!("wallets configured:   {}", manifest.wallets.len());
+    eprintln!("aggregate quantity:   {aggregate_quantity}");
+    eprintln!(
         "worst-case max session spend (declared per-wallet caps): {worst_case_session_spend} wei"
     );
     if let Some(cap) = config.max_session_total_spend {
-        println!("configured session spend cap: {cap} wei");
+        eprintln!("configured session spend cap: {cap} wei");
     }
-    println!("send-capable endpoints: {}", pool.send_capable().len());
-    println!("=================================================");
-    println!(
+    eprintln!("send-capable endpoints: {}", pool.send_capable().len());
+    eprintln!("=================================================");
+    eprintln!(
         "WARNING: multiple-wallet participation may violate a project's rules even when each\n\
          wallet individually passes the smart-contract checks. Kairox does not determine\n\
          off-chain project policy. Proceeding confirms every configured wallet is legitimately\n\
          controlled or authorized by you, and that using them together complies with the drop's\n\
          rules."
     );
-    println!("=================================================");
+    eprintln!("=================================================");
 
     if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
-        println!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        eprintln!("Aborted: live-send confirmation not received. Nothing was broadcast.");
         return Ok(());
     }
 
@@ -305,7 +423,7 @@ async fn run_manifest_send(
         match result {
             Ok(signer) => wallets.push((WalletMintRequest::from(&entry), signer)),
             Err(reason) => {
-                println!(
+                eprintln!(
                     "  [{}] {} -> KEY_LOAD_FAILED: {reason}",
                     entry.label.as_deref().unwrap_or("(unlabeled)"),
                     mask_address(&entry.address.to_string())
@@ -319,9 +437,9 @@ async fn run_manifest_send(
         )));
     }
 
-    match engine {
+    let result = match engine {
         Engine::Public => {
-            let result = run_multi_wallet_public_mint(
+            run_multi_wallet_public_mint(
                 &mut pool,
                 &resolved.info,
                 args.plan_args.collection,
@@ -330,8 +448,7 @@ async fn run_manifest_send(
                 &config,
                 |_| {},
             )
-            .await?;
-            print_session_result(&result);
+            .await?
         }
         Engine::OpenSea => {
             let slug = args
@@ -358,9 +475,39 @@ async fn run_manifest_send(
                 |_| {},
             )
             .await?;
-            print_session_result(&result);
+            result
         }
+    };
+
+    if json || output.is_some() {
+        let report = crate::cli::report::build_multi_wallet_session_report(
+            session_id,
+            plan_id,
+            started_at,
+            resolved.info.name,
+            resolved.info.chain_id,
+            args.plan_args.collection,
+            engine_str,
+            false,
+            &result,
+        );
+        let text = serde_json::to_string(&report).expect("SessionReport is always serializable");
+        if let Some(path) = &output {
+            crate::cli::report::write_report_atomic(path, &text).map_err(|e| {
+                KairoxError::Session(SessionError::new(format!(
+                    "failed to write report to {}: {e}",
+                    path.display()
+                )))
+            })?;
+            eprintln!("Report written to {}", path.display());
+        }
+        if json {
+            println!("{text}");
+        }
+        return Ok(());
     }
+
+    print_session_result(&result);
 
     Ok(())
 }

@@ -283,19 +283,27 @@ use kairox::signing::signer::{LocalSigner, Signer};
 
 const NFT: Address = address!("000000000000000000000000000000000000c0de");
 
+const SINGLE_WALLET_SEED: &str = "kairox-phase6-e2e-localhost-wallet";
+
 fn test_signer() -> LocalSigner {
-    LocalSigner::from_bytes(keccak256(b"kairox-phase6-e2e-localhost-wallet").0).unwrap()
+    signer_for_seed(SINGLE_WALLET_SEED)
+}
+
+fn signer_for_seed(seed: &str) -> LocalSigner {
+    LocalSigner::from_bytes(keccak256(seed.as_bytes()).0).unwrap()
+}
+
+/// The hex private key for the signer built from the same `seed` --
+/// `LocalSigner` deliberately never exposes its key material back out
+/// once constructed, so the only way to also get a `KAIROX_SIGNING_KEY`
+/// string is to keep the original seed and re-derive it independently
+/// (this must stay in exact lockstep with `signer_for_seed`'s derivation).
+fn signing_key_hex_for_seed(seed: &str) -> String {
+    format!("0x{}", hex::encode(keccak256(seed.as_bytes())))
 }
 
 fn signing_key_hex(_signer: &LocalSigner) -> String {
-    // Reconstruct the same seed bytes used to build the signer -- the
-    // only way to get a hex private key string back out for
-    // KAIROX_SIGNING_KEY is to keep the original seed, since LocalSigner
-    // deliberately never exposes its key material again once constructed.
-    format!(
-        "0x{}",
-        hex::encode(keccak256(b"kairox-phase6-e2e-localhost-wallet"))
-    )
+    signing_key_hex_for_seed(SINGLE_WALLET_SEED)
 }
 
 fn transfer_log_for(wallet: Address, token_id: u64) -> Value {
@@ -729,4 +737,206 @@ fn config_named_rpc_env_var_actually_connects_to_the_localhost_server() {
 
     let received = server.received.lock().unwrap();
     assert!(received.iter().any(|(m, _)| m == "eth_chainId"));
+}
+
+// =======================================================================
+// Public multi-wallet E2E (Phase 6 Section 5-7): three wallets, a real
+// secret-free manifest file, real per-wallet key_env variables, driven
+// through the real localhost server.
+// =======================================================================
+
+fn write_manifest(
+    dir: &std::path::Path,
+    wallets: &[(Address, u64, &str, &str)],
+) -> std::path::PathBuf {
+    let entries: Vec<Value> = wallets
+        .iter()
+        .map(|(addr, qty, label, key_env)| {
+            serde_json::json!({
+                "label": label,
+                "address": format!("{addr:#x}"),
+                "quantity": qty,
+                "key_env": key_env,
+            })
+        })
+        .collect();
+    let manifest = serde_json::json!({"version": 1, "wallets": entries});
+    let path = dir.join("manifest.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn multi_wallet_dry_run_json_reports_planned_state_for_every_wallet_deterministically() {
+    let a = signer_for_seed("kairox-e2e-multi-a").address();
+    let b = signer_for_seed("kairox-e2e-multi-b").address();
+    let c = signer_for_seed("kairox-e2e-multi-c").address();
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_manifest(
+        dir.path(),
+        &[
+            (a, 1, "wallet-a", "E2E_KEY_A"),
+            (b, 2, "wallet-b", "E2E_KEY_B"),
+            (c, 3, "wallet-c", "E2E_KEY_C"),
+        ],
+    );
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in multi-wallet dry-run scenario: {method}"),
+        })
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet-manifest",
+            manifest_path.to_str().unwrap(),
+            "--engine",
+            "public",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout must be exactly one JSON line");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["dry_run"], true);
+    let wallets = parsed["wallets"].as_array().unwrap();
+    assert_eq!(wallets.len(), 3);
+    // Deterministic manifest order (A, B, C), regardless of anything else.
+    assert_eq!(wallets[0]["label"], "wallet-a");
+    assert_eq!(wallets[1]["label"], "wallet-b");
+    assert_eq!(wallets[2]["label"], "wallet-c");
+    for w in wallets {
+        assert_eq!(w["state"], "PLANNED");
+        assert!(w["tx_hash"].is_null());
+    }
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a multi-wallet dry run must never broadcast anything"
+    );
+}
+
+#[test]
+fn multi_wallet_live_send_reports_three_independent_confirmed_wallets_in_manifest_order() {
+    let signer_a = signer_for_seed("kairox-e2e-multi-a");
+    let signer_b = signer_for_seed("kairox-e2e-multi-b");
+    let signer_c = signer_for_seed("kairox-e2e-multi-c");
+    let wallet_a = signer_a.address();
+    let wallet_b = signer_b.address();
+    let wallet_c = signer_c.address();
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_manifest(
+        dir.path(),
+        &[
+            (wallet_a, 1, "wallet-a", "E2E_KEY_A"),
+            (wallet_b, 1, "wallet-b", "E2E_KEY_B"),
+            (wallet_c, 1, "wallet-c", "E2E_KEY_C"),
+        ],
+    );
+
+    // Every wallet's nonce read returns 0x0 (fine -- the harness doesn't
+    // track per-wallet nonces, it only needs to serve a valid response);
+    // eth_sendRawTransaction echoes back the real keccak256 hash of
+    // whatever raw bytes it received, so three DIFFERENT wallets signing
+    // three different transactions genuinely produce three different
+    // hashes, proven below.
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            // Token id doesn't matter for this scenario; every receipt
+            // mints to whichever wallet address is embedded in the
+            // request we can't easily recover here, so instead credit
+            // all three known wallets' Transfer logs -- the receipt
+            // verifier only accepts the one matching the queried wallet
+            // anyway (protocol::logs filters by `to`).
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [
+                    transfer_log_for(wallet_a, 101),
+                    transfer_log_for(wallet_b, 102),
+                    transfer_log_for(wallet_c, 103),
+                ],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in multi-wallet live-send scenario: {method}"),
+        }),
+    });
+
+    let key_a = signing_key_hex_for_seed("kairox-e2e-multi-a");
+    let key_b = signing_key_hex_for_seed("kairox-e2e-multi-b");
+    let key_c = signing_key_hex_for_seed("kairox-e2e-multi-c");
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("E2E_KEY_A", &key_a)
+        .env("E2E_KEY_B", &key_b)
+        .env("E2E_KEY_C", &key_c)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet-manifest",
+            manifest_path.to_str().unwrap(),
+            "--engine",
+            "public",
+            "--send",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout must be exactly one JSON line");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON");
+    assert_eq!(parsed["dry_run"], false);
+    let wallets = parsed["wallets"].as_array().unwrap();
+    assert_eq!(wallets.len(), 3);
+    assert_eq!(wallets[0]["label"], "wallet-a");
+    assert_eq!(wallets[1]["label"], "wallet-b");
+    assert_eq!(wallets[2]["label"], "wallet-c");
+    let hashes: Vec<&str> = wallets
+        .iter()
+        .map(|w| w["tx_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        hashes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "three distinct wallets must produce three distinct transaction hashes: {hashes:?}"
+    );
+    for w in wallets {
+        assert_eq!(
+            w["state"], "CONFIRMED_SUCCESS",
+            "wallet {w:?} did not confirm"
+        );
+    }
+
+    let received = server.received.lock().unwrap();
+    let sends = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .count();
+    assert_eq!(sends, 3, "exactly one send per wallet expected");
 }

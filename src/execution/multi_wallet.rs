@@ -153,8 +153,9 @@ pub struct WalletResult {
 
 /// Aggregate session-level metrics. Every duration here is wall-clock —
 /// concurrent-phase durations are never summed and presented as if they
-/// were sequential.
-#[derive(Debug, Clone, Default)]
+/// were sequential. `Serialize` so a multi-wallet session report can embed
+/// it verbatim -- every field is a plain count/duration, never secret.
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SessionMetrics {
     pub wallet_count: usize,
     pub eligible_wallet_count: usize,

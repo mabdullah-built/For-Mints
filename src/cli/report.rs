@@ -183,10 +183,17 @@ pub struct WalletReport {
     pub address: String,
     pub quantity: u64,
     /// A short state tag: "PLANNED" (dry-run), "CONFIRMED_SUCCESS",
-    /// "CONFIRMED_EXECUTION_MISMATCH", "CONFIRMED_REVERT",
-    /// "RECEIPT_UNKNOWN", or "NOT_BROADCAST" (aborted before any send).
+    /// "CONFIRMED_EXECUTION_MISMATCH", "CONFIRMED_REVERT", "UNCERTAIN",
+    /// "INELIGIBLE", "INSUFFICIENT_BALANCE", "ALLOCATION_EXCEEDED",
+    /// "FAILED", "RECEIPT_UNKNOWN", or "NOT_BROADCAST" (aborted before
+    /// any send).
     pub state: String,
     pub error_code: Option<String>,
+    /// Free-text detail for states that carry one (multi-wallet
+    /// `Ineligible`/`Failed` reasons). `None` for states that are fully
+    /// described by `state`/`error_code` alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub tx_hash: Option<String>,
     pub token_ids: Vec<String>,
     pub broadcast: Vec<BroadcastOutcomeReport>,
@@ -254,9 +261,89 @@ pub fn wallet_report_from_receipt(
         quantity,
         state: state.to_string(),
         error_code,
+        detail: None,
         tx_hash: tx_hash.map(|h| format!("{h:#x}")),
         token_ids,
         broadcast,
+    }
+}
+
+/// Build a [`WalletReport`] from one wallet's multi-wallet session result.
+/// Uses the same schema `wallet_report_from_receipt` uses for the
+/// single-wallet path -- deliberately not a second, parallel report
+/// format.
+pub fn wallet_report_from_multi_wallet_result(
+    w: &crate::execution::multi_wallet::WalletResult,
+) -> WalletReport {
+    use crate::execution::multi_wallet::WalletExecutionState;
+
+    let (state, error_code, detail, token_ids): (
+        &str,
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+    ) = match &w.state {
+        WalletExecutionState::Configured
+        | WalletExecutionState::KeyVerified
+        | WalletExecutionState::Prepared
+        | WalletExecutionState::Dispatched => ("IN_PROGRESS", None, None, Vec::new()),
+        WalletExecutionState::Ineligible { reason } => (
+            "INELIGIBLE",
+            Some("NOT_ELIGIBLE".to_string()),
+            Some(reason.clone()),
+            Vec::new(),
+        ),
+        WalletExecutionState::InsufficientBalance => (
+            "INSUFFICIENT_BALANCE",
+            Some("INSUFFICIENT_BALANCE".to_string()),
+            None,
+            Vec::new(),
+        ),
+        WalletExecutionState::AllocationExceeded => (
+            "ALLOCATION_EXCEEDED",
+            Some("ALLOCATION_EXCEEDED".to_string()),
+            None,
+            Vec::new(),
+        ),
+        WalletExecutionState::ConfirmedSuccess { minted } => (
+            "CONFIRMED_SUCCESS",
+            None,
+            None,
+            minted.iter().map(|m| m.token_id.to_string()).collect(),
+        ),
+        WalletExecutionState::ConfirmedExecutionMismatch { minted, .. } => (
+            "CONFIRMED_EXECUTION_MISMATCH",
+            Some("RECEIPT_MINT_MISMATCH".to_string()),
+            None,
+            minted.iter().map(|m| m.token_id.to_string()).collect(),
+        ),
+        WalletExecutionState::ConfirmedRevert => (
+            "CONFIRMED_REVERT",
+            Some("RECEIPT_REVERT".to_string()),
+            None,
+            Vec::new(),
+        ),
+        WalletExecutionState::Uncertain => (
+            "UNCERTAIN",
+            Some("BROADCAST_UNCERTAIN".to_string()),
+            None,
+            Vec::new(),
+        ),
+        WalletExecutionState::Failed { reason } => {
+            ("FAILED", None, Some(reason.clone()), Vec::new())
+        }
+    };
+
+    WalletReport {
+        label: w.request.label.clone(),
+        address: format_addr(w.request.address),
+        quantity: w.request.quantity,
+        state: state.to_string(),
+        error_code,
+        detail,
+        tx_hash: w.tx_hash.map(|h| format!("{h:#x}")),
+        token_ids,
+        broadcast: build_broadcast_outcome_reports(&w.broadcast_results),
     }
 }
 
@@ -276,7 +363,15 @@ pub struct SessionReport {
     pub engine: String,
     pub dry_run: bool,
     pub wallets: Vec<WalletReport>,
+    /// Per-wallet latency metrics -- meaningful for a single-wallet
+    /// session only. `None` for a multi-wallet session, which reports
+    /// `session_metrics` instead (aggregate facts don't fit one wallet's
+    /// per-checkpoint timing shape).
     pub metrics: Option<crate::execution::metrics::LatencyMetrics>,
+    /// Aggregate session-level facts -- meaningful for a multi-wallet
+    /// session only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_metrics: Option<crate::execution::multi_wallet::SessionMetrics>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -301,10 +396,49 @@ pub fn build_session_report(
         chain: chain_name.to_string(),
         chain_id,
         collection: format_addr(collection),
+        session_metrics: None,
         engine: engine.to_string(),
         dry_run,
         wallets,
         metrics,
+    }
+}
+
+/// Build the `SessionReport` for a multi-wallet (`--wallet-manifest`)
+/// session -- the same schema `build_session_report` produces for a
+/// single-wallet session, with `session_metrics` populated (aggregate
+/// facts) instead of `metrics` (which is per-wallet-shaped).
+#[allow(clippy::too_many_arguments)]
+pub fn build_multi_wallet_session_report(
+    session_id: String,
+    plan_id: Option<String>,
+    started_at: OffsetDateTime,
+    chain_name: &str,
+    chain_id: u64,
+    collection: Address,
+    engine: &str,
+    dry_run: bool,
+    result: &crate::execution::multi_wallet::SessionResult,
+) -> SessionReport {
+    let wallets = result
+        .wallets
+        .iter()
+        .map(wallet_report_from_multi_wallet_result)
+        .collect();
+    SessionReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        session_id,
+        plan_id,
+        started_at: format_rfc3339(started_at),
+        completed_at: format_rfc3339(OffsetDateTime::now_utc()),
+        chain: chain_name.to_string(),
+        chain_id,
+        collection: format_addr(collection),
+        engine: engine.to_string(),
+        dry_run,
+        wallets,
+        metrics: None,
+        session_metrics: Some(result.metrics.clone()),
     }
 }
 
