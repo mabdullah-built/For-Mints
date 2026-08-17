@@ -55,8 +55,19 @@ fn decode_key_hex(mut raw: String) -> Result<[u8; 32], KeyLoadError> {
 /// `Ok(None)` (not an error) if the variable is absent, so callers can fall
 /// back to interactive input.
 pub fn load_from_env(env: &dyn EnvSource) -> Result<Option<LocalSigner>, KeyLoadError> {
+    load_from_env_var(env, SIGNING_KEY_ENV_VAR)
+}
+
+/// Load a signing key from an arbitrary named environment variable — used
+/// by multi-wallet manifests, where each wallet entry names its own
+/// `key_env` rather than always reading `KAIROX_SIGNING_KEY`. Returns
+/// `Ok(None)` (not an error) if the variable is absent.
+pub fn load_from_env_var(
+    env: &dyn EnvSource,
+    var_name: &str,
+) -> Result<Option<LocalSigner>, KeyLoadError> {
     let Some(raw) = env
-        .get(SIGNING_KEY_ENV_VAR)
+        .get(var_name)
         .map_err(|e| KeyLoadError::Encoding(e.to_string()))?
     else {
         return Ok(None);

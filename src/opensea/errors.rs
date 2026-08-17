@@ -74,10 +74,6 @@ pub enum OpenSeaError {
     #[error("OpenSea's returned mint transaction value is unsafe: {detail}")]
     UnsafeValue { detail: String },
     #[error(
-        "this mint stage requires server-signed-mint signature verification, which Kairox does not implement in Phase 4; refusing to sign an unverifiable server signature"
-    )]
-    SignatureValidationUnavailable,
-    #[error(
         "locally recomputed Merkle proof does not resolve to the on-chain allow-list root for this collection"
     )]
     MerkleProofInvalid,
@@ -136,7 +132,6 @@ impl Categorize for OpenSeaError {
             | OpenSeaError::WalletMismatch { .. }
             | OpenSeaError::QuantityMismatch { .. }
             | OpenSeaError::UnsafeValue { .. }
-            | OpenSeaError::SignatureValidationUnavailable
             | OpenSeaError::SimulationFailure { .. }
             | OpenSeaError::UnsupportedChain { .. }
             | OpenSeaError::SlugRequired

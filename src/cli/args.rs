@@ -87,9 +87,9 @@ pub struct PlanArgs {
     /// --engine auto only when the public on-chain stage is not active.
     #[arg(long)]
     pub slug: Option<String>,
-    /// Wallet address to plan a mint for. A plain address only — never a private key (that is loaded separately via KAIROX_SIGNING_KEY or interactive prompt, only when --send is used).
+    /// Wallet address to plan a mint for. A plain address only — never a private key (that is loaded separately via KAIROX_SIGNING_KEY or interactive prompt, only when --send is used). Required for `plan`, and for `mint` unless --wallet-manifest is used instead.
     #[arg(long)]
-    pub wallet: Address,
+    pub wallet: Option<Address>,
     /// Number of tokens to mint.
     #[arg(long, default_value_t = 1)]
     pub quantity: u64,
@@ -144,6 +144,27 @@ pub struct MintArgs {
     /// Number of latency samples per read-capable endpoint during benchmarking. Defaults to the chain's execution profile.
     #[arg(long)]
     pub benchmark_samples: Option<u32>,
+    /// Path to a multi-wallet manifest JSON file (see the manifest schema
+    /// docs). Mutually exclusive with --wallet; every quantity/cap/timing
+    /// flag above applies uniformly to every manifest wallet. Requires an
+    /// explicit --engine public or --engine opensea (auto engine
+    /// selection is not supported in manifest mode).
+    #[arg(long, conflicts_with = "wallet")]
+    pub wallet_manifest: Option<std::path::PathBuf>,
+    /// Worst-case aggregate spend ceiling across an entire multi-wallet
+    /// session, in wei (decimal). Only meaningful with --wallet-manifest.
+    /// Checked before any wallet is signed.
+    #[arg(long)]
+    pub max_session_total_spend_wei: Option<String>,
+    /// Maximum number of wallets dispatching/broadcasting concurrently in
+    /// a multi-wallet session. Only meaningful with --wallet-manifest.
+    #[arg(long)]
+    pub broadcast_concurrency: Option<usize>,
+    /// Maximum number of concurrent OpenSea API mint requests in a
+    /// multi-wallet OpenSea session. Only meaningful with
+    /// --wallet-manifest and --engine opensea.
+    #[arg(long)]
+    pub opensea_api_concurrency: Option<usize>,
 }
 
 #[derive(Args, Debug)]

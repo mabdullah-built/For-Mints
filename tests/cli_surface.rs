@@ -125,8 +125,10 @@ fn inspect_rejects_malformed_collection_address() {
 
 #[test]
 fn plan_requires_wallet_argument() {
-    // --wallet has no default: omitting it is a clap-level failure, not a
-    // Kairox runtime error, and must never silently default to some address.
+    // --wallet has no default: omitting it must fail closed (a Kairox
+    // runtime error, since --wallet is Option<Address> at the clap level to
+    // allow `kairox mint --wallet-manifest` instead) and never silently
+    // default to some address.
     kairox()
         .args(["plan", "0x000000000000000000000000000000000000c0de"])
         .assert()

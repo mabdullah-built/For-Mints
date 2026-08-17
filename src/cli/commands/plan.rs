@@ -10,13 +10,18 @@ use crate::cli::context::{connect_read_client, resolve_chain};
 use crate::cli::format::{format_selector, format_unix, parse_gwei_to_wei, parse_wei};
 use crate::cli::gather;
 use crate::domain::fees::SafetyCaps;
-use crate::execution::errors::KairoxError;
+use crate::execution::errors::{KairoxError, SessionError};
 use crate::execution::plan::{MintPlan, PlanInputs, build_plan};
 use crate::protocol::seadrop::{encode_mint_public, select_fee_recipient};
 
 /// Fetch on-chain state and produce a validated [`MintPlan`]. Shared by
 /// both `kairox plan` and `kairox mint` (which stops before any broadcast).
 pub async fn build_mint_plan(args: &PlanArgs) -> Result<MintPlan, KairoxError> {
+    let wallet = args.wallet.ok_or_else(|| {
+        KairoxError::Session(SessionError(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
+        ))
+    })?;
     let registry = ChainRegistry::builtin();
     let resolved = resolve_chain(&registry, &args.chain_args)?;
     let client = connect_read_client(&resolved.info, args.chain_args.rpc_url.as_ref()).await?;
@@ -27,13 +32,13 @@ pub async fn build_mint_plan(args: &PlanArgs) -> Result<MintPlan, KairoxError> {
     let allowed_fee_recipients =
         gather::fetch_allowed_fee_recipients(&client, resolved.seadrop_contract, args.collection)
             .await?;
-    let mint_stats = gather::fetch_mint_stats(&client, args.collection, args.wallet).await?;
+    let mint_stats = gather::fetch_mint_stats(&client, args.collection, wallet).await?;
 
     let fee_recipient = select_fee_recipient(
         &allowed_fee_recipients,
         public_drop.restrict_fee_recipients,
         args.fee_recipient,
-        args.wallet,
+        wallet,
     )?;
 
     let fee_hint = gather::fetch_fee_hint(&client).await?;
@@ -62,7 +67,7 @@ pub async fn build_mint_plan(args: &PlanArgs) -> Result<MintPlan, KairoxError> {
     )?;
     let gas_estimate = gather::fetch_gas_estimate(
         &client,
-        args.wallet,
+        wallet,
         resolved.seadrop_contract,
         &calldata,
         mint_value,
@@ -70,7 +75,7 @@ pub async fn build_mint_plan(args: &PlanArgs) -> Result<MintPlan, KairoxError> {
     .await;
     let gas_limit = ((gas_estimate as f64) * args.gas_buffer_multiplier.max(1.0)).ceil() as u64;
 
-    let nonce = gather::fetch_nonce(&client, args.wallet).await;
+    let nonce = gather::fetch_nonce(&client, wallet).await;
 
     let safety_caps = SafetyCaps {
         max_mint_value: parse_wei("--max-mint-value-wei", &args.max_mint_value_wei)?,
@@ -82,7 +87,7 @@ pub async fn build_mint_plan(args: &PlanArgs) -> Result<MintPlan, KairoxError> {
         chain: resolved.info,
         nft_contract: args.collection,
         seadrop_contract: resolved.seadrop_contract,
-        minter_address: args.wallet,
+        minter_address: wallet,
         quantity: args.quantity,
         public_drop,
         allowed_fee_recipients,

@@ -87,6 +87,9 @@ fn load_opensea_client(timeout: StdDuration) -> Result<OpenSeaClient, KairoxErro
 }
 
 pub async fn run(args: MintArgs) -> Result<(), KairoxError> {
+    if args.wallet_manifest.is_some() {
+        return crate::cli::commands::mint_multi::run_manifest(args).await;
+    }
     if !args.send {
         return run_dry_run(args).await;
     }
@@ -178,6 +181,11 @@ async fn connect_send_pool(
 }
 
 async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
+    let wallet = args.plan_args.wallet.ok_or_else(|| {
+        KairoxError::Session(SessionError(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
+        ))
+    })?;
     let registry = ChainRegistry::builtin();
     let resolved = resolve_chain(&registry, &args.plan_args.chain_args)?;
 
@@ -197,7 +205,7 @@ async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
         "chain:                {} (chain id {})",
         resolved.info.name, resolved.info.chain_id
     );
-    println!("wallet:                {}", args.plan_args.wallet);
+    println!("wallet:                {}", wallet);
     println!("collection:            {}", args.plan_args.collection);
     println!("quantity:              {}", args.plan_args.quantity);
     println!("mint value:            {} wei", preview.mint_value);
@@ -223,11 +231,11 @@ async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
     let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
         KairoxError::Session(SessionError(format!("failed to load signing key: {e}")))
     })?;
-    if signer.address() != args.plan_args.wallet {
+    if signer.address() != wallet {
         return Err(KairoxError::Session(SessionError(format!(
             "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
             signer.address(),
-            args.plan_args.wallet
+            wallet
         ))));
     }
 
@@ -241,7 +249,7 @@ async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
         chain: resolved.info.clone(),
         nft_contract: args.plan_args.collection,
         seadrop_contract: resolved.seadrop_contract,
-        wallet: args.plan_args.wallet,
+        wallet,
         quantity: args.plan_args.quantity,
         preferred_fee_recipient: args.plan_args.fee_recipient,
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
@@ -290,6 +298,11 @@ async fn run_send_public(args: MintArgs) -> Result<(), KairoxError> {
 }
 
 async fn run_send_opensea(args: MintArgs, slug: String) -> Result<(), KairoxError> {
+    let wallet = args.plan_args.wallet.ok_or_else(|| {
+        KairoxError::Session(SessionError(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)".into(),
+        ))
+    })?;
     let registry = ChainRegistry::builtin();
     let resolved = resolve_chain(&registry, &args.plan_args.chain_args)?;
     let opensea = load_opensea_client(StdDuration::from_secs(10))?;
@@ -306,7 +319,7 @@ async fn run_send_opensea(args: MintArgs, slug: String) -> Result<(), KairoxErro
         "chain:                {} (chain id {})",
         resolved.info.name, resolved.info.chain_id
     );
-    println!("wallet:                {}", args.plan_args.wallet);
+    println!("wallet:                {}", wallet);
     println!("collection:            {}", args.plan_args.collection);
     println!("opensea slug:          {slug}");
     println!("quantity:              {}", args.plan_args.quantity);
@@ -326,11 +339,11 @@ async fn run_send_opensea(args: MintArgs, slug: String) -> Result<(), KairoxErro
     let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
         KairoxError::Session(SessionError(format!("failed to load signing key: {e}")))
     })?;
-    if signer.address() != args.plan_args.wallet {
+    if signer.address() != wallet {
         return Err(KairoxError::Session(SessionError(format!(
             "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
             signer.address(),
-            args.plan_args.wallet
+            wallet
         ))));
     }
 
@@ -359,7 +372,7 @@ async fn run_send_opensea(args: MintArgs, slug: String) -> Result<(), KairoxErro
         slug,
         nft_contract: args.plan_args.collection,
         seadrop_contract: resolved.seadrop_contract,
-        wallet: args.plan_args.wallet,
+        wallet,
         quantity: args.plan_args.quantity,
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
         safety_caps,
