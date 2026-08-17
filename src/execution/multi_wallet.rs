@@ -743,16 +743,28 @@ pub struct OpenSeaMultiWalletTarget<'a> {
 /// this independently).
 ///
 /// Session-level setup (benchmark, drop details, endpoint selection) runs
-/// once, shared. Each wallet then runs its own fully independent pipeline
-/// via [`crate::execution::opensea_engine::run_opensea_mint_for_wallet`]
-/// — its own OpenSea request, its own validation (Merkle proof / EIP-712
-/// signature, never another wallet's), its own simulation, its own
-/// signature, its own broadcast. Concurrency is bounded by
-/// `config.opensea_api_concurrency` (deliberately smaller than the
-/// broadcast bound — see module-level constant docs): a slow or
-/// ineligible wallet occupies one concurrency slot but never blocks
-/// wallets outside that bound from starting once a slot frees up, and
-/// never blocks a wallet that already started.
+/// once, shared. Every wallet then runs its own independent, locally
+/// validated request/simulation pipeline via
+/// [`crate::execution::opensea_engine::prepare_opensea_wallet_unsigned`]
+/// (its own OpenSea request, its own Merkle proof / EIP-712 signature
+/// validation, its own simulation — never another wallet's), bounded and
+/// concurrent under `config.opensea_api_concurrency`.
+///
+/// Unlike the public engine (whose calldata is known ahead of time and can
+/// be pre-signed before the stage opens with no external dependency),
+/// OpenSea wallets only learn their own `maxTokenSupplyForStage`
+/// constraint (if any) from their own response — arrival order is not
+/// meaningful, and Kairox never infers protocol facts from OpenSea's
+/// off-chain stage-type metadata. So no wallet is EVER signed before every
+/// wallet in the session has finished this unsigned preparation: the
+/// sign/broadcast decision for the whole eligible set is a pure function
+/// of the complete set of responses, never of the order they happened to
+/// arrive in. Once every response is in, [`check_opensea_aggregate_invariants`]
+/// verifies the real aggregate cost (if a session spend cap is configured)
+/// and the real aggregate stage-supply ceiling (if any wallet's response
+/// carried one) — a no-op, and thus no extra latency, when neither
+/// applies. Only then are eligible wallets signed/broadcast/polled,
+/// bounded and concurrent.
 pub async fn run_multi_wallet_opensea_mint(
     opensea: &OpenSeaClient,
     pool: &mut RpcPool,
@@ -837,389 +849,161 @@ pub async fn run_multi_wallet_opensea_mint(
     let broadcast_limiter =
         crate::execution::broadcast::BroadcastLimiter::new(config.broadcast_concurrency.max(1));
 
-    // MODE DECISION: a strict session spend cap always requires BARRIER
-    // mode -- the true aggregate cost across every eligible wallet must be
-    // known before any of them signs, which is only knowable once every
-    // wallet has reached unsigned-ready. Without a session cap, STREAMING
-    // mode is used: each wallet's own OpenSea response deterministically
-    // and locally reveals (via `decode_seadrop_mint_calldata`, never
-    // OpenSea metadata/marketing labels) whether ITS OWN mint carries a
-    // `maxTokenSupplyForStage` constraint. An unconstrained (public) mint
-    // is signed and broadcast the instant its own preparation completes --
-    // it never waits for any other wallet. Only wallets that DO carry a
-    // stage constraint (or that complete after one has already been seen
-    // in this session) fall into a secondary, narrowly-scoped barrier
-    // limited to that constrained subset.
-    let wallet_results: Vec<WalletResult> = if let Some(session_cap) =
-        config.max_session_total_spend
-    {
-        // BARRIER MODE — PREPARE (unsigned) for every wallet, bounded and
-        // concurrent, THEN aggregate checks, THEN FINALIZE for the
-        // eligible set. Safety beats streaming latency when the operator
-        // explicitly requested an aggregate spend ceiling.
-        let prepare_results: Vec<(
-            WalletMintRequest,
-            Result<PreparedOpenSeaUnsignedWallet, KairoxError>,
-        )> = stream::iter(wallets.iter().map(|(request, _signer)| {
-            let read_client = &read_client;
-            let auth_failed = auth_failed.clone();
-            let active_opensea = &active_opensea;
-            let peak_opensea = &peak_opensea;
-            async move {
-                if auth_failed.load(std::sync::atomic::Ordering::SeqCst) {
-                    return (
-                        request.clone(),
-                        Err(KairoxError::Session(SessionError(
-                            "skipped: the shared OpenSea API key was rejected (401/403) while processing another wallet in this session".into(),
-                        ))),
-                    );
-                }
-                let now_active =
-                    active_opensea.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                peak_opensea.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
-                let params = OpenSeaWalletMintParams {
-                    chain,
-                    slug,
-                    nft_contract,
-                    seadrop_contract,
-                    wallet: request.address,
-                    quantity: request.quantity,
-                    gas_buffer_multiplier: config.gas_buffer_multiplier,
-                    safety_caps: config.safety_caps,
-                    known_stage_start,
-                    expected_price_per_token,
-                    receipt_poll_interval: config.receipt_poll_interval,
-                    receipt_timeout: config.receipt_timeout,
-                };
-                let outcome = prepare_opensea_wallet_unsigned(
-                    opensea,
-                    read_client,
-                    request.address,
-                    &params,
-                    |p| on_progress_noop_opensea(request.address, p),
-                )
-                .await;
-                active_opensea.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-
-                if matches!(
-                    &outcome,
-                    Err(KairoxError::OpenSea(
-                        crate::opensea::errors::OpenSeaError::AuthenticationFailed
-                    ))
-                ) {
-                    auth_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-
-                (request.clone(), outcome)
-            }
-        }))
-        .buffered(opensea_concurrency)
-        .collect()
-        .await;
-
-        let mut wallet_results: Vec<WalletResult> = Vec::with_capacity(wallets.len());
-        let mut unsigned_ready: Vec<(
-            WalletMintRequest,
-            &LocalSigner,
-            PreparedOpenSeaUnsignedWallet,
-        )> = Vec::new();
-        for (request, outcome) in prepare_results {
-            match outcome {
-                Ok(plan) => {
-                    let signer = wallets
-                        .iter()
-                        .find(|(r, _)| r.address == request.address)
-                        .map(|(_, s)| s)
-                        .expect(
-                            "unsigned_ready is derived from wallets, so the signer always exists",
-                        );
-                    unsigned_ready.push((request, signer, plan));
-                }
-                Err(e) => {
-                    let state = classify_prepare_error(&e);
-                    wallet_results.push(WalletResult {
-                        request,
-                        state,
-                        tx_hash: None,
-                        broadcast_results: Vec::new(),
-                        metrics: None,
-                    });
-                }
-            }
-        }
-
-        check_opensea_aggregate_invariants(
-            &unsigned_ready,
-            Some(session_cap),
-            nft_contract,
-            read_client,
-        )
-        .await?;
-
-        let final_results: Vec<WalletResult> =
-            stream::iter(unsigned_ready.into_iter().map(|(request, signer, plan)| {
-                let send_clients = &send_clients;
-                let read_client = &read_client;
-                let broadcast_limiter = &broadcast_limiter;
-                async move {
-                    let api_to_dispatch_sw = Stopwatch::start();
-                    let outcome: Result<OpenSeaWalletMintOutcome, KairoxError> =
-                        finalize_and_broadcast_opensea_wallet(
-                            signer,
-                            BroadcastTargets {
-                                send_clients,
-                                limiter: Some(broadcast_limiter),
-                            },
-                            read_client,
-                            plan,
-                            ReceiptPollConfig {
-                                interval: config.receipt_poll_interval,
-                                timeout: config.receipt_timeout,
-                            },
-                            &api_to_dispatch_sw,
-                            |p| on_progress_noop_opensea(request.address, p),
-                        )
-                        .await;
-                    wallet_result_from_opensea_outcome(request, outcome)
-                }
-            }))
-            .buffered(opensea_concurrency)
-            .collect()
-            .await;
-
-        wallet_results.extend(final_results);
-        wallet_results
-    } else {
-        // STREAMING MODE — no session cap configured. Each wallet is an
-        // independent future: prepare, and if its own response reveals no
-        // stage constraint (and no other wallet in this session has
-        // revealed one either), sign/broadcast/poll-receipt immediately,
-        // never waiting for any other wallet. A wallet whose own response
-        // DOES carry a `maxTokenSupplyForStage` constraint -- or that
-        // finishes preparing after such a constraint has already been
-        // seen -- is deliberately held out of signing and collected into
-        // `pending_constrained` instead; that narrow subset alone is
-        // resolved as a secondary barrier once every wallet has finished
-        // preparing. This is the documented exception from Section 23:
-        // a global supply invariant that cannot otherwise be proven beats
-        // the no-slow-wallet-blocking optimization, but ONLY for the
-        // wallets that invariant actually applies to.
-        let stage_barrier_triggered =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pending_constrained: std::sync::Arc<
-            std::sync::Mutex<Vec<(WalletMintRequest, PreparedOpenSeaUnsignedWallet)>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        enum StreamStep {
-            Done(Box<WalletResult>),
-            Pending,
-        }
-
-        let streamed: Vec<StreamStep> = stream::iter(wallets.iter().map(|(request, signer)| {
-            let read_client = &read_client;
-            let send_clients = &send_clients;
-            let broadcast_limiter = &broadcast_limiter;
-            let auth_failed = auth_failed.clone();
-            let active_opensea = &active_opensea;
-            let peak_opensea = &peak_opensea;
-            let stage_barrier_triggered = stage_barrier_triggered.clone();
-            let pending_constrained = pending_constrained.clone();
-            async move {
-                if auth_failed.load(std::sync::atomic::Ordering::SeqCst) {
-                    return StreamStep::Done(Box::new(WalletResult {
-                        request: request.clone(),
-                        state: WalletExecutionState::Failed {
-                            reason: "skipped: the shared OpenSea API key was rejected (401/403) while processing another wallet in this session".into(),
-                        },
-                        tx_hash: None,
-                        broadcast_results: Vec::new(),
-                        metrics: None,
-                    }));
-                }
-                let now_active =
-                    active_opensea.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                peak_opensea.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
-                let params = OpenSeaWalletMintParams {
-                    chain,
-                    slug,
-                    nft_contract,
-                    seadrop_contract,
-                    wallet: request.address,
-                    quantity: request.quantity,
-                    gas_buffer_multiplier: config.gas_buffer_multiplier,
-                    safety_caps: config.safety_caps,
-                    known_stage_start,
-                    expected_price_per_token,
-                    receipt_poll_interval: config.receipt_poll_interval,
-                    receipt_timeout: config.receipt_timeout,
-                };
-                let outcome = prepare_opensea_wallet_unsigned(
-                    opensea,
-                    read_client,
-                    request.address,
-                    &params,
-                    |p| on_progress_noop_opensea(request.address, p),
-                )
-                .await;
-                active_opensea.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-
-                if matches!(
-                    &outcome,
-                    Err(KairoxError::OpenSea(
-                        crate::opensea::errors::OpenSeaError::AuthenticationFailed
-                    ))
-                ) {
-                    auth_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-
-                let plan = match outcome {
-                    Err(e) => {
-                        let state = classify_prepare_error(&e);
-                        return StreamStep::Done(Box::new(WalletResult {
-                            request: request.clone(),
-                            state,
-                            tx_hash: None,
-                            broadcast_results: Vec::new(),
-                            metrics: None,
-                        }));
-                    }
-                    Ok(plan) => plan,
-                };
-
-                let needs_barrier = plan.stage_constraint.is_some()
-                    || stage_barrier_triggered.load(std::sync::atomic::Ordering::SeqCst);
-                if needs_barrier {
-                    stage_barrier_triggered.store(true, std::sync::atomic::Ordering::SeqCst);
-                    pending_constrained
-                        .lock()
-                        .expect("mutex poisoned")
-                        .push((request.clone(), plan));
-                    return StreamStep::Pending;
-                }
-
-                // TRUE STREAMING: this wallet's own response proved (via
-                // locally-decoded, locally-validated calldata) it carries
-                // no stage constraint, and no other wallet in this session
-                // has revealed one either -- sign/broadcast/poll now,
-                // independent of every other wallet's progress.
-                let api_to_dispatch_sw = Stopwatch::start();
-                let fin_outcome = finalize_and_broadcast_opensea_wallet(
-                    signer,
-                    BroadcastTargets {
-                        send_clients,
-                        limiter: Some(broadcast_limiter),
-                    },
-                    read_client,
-                    plan,
-                    ReceiptPollConfig {
-                        interval: config.receipt_poll_interval,
-                        timeout: config.receipt_timeout,
-                    },
-                    &api_to_dispatch_sw,
-                    |p| on_progress_noop_opensea(request.address, p),
-                )
-                .await;
-                StreamStep::Done(Box::new(wallet_result_from_opensea_outcome(
+    // SAFETY: OpenSea multi-wallet sessions cannot speculatively stream a
+    // wallet to sign/broadcast merely because ITS OWN response revealed no
+    // stage constraint. All wallets mint the SAME collection, so an
+    // "unconstrained" mint still consumes `currentTotalSupply` -- exactly
+    // the value a LATER-discovered constrained wallet's
+    // `maxTokenSupplyForStage` check depends on. If the unconstrained
+    // wallet's transaction has not yet landed (or even been observed) when
+    // the constrained wallet's aggregate check runs, that check would
+    // under-count real consumption and could pass a session whose true
+    // on-chain effect exceeds the stage ceiling. Whether a constraint is
+    // discovered early or late must never change the safety decision, so
+    // Kairox does not attempt "stream until a constraint appears": every
+    // wallet's own OpenSea response is gathered (PREPARE, unsigned, bounded
+    // and concurrent) BEFORE any wallet is signed, exactly like a strict
+    // session-spend-cap barrier already required. This makes the
+    // sign/broadcast decision for the whole eligible set a pure function of
+    // the FULL set of responses, never of the order they arrived in.
+    //
+    // The PublicSeaDropEngine (see `run_multi_wallet_public_mint`) is
+    // unaffected and keeps its true pre-signed T=0 fast path -- it never
+    // depends on wallet-specific, order-sensitive external responses.
+    let prepare_results: Vec<(
+        WalletMintRequest,
+        Result<PreparedOpenSeaUnsignedWallet, KairoxError>,
+    )> = stream::iter(wallets.iter().map(|(request, _signer)| {
+        let read_client = &read_client;
+        let auth_failed = auth_failed.clone();
+        let active_opensea = &active_opensea;
+        let peak_opensea = &peak_opensea;
+        async move {
+            if auth_failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return (
                     request.clone(),
-                    fin_outcome,
-                )))
+                    Err(KairoxError::Session(SessionError(
+                        "skipped: the shared OpenSea API key was rejected (401/403) while processing another wallet in this session".into(),
+                    ))),
+                );
+            }
+            let now_active = active_opensea.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak_opensea.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
+            let params = OpenSeaWalletMintParams {
+                chain,
+                slug,
+                nft_contract,
+                seadrop_contract,
+                wallet: request.address,
+                quantity: request.quantity,
+                gas_buffer_multiplier: config.gas_buffer_multiplier,
+                safety_caps: config.safety_caps,
+                known_stage_start,
+                expected_price_per_token,
+                receipt_poll_interval: config.receipt_poll_interval,
+                receipt_timeout: config.receipt_timeout,
+            };
+            let outcome = prepare_opensea_wallet_unsigned(
+                opensea,
+                read_client,
+                request.address,
+                &params,
+                |p| on_progress_noop_opensea(request.address, p),
+            )
+            .await;
+            active_opensea.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+            if matches!(
+                &outcome,
+                Err(KairoxError::OpenSea(
+                    crate::opensea::errors::OpenSeaError::AuthenticationFailed
+                ))
+            ) {
+                auth_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            (request.clone(), outcome)
+        }
+    }))
+    .buffered(opensea_concurrency)
+    .collect()
+    .await;
+
+    let mut wallet_results: Vec<WalletResult> = Vec::with_capacity(wallets.len());
+    let mut unsigned_ready: Vec<(
+        WalletMintRequest,
+        &LocalSigner,
+        PreparedOpenSeaUnsignedWallet,
+    )> = Vec::new();
+    for (request, outcome) in prepare_results {
+        match outcome {
+            Ok(plan) => {
+                let signer = wallets
+                    .iter()
+                    .find(|(r, _)| r.address == request.address)
+                    .map(|(_, s)| s)
+                    .expect("unsigned_ready is derived from wallets, so the signer always exists");
+                unsigned_ready.push((request, signer, plan));
+            }
+            Err(e) => {
+                let state = classify_prepare_error(&e);
+                wallet_results.push(WalletResult {
+                    request,
+                    state,
+                    tx_hash: None,
+                    broadcast_results: Vec::new(),
+                    metrics: None,
+                });
+            }
+        }
+    }
+
+    // Checked over the FULL eligible set every time (a no-op when neither a
+    // session cap is configured nor any wallet carries a stage constraint,
+    // so the common case pays no extra latency beyond the PREPARE round
+    // that was always required to even learn this). Nothing has been
+    // signed yet, so a rejection here is a clean whole-session failure --
+    // never a partial one.
+    check_opensea_aggregate_invariants(
+        &unsigned_ready,
+        config.max_session_total_spend,
+        nft_contract,
+        read_client,
+    )
+    .await?;
+
+    let final_results: Vec<WalletResult> =
+        stream::iter(unsigned_ready.into_iter().map(|(request, signer, plan)| {
+            let send_clients = &send_clients;
+            let read_client = &read_client;
+            let broadcast_limiter = &broadcast_limiter;
+            async move {
+                let api_to_dispatch_sw = Stopwatch::start();
+                let outcome: Result<OpenSeaWalletMintOutcome, KairoxError> =
+                    finalize_and_broadcast_opensea_wallet(
+                        signer,
+                        BroadcastTargets {
+                            send_clients,
+                            limiter: Some(broadcast_limiter),
+                        },
+                        read_client,
+                        plan,
+                        ReceiptPollConfig {
+                            interval: config.receipt_poll_interval,
+                            timeout: config.receipt_timeout,
+                        },
+                        &api_to_dispatch_sw,
+                        |p| on_progress_noop_opensea(request.address, p),
+                    )
+                    .await;
+                wallet_result_from_opensea_outcome(request, outcome)
             }
         }))
         .buffered(opensea_concurrency)
         .collect()
         .await;
 
-        let mut wallet_results: Vec<WalletResult> = streamed
-            .into_iter()
-            .filter_map(|s| match s {
-                StreamStep::Done(w) => Some(*w),
-                StreamStep::Pending => None,
-            })
-            .collect();
-
-        let pending = std::sync::Arc::try_unwrap(pending_constrained)
-            .map(|m| m.into_inner().expect("mutex poisoned"))
-            .unwrap_or_default();
-
-        if !pending.is_empty() {
-            match check_opensea_aggregate_invariants(
-                &pending
-                    .iter()
-                    .map(|(r, p)| {
-                        let signer = wallets
-                            .iter()
-                            .find(|(req, _)| req.address == r.address)
-                            .map(|(_, s)| s)
-                            .expect("pending wallets are derived from wallets");
-                        (r.clone(), signer, p.clone())
-                    })
-                    .collect::<Vec<_>>(),
-                None,
-                nft_contract,
-                read_client,
-            )
-            .await
-            {
-                Ok(()) => {
-                    let finalized_pending: Vec<WalletResult> =
-                        stream::iter(pending.into_iter().map(|(request, plan)| {
-                            let signer = wallets
-                                .iter()
-                                .find(|(r, _)| r.address == request.address)
-                                .map(|(_, s)| s)
-                                .expect("pending wallets are derived from wallets");
-                            let send_clients = &send_clients;
-                            let read_client = &read_client;
-                            let broadcast_limiter = &broadcast_limiter;
-                            async move {
-                                let api_to_dispatch_sw = Stopwatch::start();
-                                let outcome = finalize_and_broadcast_opensea_wallet(
-                                    signer,
-                                    BroadcastTargets {
-                                        send_clients,
-                                        limiter: Some(broadcast_limiter),
-                                    },
-                                    read_client,
-                                    plan,
-                                    ReceiptPollConfig {
-                                        interval: config.receipt_poll_interval,
-                                        timeout: config.receipt_timeout,
-                                    },
-                                    &api_to_dispatch_sw,
-                                    |p| on_progress_noop_opensea(request.address, p),
-                                )
-                                .await;
-                                wallet_result_from_opensea_outcome(request, outcome)
-                            }
-                        }))
-                        .buffered(opensea_concurrency)
-                        .collect()
-                        .await;
-                    wallet_results.extend(finalized_pending);
-                }
-                Err(reject) => {
-                    // Only the constrained subset is affected -- wallets
-                    // that already streamed through successfully above are
-                    // NOT retroactively undone (an already-broadcast
-                    // transaction cannot be un-broadcast; see module docs).
-                    let reason = reject.to_string();
-                    for (request, _plan) in pending {
-                        wallet_results.push(WalletResult {
-                            request,
-                            state: WalletExecutionState::Failed {
-                                reason: reason.clone(),
-                            },
-                            tx_hash: None,
-                            broadcast_results: Vec::new(),
-                            metrics: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        wallet_results
-    };
+    wallet_results.extend(final_results);
 
     metrics.opensea_peak_concurrency = Some(peak_opensea.load(std::sync::atomic::Ordering::SeqCst));
     metrics.broadcast_peak_concurrency = Some(broadcast_limiter.peak_concurrency());
@@ -2841,34 +2625,7 @@ mod tests {
     }
 
     async fn opensea_chain_pool() -> RpcPool {
-        opensea_chain_pool_with_mint_stats(None, None).await
-    }
-
-    /// Like [`opensea_chain_pool`], but every `eth_sendRawTransaction`
-    /// dispatch pushes `(0, recovered_wallet)` to `order_log` -- letting a
-    /// test directly observe which wallets have reached real network
-    /// dispatch while another wallet's OpenSea response is still gated.
-    async fn opensea_chain_pool_with_order_log(order_log: DispatchOrderLog) -> RpcPool {
-        let transport = MockTransport::builder()
-            .respond("eth_chainId", json!("0x1"))
-            .respond("eth_blockNumber", json!("0x1"))
-            .respond("eth_estimateGas", json!("0x2bf20"))
-            .respond(
-                "eth_getBlockByNumber",
-                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
-            )
-            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
-            .respond("eth_getTransactionCount", json!("0x0"))
-            .respond("eth_getBalance", json!("0xde0b6b3a7640000"));
-        let overrides = MintReceiptOverrides {
-            order_log: Some((0, order_log)),
-            ..Default::default()
-        };
-        let transport = attach_mint_receipt_routing_with(transport, NFT, overrides).build();
-        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
-            .await
-            .unwrap();
-        RpcPool::from_clients(1, vec![client])
+        opensea_chain_pool_with_mint_stats(None, None).await.0
     }
 
     async fn opensea_chain_pool_with_capture() -> (RpcPool, crate::chain::mock::CaptureHandle) {
@@ -2900,7 +2657,7 @@ mod tests {
     async fn opensea_chain_pool_with_mint_stats(
         mint_stats: Option<(u64, u64, u64)>,
         allow_list_merkle_root: Option<alloy_primitives::B256>,
-    ) -> RpcPool {
+    ) -> (RpcPool, crate::chain::mock::CaptureHandle) {
         let mut builder = MockTransport::builder()
             .respond("eth_chainId", json!("0x1"))
             .respond("eth_blockNumber", json!("0x1"))
@@ -2941,10 +2698,11 @@ mod tests {
             );
         }
         let transport = attach_mint_receipt_routing(builder, NFT).build();
+        let capture = transport.capture_handle();
         let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
             .await
             .unwrap();
-        RpcPool::from_clients(1, vec![client])
+        (RpcPool::from_clients(1, vec![client]), capture)
     }
 
     /// `endpoint_count` independent, identically-fixtured send-capable
@@ -3438,34 +3196,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_gate_proves_fast_wallets_reach_dispatch_while_slow_wallet_still_blocked()
-    {
-        // Test #2 (completion pass): a genuinely deterministic proof of
-        // streaming, not a timing heuristic. Wallet A and C's OpenSea mint
-        // POST gates are pre-notified (resolve immediately); wallet B's
-        // gate is held closed. We observe A and C's real
-        // `eth_sendRawTransaction` dispatch happen while B's gate is still
-        // closed, THEN release B and confirm it too eventually completes.
+    async fn unconstrained_wallets_are_not_signed_before_a_slower_wallets_stage_constraint_is_known()
+     {
+        // Mixed-stage safety fix regression: wallet A and C's OpenSea
+        // responses are unconstrained (public) and resolve immediately;
+        // wallet B's response (which carries a real stage constraint) is
+        // deliberately held closed via a gate. Even though A and C are
+        // individually "ready" long before B, they must NOT be signed or
+        // broadcast until B's response is known too -- proven here by
+        // capturing zero `eth_sendRawTransaction` calls despite A/C's own
+        // OpenSea round trip having completed well before B's gate opens.
         let wallets = wallets_abc();
-        let fast_a = wallets[0].0.address;
-        let slow_b = wallets[1].0.address;
-        let fast_c = wallets[2].0.address;
+        let wallet_a = wallets[0].0.address;
+        let wallet_b = wallets[1].0.address;
+        let wallet_c = wallets[2].0.address;
+
+        let mint_params_abi = sample_stage_mint_params(1000);
+        let mint_params = MintParams::from(&mint_params_abi);
+        // Single-leaf tree: B is the only constrained wallet, so its own
+        // leaf is a valid root with an empty proof.
+        let leaf_b = seadrop_crypto::allow_list_merkle_leaf(wallet_b, &mint_params);
 
         let gate_a = std::sync::Arc::new(tokio::sync::Notify::new());
         let gate_b = std::sync::Arc::new(tokio::sync::Notify::new());
         let gate_c = std::sync::Arc::new(tokio::sync::Notify::new());
-        // Pre-notify A/C's gates: `Notify` stores one permit, so a waiter
-        // that calls `.notified().await` afterward returns immediately.
         gate_a.notify_one();
         gate_c.notify_one();
-        // gate_b is deliberately left un-notified.
+        // gate_b deliberately left un-notified until after we observe A/C
+        // have already completed their own OpenSea round trip.
 
         let (gate_a_for_closure, gate_b_for_closure, gate_c_for_closure) =
             (gate_a.clone(), gate_b.clone(), gate_c.clone());
+        let opensea_completed: std::sync::Arc<std::sync::Mutex<Vec<Address>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opensea_completed_for_closure = opensea_completed.clone();
 
-        let order_log: DispatchOrderLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut pool = opensea_chain_pool_with_order_log(order_log.clone()).await;
-
+        let (mut pool, capture) =
+            opensea_chain_pool_with_mint_stats(Some((0, 999, 10_000)), Some(leaf_b)).await;
         let opensea_transport = MockOpenSeaTransport::builder()
             .respond(
                 "GET",
@@ -3478,13 +3245,33 @@ mod tests {
                     .get("minter")
                     .and_then(Value::as_str)
                     .and_then(|s| s.parse::<Address>().ok());
-                let gate = match minter {
-                    Some(a) if a == fast_a => gate_a_for_closure.clone(),
-                    Some(a) if a == slow_b => gate_b_for_closure.clone(),
-                    Some(a) if a == fast_c => gate_c_for_closure.clone(),
-                    _ => gate_b_for_closure.clone(),
+                let (gate, response) = match minter {
+                    Some(a) if a == wallet_a => (
+                        gate_a_for_closure.clone(),
+                        opensea_mint_response_json(Address::ZERO, 1, 0),
+                    ),
+                    Some(a) if a == wallet_c => (
+                        gate_c_for_closure.clone(),
+                        opensea_mint_response_json(Address::ZERO, 1, 0),
+                    ),
+                    Some(a) if a == wallet_b => (
+                        gate_b_for_closure.clone(),
+                        allow_list_mint_response_json(a, &mint_params_abi, Vec::new()),
+                    ),
+                    _ => (
+                        gate_b_for_closure.clone(),
+                        json!({"errors": ["unexpected minter"]}),
+                    ),
                 };
-                (gate, 200, opensea_mint_response_json(Address::ZERO, 1, 0))
+                if let Some(a) = minter
+                    && (a == wallet_a || a == wallet_c)
+                {
+                    opensea_completed_for_closure
+                        .lock()
+                        .expect("mutex poisoned")
+                        .push(a);
+                }
+                (gate, 200, response)
             })
             .build();
         let opensea = OpenSeaClient::with_transport(Box::new(opensea_transport));
@@ -3503,21 +3290,22 @@ mod tests {
         let watcher = async {
             loop {
                 {
-                    let log = order_log.lock().expect("mutex poisoned");
-                    let seen: std::collections::HashSet<Address> =
-                        log.iter().map(|(_, w)| *w).collect();
-                    if seen.contains(&fast_a) && seen.contains(&fast_c) {
-                        assert!(
-                            !seen.contains(&slow_b),
-                            "wallet B dispatched before its gate was released -- it was not actually blocked"
-                        );
+                    let seen = opensea_completed.lock().expect("mutex poisoned");
+                    if seen.contains(&wallet_a) && seen.contains(&wallet_c) {
                         break;
                     }
                 }
                 tokio::task::yield_now().await;
             }
-            // A and C have both reached real network dispatch while B's
-            // gate is still closed -- now release B.
+            // A and C have both finished their own OpenSea round trip;
+            // wallet B is still gated. If Kairox signed reactively, A/C
+            // would already be broadcasting now. Confirm zero sends have
+            // happened yet, then release B.
+            assert_eq!(
+                capture.calls_for("eth_sendRawTransaction").len(),
+                0,
+                "A and C must not be signed/broadcast before wallet B's response (and its stage constraint) is known"
+            );
             gate_b.notify_one();
         };
 
@@ -3526,16 +3314,211 @@ mod tests {
             futures_util::future::join(run_future, watcher),
         )
         .await
-        .expect("test timed out -- B's gate was likely never released")
-        .0
-        .unwrap();
+        .expect("test timed out -- B's gate was likely never released");
 
+        // 999 (current supply) + 3 (A+B+C, quantity 1 each) = 1002 exceeds
+        // B's validated maxTokenSupplyForStage of 1000 -- the whole session
+        // must fail, never a partial A/C success.
+        let err = result.unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+        assert!(err.to_string().to_lowercase().contains("stage cap"));
+    }
+
+    #[tokio::test]
+    async fn mixed_unconstrained_and_constrained_wallets_fail_before_signing_when_unsafe() {
+        // Mixed-stage FAIL test: A and C unconstrained (qty 1 each), B
+        // constrained (cap 1000, qty 1). currentTotalSupply = 999.
+        // Aggregate quantity across ALL THREE (not just B) = 3, projecting
+        // total supply to 1002 > 1000 -- must fail before any signature,
+        // as a whole session, never silently picking A/C as "safe" just
+        // because they carry no constraint of their own.
+        let wallets = wallets_abc();
+        let wallet_b = wallets[1].0.address;
+        let mint_params_abi = sample_stage_mint_params(1000);
+        let mint_params = MintParams::from(&mint_params_abi);
+        let leaf_b = seadrop_crypto::allow_list_merkle_leaf(wallet_b, &mint_params);
+
+        let (mut pool, capture) =
+            opensea_chain_pool_with_mint_stats(Some((0, 999, 10_000)), Some(leaf_b)).await;
+        let opensea_transport = MockOpenSeaTransport::builder()
+            .respond(
+                "GET",
+                "/api/v2/drops/cool-cats",
+                200,
+                drop_details_response(),
+            )
+            .respond_dynamic("POST", "/api/v2/drops/cool-cats/mint", move |body| {
+                let minter = body
+                    .get("minter")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<Address>().ok());
+                match minter {
+                    Some(a) if a == wallet_b => (
+                        200,
+                        allow_list_mint_response_json(a, &mint_params_abi, Vec::new()),
+                    ),
+                    Some(_) => (200, opensea_mint_response_json(Address::ZERO, 1, 0)),
+                    None => (400, json!({"errors": ["unexpected minter"]})),
+                }
+            })
+            .build();
+        let opensea = OpenSeaClient::with_transport(Box::new(opensea_transport));
+        let target = OpenSeaMultiWalletTarget {
+            chain: &chain(),
+            slug: "cool-cats",
+            nft_contract: NFT,
+            seadrop_contract: SEADROP,
+        };
+        let err = run_multi_wallet_opensea_mint(
+            &opensea,
+            &mut pool,
+            &target,
+            &wallets,
+            &tiny_config(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+        assert!(err.to_string().to_lowercase().contains("stage cap"));
+
+        let sends = capture.calls_for("eth_sendRawTransaction");
+        assert_eq!(
+            sends.len(),
+            0,
+            "zero wallets -- constrained or not -- may be signed/broadcast when the mixed aggregate is unsafe"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_unconstrained_and_constrained_wallets_pass_when_aggregate_is_safe() {
+        // Mixed-stage PASS test: A and C unconstrained (qty 1 each), B
+        // constrained (cap 1000, qty 1). currentTotalSupply = 998.
+        // Aggregate quantity across all three = 3, projecting to 1001...
+        // wait: use 997 so 997+3=1000 exactly fits the cap -- both
+        // constrained and unconstrained wallets may proceed.
+        let wallets = wallets_abc();
+        let wallet_b = wallets[1].0.address;
+        let mint_params_abi = sample_stage_mint_params(1000);
+        let mint_params = MintParams::from(&mint_params_abi);
+        let leaf_b = seadrop_crypto::allow_list_merkle_leaf(wallet_b, &mint_params);
+
+        let (mut pool, _capture) =
+            opensea_chain_pool_with_mint_stats(Some((0, 997, 10_000)), Some(leaf_b)).await;
+        let opensea_transport = MockOpenSeaTransport::builder()
+            .respond(
+                "GET",
+                "/api/v2/drops/cool-cats",
+                200,
+                drop_details_response(),
+            )
+            .respond_dynamic("POST", "/api/v2/drops/cool-cats/mint", move |body| {
+                let minter = body
+                    .get("minter")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<Address>().ok());
+                match minter {
+                    Some(a) if a == wallet_b => (
+                        200,
+                        allow_list_mint_response_json(a, &mint_params_abi, Vec::new()),
+                    ),
+                    Some(_) => (200, opensea_mint_response_json(Address::ZERO, 1, 0)),
+                    None => (400, json!({"errors": ["unexpected minter"]})),
+                }
+            })
+            .build();
+        let opensea = OpenSeaClient::with_transport(Box::new(opensea_transport));
+        let target = OpenSeaMultiWalletTarget {
+            chain: &chain(),
+            slug: "cool-cats",
+            nft_contract: NFT,
+            seadrop_contract: SEADROP,
+        };
+        let (result, _) = run_multi_wallet_opensea_mint(
+            &opensea,
+            &mut pool,
+            &target,
+            &wallets,
+            &tiny_config(),
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.successful_count(),
             3,
-            "all three wallets, including the deliberately-gated one, must eventually complete: {:?}",
+            "aggregate exactly fits the stage cap -- all wallets, constrained and unconstrained, may proceed: {:?}",
             result.wallets
         );
+    }
+
+    /// Stage-constraint immutability regression: [`check_opensea_aggregate_invariants`]
+    /// consumes only [`PreparedOpenSeaUnsignedWallet::stage_constraint`],
+    /// which is populated once by [`crate::execution::opensea_validate::validate_opensea_mint_response`]
+    /// from locally-decoded, locally-validated calldata. Raw OpenSea API
+    /// response objects have no path back into the aggregate check at all
+    /// -- proven here by mutating (dropping) the original mock response
+    /// source after the session already captured its
+    /// `PreparedOpenSeaUnsignedWallet`s; the aggregate decision is
+    /// unaffected because it never re-reads anything from OpenSea.
+    #[tokio::test]
+    async fn aggregate_stage_check_only_ever_reads_the_validated_prepared_wallet() {
+        let wallets: Vec<_> = wallets_abc().into_iter().take(1).collect();
+        let wallet_a = wallets[0].0.address;
+        let mint_params_abi = sample_stage_mint_params(1000);
+        let mint_params = MintParams::from(&mint_params_abi);
+        let leaf_a = seadrop_crypto::allow_list_merkle_leaf(wallet_a, &mint_params);
+
+        let (mut pool, _capture) =
+            opensea_chain_pool_with_mint_stats(Some((0, 999, 10_000)), Some(leaf_a)).await;
+
+        // The mock response is constructed, moved into the transport
+        // builder, and the builder itself is consumed by `.build()` --
+        // there is no lingering handle back to the original
+        // `allow_list_mint_response_json` value or `mint_params_abi` for
+        // the aggregate check to (incorrectly) reach into later. Only the
+        // already-decoded, already-validated `StageSupplyConstraint`
+        // travels forward, inside `PreparedOpenSeaUnsignedWallet`.
+        let opensea_transport = MockOpenSeaTransport::builder()
+            .respond(
+                "GET",
+                "/api/v2/drops/cool-cats",
+                200,
+                drop_details_response(),
+            )
+            .respond(
+                "POST",
+                "/api/v2/drops/cool-cats/mint",
+                200,
+                allow_list_mint_response_json(wallet_a, &mint_params_abi, Vec::new()),
+            )
+            .build();
+        // `mint_params_abi`/`mint_params` are no longer reachable from here
+        // on -- the transport builder above already consumed the response
+        // body by value, and `.build()` returns an immutable transport with
+        // no path back to either. Only the already-decoded, already-
+        // validated `StageSupplyConstraint` inside the resulting
+        // `PreparedOpenSeaUnsignedWallet` can reach the aggregate check.
+
+        let opensea = OpenSeaClient::with_transport(Box::new(opensea_transport));
+        let target = OpenSeaMultiWalletTarget {
+            chain: &chain(),
+            slug: "cool-cats",
+            nft_contract: NFT,
+            seadrop_contract: SEADROP,
+        };
+        // quantity 1, currentTotalSupply 999, cap 1000 -> 1000 <= 1000: safe.
+        let (result, _) = run_multi_wallet_opensea_mint(
+            &opensea,
+            &mut pool,
+            &target,
+            &wallets,
+            &tiny_config(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.successful_count(), 1, "{:?}", result.wallets);
     }
 
     #[tokio::test]
@@ -3655,7 +3638,9 @@ mod tests {
         let mint_params = MintParams::from(&mint_params_abi);
         let (root, proof_a, proof_b) = two_wallet_allow_list_tree(wallet_a, wallet_b, &mint_params);
 
-        let mut pool = opensea_chain_pool_with_mint_stats(Some((0, 999, 10_000)), Some(root)).await;
+        let mut pool = opensea_chain_pool_with_mint_stats(Some((0, 999, 10_000)), Some(root))
+            .await
+            .0;
         let opensea_transport = MockOpenSeaTransport::builder()
             .respond(
                 "GET",
@@ -3689,15 +3674,10 @@ mod tests {
             nft_contract: NFT,
             seadrop_contract: SEADROP,
         };
-        // No session cap is configured, so this session runs in STREAMING
-        // mode: both wallets carry a stage constraint, so both are held
-        // out of the pure-streaming fast path and resolved through the
-        // narrow stage-constrained-subset barrier. The aggregate check
-        // fails for that subset -- but since streaming mode never discards
-        // already-observed per-wallet results for an unrelated failure,
-        // this surfaces as a successful session whose two wallets are each
-        // `Failed` with the stage-cap reason, not a whole-function `Err`.
-        let (result, _) = run_multi_wallet_opensea_mint(
+        // Nothing is ever signed before every wallet's response is known,
+        // so an aggregate stage-cap violation fails the WHOLE session
+        // cleanly with an `Err` -- not a partial per-wallet Failed set.
+        let err = run_multi_wallet_opensea_mint(
             &opensea,
             &mut pool,
             &target,
@@ -3706,18 +3686,9 @@ mod tests {
             |_| {},
         )
         .await
-        .unwrap();
-
-        assert_eq!(result.successful_count(), 0);
-        for w in &result.wallets {
-            assert!(
-                matches!(&w.state, WalletExecutionState::Failed { reason } if reason.to_lowercase().contains("stage cap")),
-                "wallet {:?} must be Failed with the stage-cap reason: {:?}",
-                w.request.address,
-                w.state
-            );
-            assert!(w.tx_hash.is_none());
-        }
+        .unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+        assert!(err.to_string().to_lowercase().contains("stage cap"));
 
         let mint_posts = capture
             .all()
@@ -3742,7 +3713,9 @@ mod tests {
         let mint_params = MintParams::from(&mint_params_abi);
         let (root, proof_a, proof_b) = two_wallet_allow_list_tree(wallet_a, wallet_b, &mint_params);
 
-        let mut pool = opensea_chain_pool_with_mint_stats(Some((0, 998, 10_000)), Some(root)).await;
+        let mut pool = opensea_chain_pool_with_mint_stats(Some((0, 998, 10_000)), Some(root))
+            .await
+            .0;
         let opensea_transport = MockOpenSeaTransport::builder()
             .respond(
                 "GET",
@@ -3826,7 +3799,8 @@ mod tests {
 
         let pool =
             opensea_chain_pool_with_mint_stats(Some((0, current_total_supply, 10_000)), Some(root))
-                .await;
+                .await
+                .0;
         let opensea_transport = MockOpenSeaTransport::builder()
             .respond(
                 "GET",
@@ -3901,7 +3875,7 @@ mod tests {
             nft_contract: NFT,
             seadrop_contract: SEADROP,
         };
-        let (result, _) = run_multi_wallet_opensea_mint(
+        let err = run_multi_wallet_opensea_mint(
             &opensea,
             &mut pool,
             &target,
@@ -3910,17 +3884,9 @@ mod tests {
             |_| {},
         )
         .await
-        .unwrap();
-        assert_eq!(result.successful_count(), 0);
-        for w in &result.wallets {
-            assert!(
-                matches!(&w.state, WalletExecutionState::Failed { reason } if reason.to_lowercase().contains("stage cap")),
-                "wallet {:?} must be Failed with the stage-cap reason: {:?}",
-                w.request.address,
-                w.state
-            );
-            assert!(w.tx_hash.is_none());
-        }
+        .unwrap_err();
+        assert!(matches!(err, KairoxError::Session(_)));
+        assert!(err.to_string().to_lowercase().contains("stage cap"));
     }
 
     #[tokio::test]
