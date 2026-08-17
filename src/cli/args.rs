@@ -14,10 +14,11 @@ pub struct Cli {
     /// Path to a Kairox config file (see `kairox init`). Overrides
     /// KAIROX_CONFIG and the conventional ~/.config/kairox/config.toml
     /// path. The config file only ever names environment VARIABLES for
-    /// secrets, never secret values themselves. Currently consulted by
-    /// `kairox doctor` (which reports its parse/validation status and
-    /// contents); RPC endpoint resolution for other commands still comes
-    /// directly from --rpc-url/KAIROX_RPC_* as before.
+    /// secrets, never secret values themselves. Consulted by every
+    /// network-touching command for the chain/engine default (--chain >
+    /// KAIROX_CHAIN > config [defaults] > compiled default "ethereum",
+    /// same precedence for --engine) and for [chains.*] RPC endpoints
+    /// (used when neither --rpc-url nor KAIROX_RPC_* is set).
     #[arg(long, global = true)]
     pub config: Option<std::path::PathBuf>,
     #[command(subcommand)]

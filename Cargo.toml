@@ -1,8 +1,8 @@
 [package]
 name = "kairox"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2024"
-description = "Independent low-latency public SeaDrop mint execution CLI (Phase 1: foundation + dry-run planning)."
+description = "Independent low-latency public SeaDrop mint execution CLI: on-chain and OpenSea-hosted mints, single- and multi-wallet, dry-run by default."
 license = "MIT"
 
 [lib]
