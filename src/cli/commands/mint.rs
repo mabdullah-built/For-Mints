@@ -82,11 +82,26 @@ async fn select_engine(
     }
 }
 
-fn load_opensea_client(timeout: StdDuration) -> Result<OpenSeaClient, KairoxError> {
+pub(crate) fn load_opensea_client(timeout: StdDuration) -> Result<OpenSeaClient, KairoxError> {
     let api_key = ProcessEnv
         .get(OPENSEA_API_KEY_ENV)?
         .ok_or(KairoxError::OpenSea(OpenSeaError::ApiKeyMissing))?;
-    Ok(OpenSeaClient::new_http(api_key, timeout))
+    // KAIROX_OPENSEA_BASE_URL is an advanced/test-only override -- never
+    // consulted unless explicitly set (see its own doc comment).
+    match ProcessEnv.get(crate::opensea::client::OPENSEA_BASE_URL_OVERRIDE_ENV)? {
+        Some(raw) => {
+            let base_url = raw.parse().map_err(|e| {
+                KairoxError::Session(SessionError::new(format!(
+                    "{} is not a valid URL: {e}",
+                    crate::opensea::client::OPENSEA_BASE_URL_OVERRIDE_ENV
+                )))
+            })?;
+            Ok(OpenSeaClient::new_http_with_base_url(
+                api_key, base_url, timeout,
+            ))
+        }
+        None => Ok(OpenSeaClient::new_http(api_key, timeout)),
+    }
 }
 
 pub async fn run(args: MintArgs, config_path: Option<&std::path::Path>) -> Result<(), KairoxError> {

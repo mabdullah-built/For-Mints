@@ -26,6 +26,13 @@ pub const DEFAULT_BASE_URL: &str = "https://api.opensea.io";
 /// configured, never its value.
 pub const OPENSEA_API_KEY_ENV: &str = "KAIROX_OPENSEA_API_KEY";
 
+/// Advanced/test-only override for the OpenSea API base URL, checked by
+/// the CLI layer's `load_opensea_client` -- never read here, and never
+/// consulted unless explicitly set. Exists so a localhost E2E harness (or
+/// an operator pointed at a private OpenSea-API-compatible endpoint) can
+/// redirect requests without touching production code paths otherwise.
+pub const OPENSEA_BASE_URL_OVERRIDE_ENV: &str = "KAIROX_OPENSEA_BASE_URL";
+
 pub struct OpenSeaClient {
     transport: Box<dyn OpenSeaTransport>,
 }
@@ -35,6 +42,16 @@ impl OpenSeaClient {
     /// fresh HTTP client per request.
     pub fn new_http(api_key: String, timeout: Duration) -> Self {
         let base_url = Url::parse(DEFAULT_BASE_URL).expect("DEFAULT_BASE_URL is a valid URL");
+        Self::new_http_with_base_url(api_key, base_url, timeout)
+    }
+
+    /// Like [`Self::new_http`], but against an explicit base URL instead
+    /// of the real OpenSea API. Used by
+    /// [`OPENSEA_BASE_URL_OVERRIDE_ENV`]-driven test/E2E harnesses (and
+    /// any future OpenSea-API-compatible private endpoint) -- production
+    /// `--send` behavior is unchanged unless that variable is explicitly
+    /// set.
+    pub fn new_http_with_base_url(api_key: String, base_url: Url, timeout: Duration) -> Self {
         Self {
             transport: Box::new(HttpOpenSeaTransport::new(base_url, api_key, timeout)),
         }

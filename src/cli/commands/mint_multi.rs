@@ -6,8 +6,8 @@ use std::io::BufRead;
 
 use alloy_primitives::U256;
 
+use crate::chain::config::ProcessEnv;
 use crate::chain::config::load_chain_endpoints;
-use crate::chain::config::{EnvSource, ProcessEnv};
 use crate::chain::endpoint::{EndpointRole, RpcEndpoint};
 use crate::chain::pool::{ConnectOutcome, RpcPool};
 use crate::chain::registry::ChainRegistry;
@@ -22,7 +22,6 @@ use crate::execution::multi_wallet::{
     MultiWalletConfig, OpenSeaMultiWalletTarget, WalletExecutionState, WalletMintRequest,
     load_and_verify_wallet_keys, run_multi_wallet_opensea_mint, run_multi_wallet_public_mint,
 };
-use crate::opensea::client::{OPENSEA_API_KEY_ENV, OpenSeaClient};
 use crate::opensea::errors::OpenSeaError;
 
 pub async fn run_manifest(
@@ -276,9 +275,10 @@ async fn run_manifest_dry_run(
             .slug
             .clone()
             .ok_or(KairoxError::OpenSea(OpenSeaError::SlugRequired))?;
-        let api_key = ProcessEnv.get(OPENSEA_API_KEY_ENV).ok().flatten();
-        if let Some(api_key) = api_key {
-            let opensea = OpenSeaClient::new_http(api_key, std::time::Duration::from_secs(10));
+        let opensea_client =
+            crate::cli::commands::mint::load_opensea_client(std::time::Duration::from_secs(10))
+                .ok();
+        if let Some(opensea) = opensea_client {
             match opensea.get_drop_details(&slug).await {
                 Ok(details) => {
                     println!();
@@ -456,10 +456,9 @@ async fn run_manifest_send(
                 .slug
                 .clone()
                 .ok_or(KairoxError::OpenSea(OpenSeaError::SlugRequired))?;
-            let api_key = ProcessEnv
-                .get(OPENSEA_API_KEY_ENV)?
-                .ok_or(KairoxError::OpenSea(OpenSeaError::ApiKeyMissing))?;
-            let opensea = OpenSeaClient::new_http(api_key, std::time::Duration::from_secs(10));
+            let opensea = crate::cli::commands::mint::load_opensea_client(
+                std::time::Duration::from_secs(10),
+            )?;
             let target = OpenSeaMultiWalletTarget {
                 chain: &resolved.info,
                 slug: &slug,

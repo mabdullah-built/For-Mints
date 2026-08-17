@@ -940,3 +940,167 @@ fn multi_wallet_live_send_reports_three_independent_confirmed_wallets_in_manifes
         .count();
     assert_eq!(sends, 3, "exactly one send per wallet expected");
 }
+
+// =======================================================================
+// OpenSea API failure E2E (Phase 6 Section 10): a real localhost REST
+// endpoint, with the real CLI's OpenSea client redirected to it via
+// KAIROX_OPENSEA_BASE_URL (an advanced/test-only override -- see
+// opensea::client::OPENSEA_BASE_URL_OVERRIDE_ENV -- added specifically to
+// make this possible; production behavior is unchanged unless it is
+// explicitly set). One combined server answers both JSON-RPC (path "/")
+// and the OpenSea REST paths, so a single localhost port stands in for
+// both "the chain" and "OpenSea" the same way it would in a real session.
+// =======================================================================
+
+fn opensea_drop_details_json(slug: &str) -> Value {
+    serde_json::json!({
+        "collection_slug": slug,
+        "collection_name": "Test Collection",
+        "chain": "ethereum",
+        "contract_address": format!("{NFT:#x}"),
+        "drop_type": "public",
+        "is_minting": true,
+        "active_stage": null,
+        "next_stage": null,
+        "stages": [],
+        "total_supply": null,
+        "max_supply": null,
+    })
+}
+
+fn spawn_combined_rpc_and_opensea_server(
+    rpc_handler: impl Fn(&str, &Value) -> Behavior + Send + Sync + 'static,
+    opensea_mint_behavior: impl Fn() -> Behavior + Send + Sync + 'static,
+    slug: &'static str,
+) -> LocalHttpServer {
+    LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = rpc_handler(&method, &params);
+            (method, behavior)
+        } else if path == format!("/api/v2/drops/{slug}") {
+            (
+                path.to_string(),
+                rpc_ok_status(opensea_drop_details_json(slug)),
+            )
+        } else if path == format!("/api/v2/drops/{slug}/mint") {
+            (path.to_string(), opensea_mint_behavior())
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    })
+}
+
+/// Plain 200 + JSON body -- unlike `rpc_ok`, no JSON-RPC envelope, for
+/// OpenSea's own REST response shape.
+fn rpc_ok_status(value: Value) -> Behavior {
+    Behavior::Json(value)
+}
+
+#[test]
+fn opensea_401_is_reported_as_authentication_failed_before_any_signing() {
+    let wallet = test_signer().address();
+    let key_hex = signing_key_hex_for_seed(SINGLE_WALLET_SEED);
+    const SLUG: &str = "kairox-e2e-opensea-401";
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in opensea-401 scenario: {method}"),
+            })
+        },
+        || Behavior::HttpStatus(401, serde_json::json!({"errors": ["invalid API key"]})),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("OpenSea rejected the API key"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a terminal OpenSea auth failure must never reach Ethereum signing"
+    );
+}
+
+#[test]
+fn opensea_422_eligibility_rejection_is_terminal_not_retried() {
+    let wallet = test_signer().address();
+    let key_hex = signing_key_hex_for_seed(SINGLE_WALLET_SEED);
+    const SLUG: &str = "kairox-e2e-opensea-422";
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in opensea-422 scenario: {method}"),
+            })
+        },
+        || {
+            Behavior::HttpStatus(
+                422,
+                serde_json::json!({"errors": ["wallet is not eligible for this stage"]}),
+            )
+        },
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not eligible"));
+
+    let received = server.received.lock().unwrap();
+    let mint_attempts = received
+        .iter()
+        .filter(|(p, _)| p.ends_with("/mint"))
+        .count();
+    assert_eq!(
+        mint_attempts, 1,
+        "a terminal 422 must not be retried: expected exactly one mint POST, got {mint_attempts}"
+    );
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
