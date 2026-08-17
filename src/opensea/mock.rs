@@ -15,6 +15,8 @@ use super::transport::{HttpResponse, OpenSeaTransport, OpenSeaTransportError};
 type DynamicResponder = std::sync::Arc<dyn Fn(&Value) -> (u16, Value) + Send + Sync>;
 type DynamicDelayedResponder =
     std::sync::Arc<dyn Fn(&Value) -> (Duration, u16, Value) + Send + Sync>;
+type DynamicGatedResponder =
+    std::sync::Arc<dyn Fn(&Value) -> (Arc<tokio::sync::Notify>, u16, Value) + Send + Sync>;
 
 enum Canned {
     Response {
@@ -41,6 +43,14 @@ enum Canned {
     /// POST resolves immediately, to prove a slow wallet never blocks a
     /// fast one.
     DynamicDelayed(DynamicDelayedResponder),
+    /// Like [`Canned::Dynamic`], but resolves only after the returned
+    /// [`tokio::sync::Notify`] is notified -- a deterministic gate, rather
+    /// than a fixed delay, for proving a slow wallet's response genuinely
+    /// does not block an unrelated fast wallet's progress (the fast
+    /// wallet's dispatch can be directly observed to happen while the slow
+    /// wallet's gate is still closed, before the test explicitly releases
+    /// it).
+    DynamicGated(DynamicGatedResponder),
 }
 
 impl Clone for Canned {
@@ -63,6 +73,7 @@ impl Clone for Canned {
                 body: body.clone(),
             },
             Self::DynamicDelayed(f) => Self::DynamicDelayed(f.clone()),
+            Self::DynamicGated(f) => Self::DynamicGated(f.clone()),
         }
     }
 }
@@ -166,6 +177,15 @@ impl MockOpenSeaTransport {
                     body: response_body,
                 })
             }
+            Some(Canned::DynamicGated(f)) => {
+                let request_body = body.cloned().unwrap_or(Value::Null);
+                let (gate, status, response_body) = f(&request_body);
+                gate.notified().await;
+                Ok(HttpResponse {
+                    status,
+                    body: response_body,
+                })
+            }
             None => Err(OpenSeaTransportError::Network(format!(
                 "no mock response configured for {method} {path}"
             ))),
@@ -248,6 +268,26 @@ impl MockOpenSeaTransportBuilder {
         self.entries.insert(
             MockOpenSeaTransport::key(method, path),
             Canned::DynamicDelayed(std::sync::Arc::new(f)),
+        );
+        self
+    }
+
+    /// Like [`Self::respond_dynamic`], but the closure also chooses this
+    /// request's own [`tokio::sync::Notify`] gate -- the response resolves
+    /// only once that gate is notified, giving a test full deterministic
+    /// control over exactly when one wallet's mint POST completes (e.g.
+    /// pre-notifying fast wallets' gates so they resolve immediately, and
+    /// holding one wallet's gate closed until the test explicitly releases
+    /// it) rather than relying on timing/delays.
+    pub fn respond_dynamic_gated(
+        mut self,
+        method: &str,
+        path: &str,
+        f: impl Fn(&Value) -> (Arc<tokio::sync::Notify>, u16, Value) + Send + Sync + 'static,
+    ) -> Self {
+        self.entries.insert(
+            MockOpenSeaTransport::key(method, path),
+            Canned::DynamicGated(std::sync::Arc::new(f)),
         );
         self
     }

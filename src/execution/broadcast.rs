@@ -145,10 +145,67 @@ pub async fn broadcast_to_all(
     clients: &[&RpcClient],
     prepared: &PreparedBroadcast,
 ) -> Vec<EndpointBroadcastResult> {
-    let attempts = clients
-        .iter()
-        .enumerate()
-        .map(|(i, client)| attempt_broadcast(client, prepared, format!("endpoint[{i}]")));
+    broadcast_to_all_with_limiter(clients, prepared, None).await
+}
+
+/// A shared, session-scoped bound on the number of individual
+/// `eth_sendRawTransaction` requests allowed in flight at once, usable
+/// across multiple wallets whose broadcasts happen at different times
+/// (e.g. OpenSea streaming mode, where wallets finish independently) --
+/// unlike [`dispatch_broadcast_matrix`], which bounds one precomputed
+/// batch, this bounds an open-ended sequence of per-wallet fan-outs
+/// sharing one limiter for the whole session's lifetime.
+pub struct BroadcastLimiter {
+    semaphore: tokio::sync::Semaphore,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl BroadcastLimiter {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            semaphore: tokio::sync::Semaphore::new(permits.max(1)),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    /// The real, observed maximum number of individual
+    /// `eth_sendRawTransaction` requests simultaneously in flight through
+    /// this limiter, at any instant. Never exceeds the configured permit
+    /// count.
+    pub fn peak_concurrency(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// Dispatch the exact same prebuilt request to every client in `clients`,
+/// concurrently, but with each individual endpoint send gated by `limiter`
+/// (if given) -- bounding the actual number of `eth_sendRawTransaction`
+/// requests in flight, not merely how many wallets may be inside this call
+/// at once. `None` preserves [`broadcast_to_all`]'s original unbounded
+/// behavior for the single-wallet hot path, which has no session-wide
+/// budget to share.
+pub async fn broadcast_to_all_with_limiter(
+    clients: &[&RpcClient],
+    prepared: &PreparedBroadcast,
+    limiter: Option<&BroadcastLimiter>,
+) -> Vec<EndpointBroadcastResult> {
+    let attempts = clients.iter().enumerate().map(|(i, client)| async move {
+        let Some(limiter) = limiter else {
+            return attempt_broadcast(client, prepared, format!("endpoint[{i}]")).await;
+        };
+        let _permit = limiter
+            .semaphore
+            .acquire()
+            .await
+            .expect("BroadcastLimiter's semaphore is never closed");
+        let now_active = limiter.active.fetch_add(1, Ordering::SeqCst) + 1;
+        limiter.peak.fetch_max(now_active, Ordering::SeqCst);
+        let result = attempt_broadcast(client, prepared, format!("endpoint[{i}]")).await;
+        limiter.active.fetch_sub(1, Ordering::SeqCst);
+        result
+    });
 
     futures_util::future::join_all(attempts).await
 }
@@ -212,7 +269,10 @@ pub struct BroadcastJob<'a> {
 }
 
 /// Real, observed facts about a dispatched [`BroadcastJob`] matrix — not a
-/// formula derived from the configured bound.
+/// formula derived from the configured bound. Dispatch-time and
+/// response-time facts are kept strictly separate: a slow RPC *response*
+/// must never be interpreted as a late *dispatch* — the request left on
+/// time even if the endpoint took a while to answer.
 #[derive(Debug, Clone, Default)]
 pub struct BroadcastMatrixMetrics {
     /// The maximum number of individual `eth_sendRawTransaction` requests
@@ -220,10 +280,17 @@ pub struct BroadcastMatrixMetrics {
     /// instant. Never exceeds the `concurrency` bound passed to
     /// [`dispatch_broadcast_matrix`].
     pub peak_concurrency: usize,
-    /// The timestamp of the very first job's dispatch.
+    /// The timestamp the very first job was dispatched (recorded
+    /// immediately before its `eth_sendRawTransaction` call, never after).
     pub first_dispatch_at: Option<OffsetDateTime>,
-    /// The timestamp of the very last job's response.
-    pub last_responded_at: Option<OffsetDateTime>,
+    /// The timestamp the very last job was dispatched -- NOT when it
+    /// responded. A job queued behind the concurrency bound dispatches
+    /// late; a job whose endpoint is merely slow to respond does not.
+    pub last_dispatch_at: Option<OffsetDateTime>,
+    /// The timestamp the very last job's response (success or failure)
+    /// was observed. Reflects total matrix completion time, not dispatch
+    /// timing -- kept only as a separate, honestly-labeled fact.
+    pub last_response_at: Option<OffsetDateTime>,
 }
 
 /// Dispatch every `(wallet, endpoint)` job in `jobs`, bounded to at most
@@ -249,19 +316,31 @@ pub async fn dispatch_broadcast_matrix(
     let active = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
     let first_dispatch_at = Mutex::new(None::<OffsetDateTime>);
-    let last_responded_at = Mutex::new(None::<OffsetDateTime>);
+    let last_dispatch_at = Mutex::new(None::<OffsetDateTime>);
+    let last_response_at = Mutex::new(None::<OffsetDateTime>);
 
     let results: Vec<(usize, EndpointBroadcastResult)> =
         stream::iter(jobs.into_iter().enumerate().map(|(job_index, job)| {
             let active = &active;
             let peak = &peak;
             let first_dispatch_at = &first_dispatch_at;
-            let last_responded_at = &last_responded_at;
+            let last_dispatch_at = &last_dispatch_at;
+            let last_response_at = &last_response_at;
             async move {
+                // Recorded strictly at dispatch time, before the request is
+                // even sent -- a slow endpoint's response time must never
+                // be able to masquerade as a late dispatch.
+                let dispatch_at = OffsetDateTime::now_utc();
                 {
                     let mut first = first_dispatch_at.lock().expect("mutex poisoned");
                     if first.is_none() {
-                        *first = Some(OffsetDateTime::now_utc());
+                        *first = Some(dispatch_at);
+                    }
+                }
+                {
+                    let mut last = last_dispatch_at.lock().expect("mutex poisoned");
+                    if last.is_none_or(|prev| dispatch_at > prev) {
+                        *last = Some(dispatch_at);
                     }
                 }
                 let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -273,8 +352,11 @@ pub async fn dispatch_broadcast_matrix(
 
                 active.fetch_sub(1, Ordering::SeqCst);
                 {
-                    let mut last = last_responded_at.lock().expect("mutex poisoned");
-                    *last = Some(OffsetDateTime::now_utc());
+                    let response_at = OffsetDateTime::now_utc();
+                    let mut last = last_response_at.lock().expect("mutex poisoned");
+                    if last.is_none_or(|prev| response_at > prev) {
+                        *last = Some(response_at);
+                    }
                 }
 
                 (job.wallet_index, result)
@@ -287,7 +369,8 @@ pub async fn dispatch_broadcast_matrix(
     let metrics = BroadcastMatrixMetrics {
         peak_concurrency: peak.load(Ordering::SeqCst),
         first_dispatch_at: *first_dispatch_at.lock().expect("mutex poisoned"),
-        last_responded_at: *last_responded_at.lock().expect("mutex poisoned"),
+        last_dispatch_at: *last_dispatch_at.lock().expect("mutex poisoned"),
+        last_response_at: *last_response_at.lock().expect("mutex poisoned"),
     };
 
     (results, metrics)
@@ -387,6 +470,25 @@ mod tests {
                 "eth_sendRawTransaction",
                 json!(format!("0x{}", hex::encode(expected_hash()))),
             )
+            .build();
+        RpcClient::connect(
+            Box::new(transport),
+            1,
+            EndpointRole::SendOnly,
+            Some(label.to_string()),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn delayed_accepting_client(label: &str, delay: Duration) -> RpcClient {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond(
+                "eth_sendRawTransaction",
+                json!(format!("0x{}", hex::encode(expected_hash()))),
+            )
+            .delay("eth_sendRawTransaction", delay)
             .build();
         RpcClient::connect(
             Box::new(transport),
@@ -602,5 +704,93 @@ mod tests {
         }];
         let err = uncertain_outcome_error(&results);
         assert!(matches!(err.category(), ErrorCategory::MustStopSession));
+    }
+
+    #[tokio::test]
+    async fn dispatch_broadcast_matrix_peak_and_grouping() {
+        let client_a = accepting_client("a").await;
+        let client_b = accepting_client("b").await;
+        let client_c = accepting_client("c").await;
+        let raw = alloy_primitives::Bytes::from(vec![0x02, 0x01]);
+        let prepared = PreparedBroadcast::build(expected_hash(), raw);
+
+        // 2 wallets x 3 endpoints = 6 jobs, endpoint-major.
+        let mut jobs: Vec<BroadcastJob<'_>> = Vec::with_capacity(6);
+        for client in [&client_a, &client_b, &client_c] {
+            for wallet_index in 0..2 {
+                jobs.push(BroadcastJob {
+                    wallet_index,
+                    client,
+                    prepared: &prepared,
+                });
+            }
+        }
+
+        let (results, metrics) = dispatch_broadcast_matrix(jobs, 2).await;
+        assert_eq!(results.len(), 6);
+        assert!(metrics.peak_concurrency <= 2);
+
+        let grouped = group_broadcast_results_by_wallet(results, 2);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(
+            grouped[0].len(),
+            3,
+            "wallet 0 must have one result per endpoint"
+        );
+        assert_eq!(
+            grouped[1].len(),
+            3,
+            "wallet 1 must have one result per endpoint"
+        );
+        for wallet_results in &grouped {
+            assert!(wallet_results.iter().all(|r| r.outcome
+                == BroadcastOutcome::Accepted {
+                    tx_hash: expected_hash()
+                }));
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_skew_is_not_inflated_by_a_slow_response() {
+        // Section/Gap 4: dispatch timing must be recorded strictly at
+        // dispatch time, never conflated with how long an endpoint took to
+        // respond. Two jobs dispatch back-to-back (bounded concurrency 2,
+        // so both start together); one endpoint holds its response for
+        // 200ms. `last_dispatch_at - first_dispatch_at` must stay tiny;
+        // `last_response_at` must reflect the real ~200ms completion time.
+        let fast_client = accepting_client("fast").await;
+        let slow_client = delayed_accepting_client("slow", Duration::from_millis(200)).await;
+        let raw = alloy_primitives::Bytes::from(vec![0x02, 0x02]);
+        let prepared = PreparedBroadcast::build(expected_hash(), raw);
+
+        let jobs = vec![
+            BroadcastJob {
+                wallet_index: 0,
+                client: &fast_client,
+                prepared: &prepared,
+            },
+            BroadcastJob {
+                wallet_index: 0,
+                client: &slow_client,
+                prepared: &prepared,
+            },
+        ];
+
+        let (_, metrics) = dispatch_broadcast_matrix(jobs, 2).await;
+        let first = metrics.first_dispatch_at.expect("dispatch recorded");
+        let last_dispatch = metrics.last_dispatch_at.expect("dispatch recorded");
+        let last_response = metrics.last_response_at.expect("response recorded");
+
+        let dispatch_spread_ms = (last_dispatch - first).whole_milliseconds();
+        let response_spread_ms = (last_response - first).whole_milliseconds();
+
+        assert!(
+            dispatch_spread_ms < 50,
+            "dispatch spread should be near-zero (both jobs admitted together), got {dispatch_spread_ms}ms"
+        );
+        assert!(
+            response_spread_ms >= 150,
+            "response spread should reflect the real ~200ms slow response, got {response_spread_ms}ms"
+        );
     }
 }

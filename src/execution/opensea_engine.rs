@@ -30,7 +30,7 @@ use crate::signing::signer::Signer;
 use crate::signing::transaction::UnsignedEip1559Tx;
 
 use super::broadcast::{
-    BroadcastSummary, EndpointBroadcastResult, broadcast_to_all, summarize_broadcast,
+    BroadcastSummary, EndpointBroadcastResult, broadcast_to_all_with_limiter, summarize_broadcast,
     uncertain_outcome_error,
 };
 use super::errors::{KairoxError, SessionError};
@@ -459,9 +459,23 @@ pub struct ReceiptPollConfig {
     pub timeout: StdDuration,
 }
 
+/// Bundles the send-capable endpoints a wallet's broadcast fans out to
+/// with an optional shared, session-scoped [`BroadcastLimiter`]. `limiter`
+/// is `None` for the single-wallet hot path (an unbounded fan-out to a
+/// handful of endpoints has no session-wide budget to share) and
+/// `Some(..)` for multi-wallet OpenSea sessions, where every wallet's
+/// individual `eth_sendRawTransaction` calls -- however many wallets, and
+/// whenever each happens to broadcast -- share one `--broadcast-concurrency`
+/// budget, exactly like the public engine's request matrix does.
+#[derive(Clone, Copy)]
+pub struct BroadcastTargets<'a> {
+    pub send_clients: &'a [&'a crate::chain::rpc::RpcClient],
+    pub limiter: Option<&'a super::broadcast::BroadcastLimiter>,
+}
+
 pub async fn finalize_and_broadcast_opensea_wallet(
     signer: &dyn Signer,
-    send_clients: &[&crate::chain::rpc::RpcClient],
+    targets: BroadcastTargets<'_>,
     read_client: &crate::chain::rpc::RpcClient,
     plan: PreparedOpenSeaUnsignedWallet,
     receipt_poll: ReceiptPollConfig,
@@ -518,10 +532,12 @@ pub async fn finalize_and_broadcast_opensea_wallet(
     // different signed transactions; only within one wallet's own fan-out
     // must the bytes be identical everywhere.
     on_progress(OpenSeaProgress::Broadcasting {
-        send_endpoint_count: send_clients.len(),
+        send_endpoint_count: targets.send_clients.len(),
     });
     let dispatch_sw = Stopwatch::start();
-    let broadcast_results = broadcast_to_all(send_clients, &prepared.broadcast).await;
+    let broadcast_results =
+        broadcast_to_all_with_limiter(targets.send_clients, &prepared.broadcast, targets.limiter)
+            .await;
     metrics.dispatch_ms = Some(dispatch_sw.elapsed_ms());
     metrics.api_to_dispatch_ms = Some(api_to_dispatch_sw.elapsed_ms());
 
@@ -597,7 +613,10 @@ pub async fn run_opensea_mint_for_wallet(
     .await?;
     finalize_and_broadcast_opensea_wallet(
         signer,
-        send_clients,
+        BroadcastTargets {
+            send_clients,
+            limiter: None,
+        },
         read_client,
         plan,
         ReceiptPollConfig {
