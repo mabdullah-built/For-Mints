@@ -105,11 +105,11 @@ Builds and prints the authoritative dry-run plan for a public mint: fee recipien
 
 ### `kairox mint <collection> --wallet W`
 
-Dry-run by default (identical output shape to `plan`, for whichever engine `--engine`/`--slug` resolves to). `--send` opts into the live pipeline: a confirmation summary, signing-key load, scheduled pre-signing, identical-raw-transaction broadcast to every send-capable endpoint, and receipt verification. `--json`/`--output PATH` emit a `SessionReport` with a `session_id` generated before any signing (currently supported for single-wallet sessions only; not yet for `--wallet-manifest`).
+Dry-run by default (identical output shape to `plan`, for whichever engine `--engine`/`--slug` resolves to). `--send` opts into the live pipeline: a confirmation summary, signing-key load, scheduled pre-signing, identical-raw-transaction broadcast to every send-capable endpoint, and receipt verification. `--json`/`--output PATH` emit a `SessionReport` with a `session_id` generated before any signing.
 
 ### `kairox mint <collection> --wallet-manifest FILE --engine public|opensea --send`
 
-Runs the same mint for every wallet in a JSON manifest (up to 50), with a bounded concurrency for both broadcast dispatch and (for the OpenSea engine) API requests, an aggregate spend/stage-supply preflight before any wallet is signed, and a deterministic manifest-order result set. `--engine auto` is not supported in manifest mode — pick `public` or `opensea` explicitly. `--json` is not yet implemented for manifest sessions (see Known limitations).
+Runs the same mint for every wallet in a JSON manifest (up to 50), with a bounded concurrency for both broadcast dispatch and (for the OpenSea engine) API requests, an aggregate spend/stage-supply preflight before any wallet is signed, and a deterministic manifest-order result set. `--engine auto` is not supported in manifest mode — pick `public` or `opensea` explicitly. `--json`/`--output PATH` emit the same `SessionReport` schema as a single-wallet session, with one `WalletReport` per manifest entry in manifest order (dry-run or live, for both engines) — proven end-to-end in `tests/e2e_localhost.rs`.
 
 ### `kairox bench`
 
@@ -125,7 +125,7 @@ If a broadcast's outcome cannot be determined (a timeout or connection failure w
 
 ## JSON output and error codes
 
-`doctor`, `plan`, `mint` (single-wallet), and `receipt` support `--json`: stdout carries exactly one JSON object and nothing else; all progress/diagnostic text goes to stderr. Every report starts with `schema_version`. Errors map onto a stable `KairoxErrorCode` set (`CONFIG_INVALID`, `CHAIN_MISMATCH`, `OPENSEA_AUTH_FAILED`, `RECEIPT_MINT_MISMATCH`, etc.) — see [docs/architecture.md](docs/architecture.md).
+`doctor`, `plan`, `mint` (single-wallet and `--wallet-manifest`), and `receipt` support `--json`: stdout carries exactly one JSON object and nothing else; all progress/diagnostic text goes to stderr. Every report starts with `schema_version`. Every CLI error is printed as `error[CODE]: message` on stderr with a stable `KairoxErrorCode` (`CONFIG_INVALID`, `CHAIN_MISMATCH`, `OPENSEA_AUTH_FAILED`, `RECEIPT_MINT_MISMATCH`, `WALLET_KEY_MISMATCH`, `INSUFFICIENT_BALANCE`, `SESSION_CAP_EXCEEDED`, `NO_VERIFIED_READ_RPC`, etc.) — see [docs/architecture.md](docs/architecture.md).
 
 ## Security model
 
@@ -133,11 +133,15 @@ See [docs/security.md](docs/security.md) for the full model: key handling, secre
 
 ## Known limitations
 
-- `--json`/`--output`/`SessionReport` are implemented for single-wallet `mint` sessions and `plan`; multi-wallet (`--wallet-manifest`) sessions do not yet emit a structured report.
-- `--json`/`--output` for a dry-run `mint --engine opensea` is not implemented (the OpenSea dry-run preview only fetches informational drop metadata, not a validated plan) — it fails closed with a clear error rather than emitting an incomplete report.
-- No Ctrl-C/SIGINT handling: killing the process mid-broadcast does not tell you whether the transaction was actually sent — treat an interrupted `--send` the same as an Uncertain outcome and check `kairox receipt` once you have a chance.
+- `--json`/`--output` for a dry-run `mint --engine opensea` is not implemented (the OpenSea dry-run preview only fetches informational drop metadata, not a validated plan — producing one would require the same wallet-specific mint-transaction request `--send` makes, which is not something a "dry run" should trigger against a third-party API) — it fails closed with a clear error rather than emitting an incomplete report. Live `--send` with `--engine opensea` (single- or multi-wallet) does emit the full `SessionReport`.
+- No Ctrl-C/SIGINT handling: killing the process mid-broadcast does not tell you whether the transaction was actually sent — treat an interrupted `--send` the same as an Uncertain outcome and check `kairox receipt` once you have a chance. No background task outlives the process either way (see [docs/architecture.md](docs/architecture.md) for the no-detached-task audit): there is nothing left running after an interrupt, only genuine uncertainty about what the remote node did with bytes already sent.
+- No `kairox receipt --report FILE` batch-recheck command; recheck one transaction at a time with `kairox receipt --tx ... --collection ... --wallet ... --quantity ...`.
 - No shell completions yet.
 - No telemetry of any kind — but see the Privacy section in [docs/security.md](docs/security.md) for what your RPC provider and OpenSea itself can see.
+
+## End-to-end test coverage
+
+`tests/e2e_localhost.rs` runs the actual compiled `kairox` binary as a subprocess against a real, hand-rolled `std::net::TcpListener` HTTP/1.1 server (not a mocked transport trait) — the real `reqwest`-based RPC and OpenSea HTTP clients genuinely connect over a loopback socket. It covers: public single- and multi-wallet dry-run and live mints; OpenSea allowlist and server-signed mints with real locally-generated Merkle proofs and EIP-712 signatures; OpenSea 401/403/422/429/500 responses and malicious-response rejection (bad proof, bad signature, wrong collection, unsupported selector) before any Ethereum signature; a genuine possible-send broadcast (the server reads the full raw transaction, then closes the connection with no response) proven Uncertain, never retried; definitive broadcast rejection; receipt revert and four receipt/mint-mismatch shapes; JSON stdout purity and `--output` file writes for every JSON-capable command; config precedence and malformed/invalid config; and secret-redaction across successful and failing real-HTTP paths. No test in this file broadcasts to a real chain.
 
 ## Documentation
 
