@@ -43,7 +43,7 @@ async fn run_with(config_path: Option<std::path::PathBuf>, command: Command) -> 
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error[{}]: {e}", e.code());
             1
         }
     }

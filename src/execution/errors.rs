@@ -43,6 +43,12 @@ pub enum KairoxError {
     Rpc(#[from] crate::chain::rpc::RpcError),
     #[error(transparent)]
     Config(#[from] crate::chain::config::ConfigError),
+    /// A config-*file* error (`kairox init`/`--config`'s own TOML schema,
+    /// version, or secret-looking-value checks) -- distinct from
+    /// [`Self::Config`], which is the older env-var-only RPC config path.
+    /// Both map to the same [`KairoxErrorCode::ConfigInvalid`].
+    #[error(transparent)]
+    ConfigFile(#[from] crate::config::ConfigError),
     #[error(transparent)]
     Fee(#[from] crate::domain::fees::FeeError),
     #[error(transparent)]
@@ -225,7 +231,7 @@ impl KairoxError {
         use crate::opensea::errors::OpenSeaError;
 
         match self {
-            KairoxError::Config(_) => KairoxErrorCode::ConfigInvalid,
+            KairoxError::Config(_) | KairoxError::ConfigFile(_) => KairoxErrorCode::ConfigInvalid,
             KairoxError::Rpc(crate::chain::rpc::RpcError::ChainIdMismatch { .. }) => {
                 KairoxErrorCode::ChainMismatch
             }
@@ -298,7 +304,7 @@ impl Categorize for KairoxError {
     fn category(&self) -> ErrorCategory {
         match self {
             KairoxError::Rpc(e) => e.category(),
-            KairoxError::Config(_) => ErrorCategory::Fatal,
+            KairoxError::Config(_) | KairoxError::ConfigFile(_) => ErrorCategory::Fatal,
             KairoxError::Fee(_) => ErrorCategory::Fatal,
             KairoxError::SafetyCap(_) => ErrorCategory::Fatal,
             KairoxError::Supply(_) => ErrorCategory::Fatal,

@@ -76,8 +76,7 @@ pub fn resolve_chain_and_runtime(
         chain_args.chain.as_deref(),
         None,
         &ProcessEnv,
-    )
-    .map_err(|e| KairoxError::Session(SessionError::new(format!("config error: {e}"))))?;
+    )?;
     let resolved = resolve_chain(registry, &runtime.chain, chain_args.seadrop_contract)?;
     Ok((resolved, runtime))
 }
@@ -98,8 +97,7 @@ pub fn resolve_read_endpoint(
     if let Some(config) = config
         && let Some(entry) = config_chain_entry(config, chain)
     {
-        let endpoints = resolve_chain_rpc_endpoints(entry, &ProcessEnv)
-            .map_err(|e| KairoxError::Session(SessionError::new(format!("config error: {e}"))))?;
+        let endpoints = resolve_chain_rpc_endpoints(entry, &ProcessEnv)?;
         if let Some(endpoint) = endpoints
             .iter()
             .find(|e| e.role.can_read())
