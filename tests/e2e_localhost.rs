@@ -276,9 +276,10 @@ fn harness_close_without_responding_is_observed_as_a_network_error() {
 // test fixture so the response shapes are known-correct, not guessed.
 // =======================================================================
 
-use alloy_primitives::{Address, U256, address, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
 use alloy_sol_types::SolCall;
-use kairox::protocol::seadrop::{self as sd, PublicDropAbi};
+use kairox::protocol::seadrop::{self as sd, MintParams as NormalizedMintParams, PublicDropAbi};
+use kairox::protocol::seadrop_crypto;
 use kairox::signing::signer::{LocalSigner, Signer};
 
 const NFT: Address = address!("000000000000000000000000000000000000c0de");
@@ -314,6 +315,26 @@ fn transfer_log_for(wallet: Address, token_id: u64) -> Value {
         "topics": [
             format!("0x{}", hex::encode(keccak256(b"Transfer(address,address,uint256)"))),
             format!("0x{}", hex::encode([0u8; 32])),
+            format!("0x{}", hex::encode(to_topic)),
+            format!("0x{}", hex::encode(U256::from(token_id).to_be_bytes::<32>())),
+        ],
+        "data": "0x",
+    })
+}
+
+/// A fully customizable `Transfer` log, for constructing the specific
+/// receipt-mismatch shapes Phase 6 Section 15 requires (wrong collection
+/// address, wrong recipient, `from != 0x0`).
+fn transfer_log_custom(contract: Address, from: Address, to: Address, token_id: u64) -> Value {
+    let mut from_topic = [0u8; 32];
+    from_topic[12..32].copy_from_slice(from.as_slice());
+    let mut to_topic = [0u8; 32];
+    to_topic[12..32].copy_from_slice(to.as_slice());
+    serde_json::json!({
+        "address": format!("{contract:#x}"),
+        "topics": [
+            format!("0x{}", hex::encode(keccak256(b"Transfer(address,address,uint256)"))),
+            format!("0x{}", hex::encode(from_topic)),
             format!("0x{}", hex::encode(to_topic)),
             format!("0x{}", hex::encode(U256::from(token_id).to_be_bytes::<32>())),
         ],
@@ -653,6 +674,142 @@ fn public_single_wallet_receipt_mismatch_is_not_reported_as_success() {
             &format!("{NFT:#x}"),
             "--wallet",
             &format!("{wallet:#x}"),
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("CONFIRMED_EXECUTION_MISMATCH")
+                .and(predicates::str::contains("CONFIRMED_SUCCESS").not()),
+        );
+}
+
+/// Shared body for the four receipt-mismatch variants below: same
+/// send/receipt-poll setup, differing only in what the receipt's logs
+/// contain.
+fn assert_receipt_mismatch_for_logs(test_label: &'static str, logs: Vec<Value>) {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": logs.clone(),
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in {test_label} scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("CONFIRMED_EXECUTION_MISMATCH")
+                .and(predicates::str::contains("CONFIRMED_SUCCESS").not()),
+        );
+}
+
+#[test]
+fn receipt_mismatch_wrong_collection_address_is_not_confirmed_success() {
+    let wallet = test_signer().address();
+    let other_collection: Address = address!("00000000000000000000000000000000000dead0");
+    assert_receipt_mismatch_for_logs(
+        "wrong-collection",
+        vec![transfer_log_custom(
+            other_collection,
+            Address::ZERO,
+            wallet,
+            1,
+        )],
+    );
+}
+
+#[test]
+fn receipt_mismatch_wrong_recipient_is_not_confirmed_success() {
+    let stranger: Address = address!("000000000000000000000000000000000000bee1");
+    assert_receipt_mismatch_for_logs(
+        "wrong-recipient",
+        vec![transfer_log_custom(NFT, Address::ZERO, stranger, 1)],
+    );
+}
+
+#[test]
+fn receipt_mismatch_from_not_zero_is_not_confirmed_success() {
+    // A secondary transfer (from a real prior owner, not the zero address)
+    // is not a mint -- even though the receipt succeeded and a Transfer for
+    // this collection/wallet genuinely exists in the logs.
+    let wallet = test_signer().address();
+    let prior_owner: Address = address!("000000000000000000000000000000000000bee2");
+    assert_receipt_mismatch_for_logs(
+        "from-not-zero",
+        vec![transfer_log_custom(NFT, prior_owner, wallet, 1)],
+    );
+}
+
+#[test]
+fn receipt_mismatch_wrong_quantity_is_not_confirmed_success() {
+    // Requested quantity defaults to 1; a receipt reporting a genuine mint
+    // Transfer for a *different* token id count than requested is still
+    // evaluated against the requested quantity=1, so this instead proves
+    // the inverse: requesting quantity=2 while only one genuine mint
+    // Transfer landed must not be confirmed success.
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [transfer_log_for(wallet, 1)],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in wrong-quantity scenario: {method}"),
+        }),
+    });
+
+    let key_hex = signing_key_hex_for_seed(SINGLE_WALLET_SEED);
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--quantity",
+            "2",
             "--send",
             "--yes",
         ])
@@ -1102,5 +1259,1416 @@ fn opensea_422_eligibility_rejection_is_terminal_not_retried() {
         mint_attempts, 1,
         "a terminal 422 must not be retried: expected exactly one mint POST, got {mint_attempts}"
     );
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
+#[test]
+fn opensea_403_is_reported_as_authentication_failed_before_any_signing() {
+    // 403, distinct from 401, maps to the same terminal AuthenticationFailed
+    // outcome (see opensea::client::interpret) -- proven separately since
+    // the spec calls both out explicitly.
+    let wallet = test_signer().address();
+    let key_hex = signing_key_hex_for_seed(SINGLE_WALLET_SEED);
+    const SLUG: &str = "kairox-e2e-opensea-403";
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in opensea-403 scenario: {method}"),
+            })
+        },
+        || Behavior::HttpStatus(403, serde_json::json!({"errors": ["forbidden"]})),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("OpenSea rejected the API key"));
+
+    let received = server.received.lock().unwrap();
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
+// =======================================================================
+// JSON stdout purity (Phase 6 Section 17), output-file E2E (Section 18),
+// secret-leak E2E over real HTTP (Section 19), config precedence / bad
+// config E2E (Sections 15-16), and `inspect` E2E (Section 2 completeness).
+// =======================================================================
+
+fn assert_stdout_is_exactly_one_json_object(stdout: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stdout).to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stdout must be exactly one JSON line over real HTTP, got: {text:?}"
+    );
+    serde_json::from_str(lines[0]).expect("valid JSON")
+}
+
+#[test]
+fn doctor_json_is_exactly_one_valid_json_object_over_real_http() {
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        "eth_blockNumber" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let parsed = assert_stdout_is_exactly_one_json_object(&assert.get_output().stdout);
+    assert_eq!(parsed["schema_version"], 1);
+}
+
+#[test]
+fn single_wallet_mint_json_dry_run_is_exactly_one_valid_json_object_over_real_http() {
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        })
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--json",
+        ])
+        .assert()
+        .success();
+    let parsed = assert_stdout_is_exactly_one_json_object(&assert.get_output().stdout);
+    assert_eq!(parsed["schema_version"], 1);
+    assert!(parsed["plan_id"].as_str().unwrap().starts_with("plan_"));
+
+    let received = server.received.lock().unwrap();
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
+#[test]
+fn single_wallet_mint_json_live_send_is_exactly_one_valid_json_object_over_real_http() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [transfer_log_for(wallet, 7)],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        }),
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--send",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let parsed = assert_stdout_is_exactly_one_json_object(&assert.get_output().stdout);
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["dry_run"], false);
+    let wallets = parsed["wallets"].as_array().unwrap();
+    assert_eq!(wallets.len(), 1);
+    assert_eq!(wallets[0]["state"], "CONFIRMED_SUCCESS");
+}
+
+#[test]
+fn receipt_json_is_exactly_one_valid_json_object_over_real_http() {
+    let wallet = test_signer().address();
+    let tx_hash = B256::repeat_byte(0xAB);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        "eth_getTransactionReceipt" => rpc_ok(serde_json::json!({
+            "transactionHash": format!("{tx_hash:#x}"),
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "logs": [transfer_log_for(wallet, 3)],
+        })),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "receipt",
+            "--tx",
+            &format!("{tx_hash:#x}"),
+            "--collection",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--json",
+        ])
+        .assert()
+        .success();
+    let parsed = assert_stdout_is_exactly_one_json_object(&assert.get_output().stdout);
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["state"], "CONFIRMED_SUCCESS");
+}
+
+#[test]
+fn inspect_reports_normalized_public_drop_state_over_real_http() {
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in inspect scenario: {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "inspect",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("mint price"));
+}
+
+// --- Output-file E2E (Section 18) ---
+
+#[test]
+fn plan_output_file_writes_valid_schema_1_json() {
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("plan-report.json");
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "plan",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let contents = std::fs::read_to_string(&out_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON on disk");
+    assert_eq!(parsed["schema_version"], 1);
+}
+
+#[test]
+fn single_wallet_mint_output_file_writes_valid_schema_1_json() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [transfer_log_for(wallet, 5)],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        }),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("mint-report.json");
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--send",
+            "--yes",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let contents = std::fs::read_to_string(&out_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON on disk");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["wallets"][0]["state"], "CONFIRMED_SUCCESS");
+}
+
+#[test]
+fn multi_wallet_mint_output_file_writes_valid_schema_1_json_in_manifest_order() {
+    let a = signer_for_seed("kairox-e2e-output-a").address();
+    let b = signer_for_seed("kairox-e2e-output-b").address();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_manifest(
+        dir.path(),
+        &[
+            (a, 1, "wallet-a", "E2E_OUT_KEY_A"),
+            (b, 1, "wallet-b", "E2E_OUT_KEY_B"),
+        ],
+    );
+    let out_path = dir.path().join("multi-mint-report.json");
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet-manifest",
+            manifest_path.to_str().unwrap(),
+            "--engine",
+            "public",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let contents = std::fs::read_to_string(&out_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON on disk");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["dry_run"], true);
+    let wallets = parsed["wallets"].as_array().unwrap();
+    assert_eq!(wallets[0]["label"], "wallet-a");
+    assert_eq!(wallets[1]["label"], "wallet-b");
+}
+
+// --- Secret-leak E2E over real HTTP success and failure paths (Section 19) ---
+
+const PRIVATE_KEY_SENTINEL_SUFFIX: &str =
+    "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+const OPENSEA_KEY_SENTINEL: &str = "sentinel-opensea-api-key-must-never-leak-9f3a";
+const RPC_QUERY_TOKEN_SENTINEL: &str = "sentinel-rpc-query-token-must-never-leak-7c21";
+
+fn assert_no_sentinels_leaked(haystack: &[u8]) {
+    let text = String::from_utf8_lossy(haystack);
+    assert!(
+        !text.contains(PRIVATE_KEY_SENTINEL_SUFFIX),
+        "private key sentinel leaked: {text}"
+    );
+    assert!(
+        !text.contains(OPENSEA_KEY_SENTINEL),
+        "OpenSea API key sentinel leaked: {text}"
+    );
+    assert!(
+        !text.contains(RPC_QUERY_TOKEN_SENTINEL),
+        "RPC query-token sentinel leaked: {text}"
+    );
+}
+
+#[test]
+fn secrets_never_leak_on_a_rejected_live_send_over_real_http() {
+    // A syntactically valid but deliberately wrong signing key (it will
+    // never resolve to `wallet`, so this fails closed on
+    // WalletKeyMismatch) -- proves the attempted secret material never
+    // leaks even on a failure path that has already loaded it.
+    let wallet = test_signer().address();
+    let key_hex = format!("0x{PRIVATE_KEY_SENTINEL_SUFFIX}");
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        })
+    });
+
+    let assert = kairox_bin()
+        .env(
+            "KAIROX_RPC_1_0_URL",
+            format!("{}?token={RPC_QUERY_TOKEN_SENTINEL}", server.url()),
+        )
+        .env("KAIROX_OPENSEA_API_KEY", OPENSEA_KEY_SENTINEL)
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--send",
+            "--yes",
+        ])
+        .assert();
+    let output = assert.get_output();
+    assert_no_sentinels_leaked(&output.stdout);
+    assert_no_sentinels_leaked(&output.stderr);
+}
+
+#[test]
+fn secrets_never_leak_on_a_successful_live_send_over_real_http() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [transfer_log_for(wallet, 11)],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        }),
+    });
+
+    let assert = kairox_bin()
+        .env(
+            "KAIROX_RPC_1_0_URL",
+            format!("{}?token={RPC_QUERY_TOKEN_SENTINEL}", server.url()),
+        )
+        .env("KAIROX_OPENSEA_API_KEY", OPENSEA_KEY_SENTINEL)
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    let output = assert.get_output();
+    assert_no_sentinels_leaked(&output.stdout);
+    assert_no_sentinels_leaked(&output.stderr);
+}
+
+#[test]
+fn secrets_never_leak_on_doctor_with_a_query_token_rpc_url() {
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    let assert = kairox_bin()
+        .env(
+            "KAIROX_RPC_1_0_URL",
+            format!("{}?token={RPC_QUERY_TOKEN_SENTINEL}", server.url()),
+        )
+        .env("KAIROX_OPENSEA_API_KEY", OPENSEA_KEY_SENTINEL)
+        .env(
+            "KAIROX_SIGNING_KEY",
+            format!("0x{PRIVATE_KEY_SENTINEL_SUFFIX}"),
+        )
+        .arg("doctor")
+        .assert()
+        .success();
+    let output = assert.get_output();
+    assert_no_sentinels_leaked(&output.stdout);
+    assert_no_sentinels_leaked(&output.stderr);
+}
+
+#[test]
+fn secrets_never_leak_on_an_opensea_401_failure_over_real_http() {
+    let wallet = test_signer().address();
+    let key_hex = format!("0x{PRIVATE_KEY_SENTINEL_SUFFIX}");
+    const SLUG: &str = "kairox-e2e-secret-leak-401";
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method: {method}"),
+            })
+        },
+        || Behavior::HttpStatus(401, serde_json::json!({"errors": ["invalid API key"]})),
+        SLUG,
+    );
+
+    let assert = kairox_bin()
+        .env(
+            "KAIROX_RPC_1_0_URL",
+            format!("{}?token={RPC_QUERY_TOKEN_SENTINEL}", server.url()),
+        )
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", OPENSEA_KEY_SENTINEL)
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure();
+    let output = assert.get_output();
+    assert_no_sentinels_leaked(&output.stdout);
+    assert_no_sentinels_leaked(&output.stderr);
+}
+
+// --- Bad-config E2E (Section 16) ---
+
+// NOTE: `doctor` deliberately never fails the process on a bad config --
+// it is a diagnostic tool that reports a `[FAIL (...)]` line inline and
+// keeps going (see its own real-HTTP tests above), so it cannot be used
+// to prove "invalid config -> nonzero exit". `plan` genuinely depends on
+// config resolution succeeding before it can do anything, so a bad config
+// there is a real, unrecoverable error with a real nonzero exit code.
+fn bad_config_kairox_bin(config_path: &std::path::Path) -> assert_cmd::Command {
+    let mut cmd = kairox_bin();
+    cmd.args([
+        "--config",
+        config_path.to_str().unwrap(),
+        "plan",
+        "0x000000000000000000000000000000000000c0de",
+        "--wallet",
+        "0x0000000000000000000000000000000000000aaa",
+    ]);
+    cmd
+}
+
+#[test]
+fn bad_config_unknown_field_is_rejected_with_config_invalid_and_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "version = 1\nsome_unknown_field = true\n").unwrap();
+
+    bad_config_kairox_bin(&path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG_INVALID"));
+}
+
+#[test]
+fn bad_config_unsupported_schema_version_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "version = 99\n").unwrap();
+
+    bad_config_kairox_bin(&path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG_INVALID"));
+}
+
+#[test]
+fn bad_config_malformed_toml_is_rejected_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "this is not valid TOML at all {{{\n").unwrap();
+
+    bad_config_kairox_bin(&path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG_INVALID"));
+}
+
+#[test]
+fn bad_config_secret_looking_value_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "version = 1\n[opensea]\napi_key_env = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
+    )
+    .unwrap();
+
+    bad_config_kairox_bin(&path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("CONFIG_INVALID"));
+}
+
+// --- Config precedence E2E (Section 15): CLI > env > config > default ---
+
+#[test]
+fn config_precedence_cli_rpc_url_wins_over_env_and_config() {
+    // Two distinct real servers: the config/env-named one must never
+    // receive any traffic once --rpc-url is given explicitly on the CLI --
+    // proving the CLI > env > config precedence link, on top of the
+    // existing `config_named_rpc_env_var_actually_connects_to_the_localhost_server`
+    // test (which proves the env > config link).
+    let wallet = test_signer().address();
+    let winning = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method: {method}"),
+        })
+    });
+    let losing = LocalHttpServer::spawn_json_rpc(|_method, _p| Behavior::JsonRpcError {
+        code: -32000,
+        message: "this endpoint must never be contacted".into(),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "version = 1\n[chains.ethereum]\nread_rpc_env = [\"E2E_PRECEDENCE_LOSING_URL\"]\n",
+    )
+    .unwrap();
+
+    kairox_bin()
+        .env("E2E_PRECEDENCE_LOSING_URL", losing.url())
+        .env_remove("KAIROX_RPC_1_0_URL")
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "plan",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--rpc-url",
+            &winning.url(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("mint value:"));
+
+    assert!(
+        losing
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(m, _)| m != "eth_chainId"),
+        "the config/env-resolved endpoint must never be contacted once --rpc-url is given"
+    );
+    assert!(
+        winning
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, _)| m == "eth_chainId"),
+        "the explicit --rpc-url endpoint must have been contacted"
+    );
+}
+
+#[test]
+fn opensea_429_is_bounded_retried_then_terminal_rate_limited() {
+    const SLUG: &str = "kairox-e2e-opensea-429";
+    let wallet = test_signer().address();
+    let key_hex = signing_key_hex_for_seed(SINGLE_WALLET_SEED);
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in opensea-429 scenario: {method}"),
+            })
+        },
+        || Behavior::HttpStatus(429, serde_json::json!({"errors": ["rate limited"]})),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("rate-limited"));
+
+    let received = server.received.lock().unwrap();
+    let mint_attempts = received
+        .iter()
+        .filter(|(p, _)| p.ends_with("/mint"))
+        .count();
+    assert_eq!(
+        mint_attempts, 3,
+        "429 is retryable up to the bounded MAX_ATTEMPTS=3, then terminal: got {mint_attempts}"
+    );
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
+#[test]
+fn opensea_500_is_bounded_retried_then_terminal_server_error() {
+    const SLUG: &str = "kairox-e2e-opensea-500";
+    let wallet = test_signer().address();
+    let key_hex = signing_key_hex_for_seed(SINGLE_WALLET_SEED);
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in opensea-500 scenario: {method}"),
+            })
+        },
+        || Behavior::HttpStatus(500, serde_json::json!({"errors": ["internal error"]})),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("OpenSea server error"));
+
+    let received = server.received.lock().unwrap();
+    let mint_attempts = received
+        .iter()
+        .filter(|(p, _)| p.ends_with("/mint"))
+        .count();
+    assert_eq!(mint_attempts, 3, "500 is bounded-retried, never unbounded");
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
+// =======================================================================
+// OpenSea allow-list and server-signed E2E (Phase 6 Sections 8-9): real
+// Merkle-proof / EIP-712 material, generated locally, verified through the
+// real localhost RPC (getAllowListMerkleRoot / getSignedMintValidationParams
+// / getFeeRecipientIsAllowed), through the real CLI, ending in a real
+// broadcast + receipt over the real localhost server.
+// =======================================================================
+
+const SEADROP: Address = address!("00005EA00Ac477B1030CE78506496e8C2dE24bf5");
+const FEE_RECIPIENT: Address = address!("0000000000000000000000000000000000fee000");
+
+fn sample_mint_params_abi(restrict_fee_recipients: bool) -> sd::MintParamsAbi {
+    sd::MintParamsAbi {
+        mintPrice: U256::from(0u64),
+        maxTotalMintableByWallet: U256::from(5u64),
+        startTime: U256::from(0u64),
+        endTime: U256::from(9_999_999_999u64),
+        dropStageIndex: U256::from(1u64),
+        maxTokenSupplyForStage: U256::from(1_000u64),
+        feeBps: U256::from(0u64),
+        restrictFeeRecipients: restrict_fee_recipients,
+    }
+}
+
+fn root_hex(root: B256) -> Value {
+    serde_json::json!(format!(
+        "0x{}",
+        hex::encode(sd::getAllowListMerkleRootCall::abi_encode_returns(&root))
+    ))
+}
+
+fn permissive_signed_mint_validation_params() -> sd::SignedMintValidationParamsAbi {
+    sd::SignedMintValidationParamsAbi {
+        minMintPrice: alloy_primitives::Uint::from(0u64),
+        maxMaxTotalMintableByWallet: alloy_primitives::Uint::from(1_000u64),
+        minStartTime: alloy_primitives::Uint::from(0u64),
+        maxEndTime: alloy_primitives::Uint::from(9_999_999_999u64),
+        maxMaxTokenSupplyForStage: alloy_primitives::Uint::from(1_000_000u64),
+        minFeeBps: 0,
+        maxFeeBps: 10_000,
+    }
+}
+
+fn validation_params_hex(p: sd::SignedMintValidationParamsAbi) -> Value {
+    serde_json::json!(format!(
+        "0x{}",
+        hex::encode(sd::getSignedMintValidationParamsCall::abi_encode_returns(
+            &p
+        ))
+    ))
+}
+
+fn fee_recipient_allowed_hex(allowed: bool) -> Value {
+    serde_json::json!(format!(
+        "0x{}",
+        hex::encode(sd::getFeeRecipientIsAllowedCall::abi_encode_returns(
+            &allowed
+        ))
+    ))
+}
+
+/// eth_call dispatch for the OpenSea-specific on-chain reads
+/// (getAllowListMerkleRoot / getSignedMintValidationParams /
+/// getFeeRecipientIsAllowed), falling back to `standard_read_response` for
+/// everything else (chainId, block, priority fee, nonce, balance, gas
+/// estimate).
+fn opensea_read_response(
+    method: &str,
+    params: &Value,
+    allow_list_root: Option<B256>,
+    validation_params: Option<sd::SignedMintValidationParamsAbi>,
+    fee_recipient_allowed: Option<bool>,
+) -> Option<Behavior> {
+    if method == "eth_call" {
+        let data = params
+            .get(0)
+            .and_then(|c| c.get("data"))
+            .and_then(Value::as_str)
+            .unwrap_or("0x");
+        let root_sel = format!(
+            "0x{}",
+            hex::encode(sd::getAllowListMerkleRootCall::SELECTOR)
+        );
+        let val_sel = format!(
+            "0x{}",
+            hex::encode(sd::getSignedMintValidationParamsCall::SELECTOR)
+        );
+        let fee_sel = format!(
+            "0x{}",
+            hex::encode(sd::getFeeRecipientIsAllowedCall::SELECTOR)
+        );
+        if data.starts_with(&root_sel) {
+            return Some(rpc_ok(root_hex(
+                allow_list_root.expect("allow_list_root must be configured for this scenario"),
+            )));
+        }
+        if data.starts_with(&val_sel) {
+            return Some(rpc_ok(validation_params_hex(
+                validation_params.expect("validation_params must be configured for this scenario"),
+            )));
+        }
+        if data.starts_with(&fee_sel) {
+            return Some(rpc_ok(fee_recipient_allowed_hex(
+                fee_recipient_allowed
+                    .expect("fee_recipient_allowed must be configured for this scenario"),
+            )));
+        }
+    }
+    standard_read_response(method, params)
+}
+
+fn allow_list_mint_response_json(mint_params: sd::MintParamsAbi) -> Value {
+    let call = sd::mintAllowListCall {
+        nftContract: NFT,
+        feeRecipient: FEE_RECIPIENT,
+        minterIfNotPayer: Address::ZERO,
+        quantity: U256::from(1u64),
+        mintParams: mint_params,
+        proof: vec![],
+    };
+    serde_json::json!({
+        "to": format!("{SEADROP:#x}"),
+        "data": format!("0x{}", hex::encode(call.abi_encode())),
+        "value": "0x0",
+        "chain": "ethereum",
+    })
+}
+
+fn allow_list_leaf(wallet: Address, mint_params: &sd::MintParamsAbi) -> B256 {
+    seadrop_crypto::allow_list_merkle_leaf(wallet, &NormalizedMintParams::from(mint_params))
+}
+
+/// A raw k256 signing key built from the same seed bytes as a
+/// `LocalSigner`, used only to sign an arbitrary EIP-712 digest directly
+/// for test fixtures (`LocalSigner` deliberately never exposes its key
+/// material for anything but signing a real `UnsignedEip1559Tx`).
+fn raw_signing_key_for_seed(seed: &str) -> k256::ecdsa::SigningKey {
+    let bytes = keccak256(seed.as_bytes()).0;
+    k256::ecdsa::SigningKey::from_bytes((&bytes).into()).unwrap()
+}
+
+/// Decode a single `address` argument from `0x<selector><32-byte-word>...`
+/// calldata: the address occupies the low 20 bytes of that first word.
+fn decode_single_address_arg(data: &str) -> Address {
+    let stripped = data.trim_start_matches("0x");
+    let word = &stripped[8..8 + 64];
+    let addr_hex = &word[24..64];
+    format!("0x{addr_hex}").parse().unwrap()
+}
+
+fn sign_digest_65_bytes(key: &k256::ecdsa::SigningKey, digest: B256) -> [u8; 65] {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    let (signature, recovery_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+        key.sign_prehash(digest.as_slice()).unwrap();
+    let mut out = [0u8; 65];
+    out[0..64].copy_from_slice(&signature.to_bytes());
+    out[64] = if recovery_id.is_y_odd() { 1 } else { 0 };
+    out
+}
+
+fn signed_mint_response_json(
+    wallet: Address,
+    mint_params: sd::MintParamsAbi,
+    signer_seed: &str,
+    salt: U256,
+) -> Value {
+    let normalized = NormalizedMintParams::from(&mint_params);
+    let digest = seadrop_crypto::signed_mint_digest(
+        1,
+        SEADROP,
+        NFT,
+        wallet,
+        FEE_RECIPIENT,
+        &normalized,
+        salt,
+    );
+    let key = raw_signing_key_for_seed(signer_seed);
+    let signature = sign_digest_65_bytes(&key, digest);
+    let call = sd::mintSignedCall {
+        nftContract: NFT,
+        feeRecipient: FEE_RECIPIENT,
+        minterIfNotPayer: Address::ZERO,
+        quantity: U256::from(1u64),
+        mintParams: mint_params,
+        salt,
+        signature: Bytes::from(signature.to_vec()),
+    };
+    serde_json::json!({
+        "to": format!("{SEADROP:#x}"),
+        "data": format!("0x{}", hex::encode(call.abi_encode())),
+        "value": "0x0",
+        "chain": "ethereum",
+    })
+}
+
+#[test]
+fn opensea_allow_list_mint_verifies_real_merkle_proof_and_completes_end_to_end() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-allowlist";
+
+    let mint_params = sample_mint_params_abi(false);
+    // Single-leaf tree: leaf == root, proof == [] -- the simplest genuine
+    // Merkle verification (still a real recomputation against a real
+    // on-chain-reported root, not a bypass).
+    let leaf = allow_list_leaf(wallet, &mint_params);
+    let response = allow_list_mint_response_json(mint_params);
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| match method {
+            "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+            "eth_getTransactionReceipt" => {
+                let queried_hash = params
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x")
+                    .to_string();
+                rpc_ok(serde_json::json!({
+                    "transactionHash": queried_hash,
+                    "status": "0x1",
+                    "blockNumber": "0x1",
+                    "logs": [transfer_log_for(wallet, 42)],
+                }))
+            }
+            _ => opensea_read_response(method, params, Some(leaf), None, None).unwrap_or(
+                Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!("unexpected RPC method in allow-list scenario: {method}"),
+                },
+            ),
+        },
+        move || rpc_ok_status(response.clone()),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("BROADCAST RESULT"))
+        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+
+    let received = server.received.lock().unwrap();
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(m, _)| m == "eth_sendRawTransaction")
+            .count(),
+        1
+    );
+    assert!(
+        received.iter().any(|(m, _)| m == "eth_call"),
+        "the on-chain allow-list root must genuinely have been fetched via eth_call"
+    );
+}
+
+#[test]
+fn opensea_server_signed_mint_verifies_real_eip712_signature_and_completes_end_to_end() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-signed";
+    const SIGNER_SEED: &str = "kairox-e2e-signed-mint-authorized-signer";
+
+    let mint_params = sample_mint_params_abi(true);
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| match method {
+            "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+            "eth_getTransactionReceipt" => {
+                let queried_hash = params
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x")
+                    .to_string();
+                rpc_ok(serde_json::json!({
+                    "transactionHash": queried_hash,
+                    "status": "0x1",
+                    "blockNumber": "0x1",
+                    "logs": [transfer_log_for(wallet, 99)],
+                }))
+            }
+            _ => opensea_read_response(
+                method,
+                params,
+                None,
+                Some(permissive_signed_mint_validation_params()),
+                Some(true),
+            )
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in signed-mint scenario: {method}"),
+            }),
+        },
+        move || {
+            rpc_ok_status(signed_mint_response_json(
+                wallet,
+                sample_mint_params_abi(true),
+                SIGNER_SEED,
+                U256::from(1u64),
+            ))
+        },
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("BROADCAST RESULT"))
+        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+
+    let received = server.received.lock().unwrap();
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(m, _)| m == "eth_sendRawTransaction")
+            .count(),
+        1
+    );
+    let _ = mint_params;
+}
+
+// =======================================================================
+// Malicious OpenSea response E2E (Phase 6 Section 11): every case must
+// fail closed before Kairox ever signs an Ethereum transaction.
+// =======================================================================
+
+#[test]
+fn opensea_response_with_invalid_merkle_proof_is_rejected_before_signing() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-bad-proof";
+
+    let mint_params = sample_mint_params_abi(false);
+    let response = allow_list_mint_response_json(mint_params);
+    // The on-chain root deliberately does not match this wallet's leaf.
+    let wrong_root = keccak256(b"a-root-that-does-not-match-any-real-leaf");
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| {
+            opensea_read_response(method, params, Some(wrong_root), None, None).unwrap_or(
+                Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!("unexpected RPC method in bad-proof scenario: {method}"),
+                },
+            )
+        },
+        move || rpc_ok_status(response.clone()),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Merkle"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an invalid Merkle proof must never reach Ethereum signing"
+    );
+}
+
+#[test]
+fn opensea_response_targeting_wrong_collection_is_rejected_before_signing() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-wrong-collection";
+    let other_collection: Address = address!("00000000000000000000000000000000000dead0");
+
+    let mint_params = sample_mint_params_abi(false);
+    let call = sd::mintAllowListCall {
+        nftContract: other_collection, // wrong: does not match the requested NFT
+        feeRecipient: FEE_RECIPIENT,
+        minterIfNotPayer: Address::ZERO,
+        quantity: U256::from(1u64),
+        mintParams: mint_params,
+        proof: vec![],
+    };
+    let response = serde_json::json!({
+        "to": format!("{SEADROP:#x}"),
+        "data": format!("0x{}", hex::encode(call.abi_encode())),
+        "value": "0x0",
+        "chain": "ethereum",
+    });
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in wrong-collection scenario: {method}"),
+            })
+        },
+        move || rpc_ok_status(response.clone()),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "does not match the requested collection",
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+    // Wrong-collection is rejected purely from decoded calldata -- it must
+    // never even reach the on-chain Merkle-root lookup.
+    assert!(!received.iter().any(|(p, _)| p == "getAllowListMerkleRoot"));
+}
+
+#[test]
+fn opensea_response_with_mutated_server_signature_is_rejected_before_signing() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-bad-signature";
+    const SIGNER_SEED: &str = "kairox-e2e-mutated-signature-signer";
+
+    let mint_params = sample_mint_params_abi(true);
+    let response = signed_mint_response_json(wallet, mint_params, SIGNER_SEED, U256::from(1u64));
+    // Flip a hex nibble squarely inside the signature's real 64 `r`/`s`
+    // bytes (the dynamic `bytes signature` ABI encoding right-pads its
+    // final partial word with zeros -- mutating the very last character
+    // would land in that padding and be a silent no-op, so this targets a
+    // position well clear of it: 100 hex characters from the end is inside
+    // the second-to-last full 32-byte word, entirely real signature data).
+    let mut data = response["data"].as_str().unwrap().to_string();
+    let target = data.len() - 100;
+    let mutated_char = if data.as_bytes()[target] == b'0' {
+        '1'
+    } else {
+        '0'
+    };
+    data.replace_range(target..target + 1, &mutated_char.to_string());
+    let mut response = response;
+    response["data"] = serde_json::json!(data);
+
+    // Critical: validation params must be permissive ONLY for the genuine
+    // authorized signer's address. Otherwise a mutated signature that
+    // still happens to recover to *some* valid-looking (but wrong)
+    // address would incorrectly pass "authorization" against a
+    // constant-regardless-of-address mock -- proving nothing about the
+    // signature check. Any other queried address gets the real contract's
+    // own "unauthorized" sentinel (`maxMaxTotalMintableByWallet == 0`).
+    let authorized_signer = LocalSigner::from_bytes(keccak256(SIGNER_SEED.as_bytes()).0)
+        .unwrap()
+        .address();
+    let zero_sentinel = sd::SignedMintValidationParamsAbi {
+        minMintPrice: alloy_primitives::Uint::from(0u64),
+        maxMaxTotalMintableByWallet: alloy_primitives::Uint::from(0u64),
+        minStartTime: alloy_primitives::Uint::from(0u64),
+        maxEndTime: alloy_primitives::Uint::from(0u64),
+        maxMaxTokenSupplyForStage: alloy_primitives::Uint::from(0u64),
+        minFeeBps: 0,
+        maxFeeBps: 0,
+    };
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| {
+            if method == "eth_call" {
+                let data = params
+                    .get(0)
+                    .and_then(|c| c.get("data"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x");
+                let val_sel = format!(
+                    "0x{}",
+                    hex::encode(sd::getSignedMintValidationParamsCall::SELECTOR)
+                );
+                if data.starts_with(&val_sel) {
+                    let queried_signer = decode_single_address_arg(data);
+                    let params_to_return = if queried_signer == authorized_signer {
+                        permissive_signed_mint_validation_params()
+                    } else {
+                        zero_sentinel.clone()
+                    };
+                    return rpc_ok(validation_params_hex(params_to_return));
+                }
+                let fee_sel = format!(
+                    "0x{}",
+                    hex::encode(sd::getFeeRecipientIsAllowedCall::SELECTOR)
+                );
+                if data.starts_with(&fee_sel) {
+                    return rpc_ok(fee_recipient_allowed_hex(true));
+                }
+            }
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in bad-signature scenario: {method}"),
+            })
+        },
+        move || rpc_ok_status(response.clone()),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure();
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a mutated server-mint signature must never reach Ethereum signing"
+    );
+}
+
+#[test]
+fn opensea_response_with_unsupported_token_gated_selector_is_rejected_before_signing() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-token-gated";
+
+    let call = sd::mintAllowedTokenHolderCall {
+        nftContract: NFT,
+        feeRecipient: FEE_RECIPIENT,
+        minterIfNotPayer: Address::ZERO,
+        mintParams: sd::TokenGatedMintParamsAbi {
+            allowedNftToken: NFT,
+            allowedNftTokenIds: vec![U256::from(1u64)],
+        },
+    };
+    let response = serde_json::json!({
+        "to": format!("{SEADROP:#x}"),
+        "data": format!("0x{}", hex::encode(call.abi_encode())),
+        "value": "0x0",
+        "chain": "ethereum",
+    });
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in token-gated scenario: {method}"),
+            })
+        },
+        move || rpc_ok_status(response.clone()),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("token-gated"));
+
+    let received = server.received.lock().unwrap();
     assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
 }
