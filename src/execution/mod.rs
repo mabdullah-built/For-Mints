@@ -18,4 +18,5 @@ pub mod profile;
 pub mod receipt;
 pub mod resolver;
 pub mod scheduler;
+pub mod stage_resolver;
 pub mod watch;
