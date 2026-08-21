@@ -102,6 +102,14 @@ pub enum SessionErrorKind {
     /// this wallet's own eligibility, so callers must not classify it the
     /// same way as an `Ineligible` outcome.
     SkippedSharedResourceFailure,
+    /// No registered [`crate::execution::resolver::MintAdapter`] produced a
+    /// confident detection for the given target. Never a guess -- an
+    /// unrecognized contract is refused, not sent to with assumed calldata.
+    UnsupportedProtocol,
+    /// More than one registered adapter produced a detection for the same
+    /// target and the resolver has no principled way to prefer one over
+    /// the other. Refused rather than picked arbitrarily.
+    AmbiguousProtocol,
 }
 
 /// An error representing a state Kairox has explicitly decided must halt
@@ -191,6 +199,8 @@ pub enum KairoxErrorCode {
     InsufficientBalance,
     SessionCapExceeded,
     NoVerifiedReadRpc,
+    UnsupportedProtocol,
+    AmbiguousProtocol,
     /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
     /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
     SessionAborted,
@@ -218,6 +228,8 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::InsufficientBalance => "INSUFFICIENT_BALANCE",
             Self::SessionCapExceeded => "SESSION_CAP_EXCEEDED",
             Self::NoVerifiedReadRpc => "NO_VERIFIED_READ_RPC",
+            Self::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
+            Self::AmbiguousProtocol => "AMBIGUOUS_PROTOCOL",
             Self::SessionAborted => "SESSION_ABORTED",
         };
         f.write_str(s)
@@ -292,6 +304,8 @@ impl KairoxError {
                 SessionErrorKind::SessionCapExceeded => KairoxErrorCode::SessionCapExceeded,
                 SessionErrorKind::AggregateSupplyExceeded => KairoxErrorCode::SupplyExhausted,
                 SessionErrorKind::NoVerifiedReadRpc => KairoxErrorCode::NoVerifiedReadRpc,
+                SessionErrorKind::UnsupportedProtocol => KairoxErrorCode::UnsupportedProtocol,
+                SessionErrorKind::AmbiguousProtocol => KairoxErrorCode::AmbiguousProtocol,
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest
                 | SessionErrorKind::SkippedSharedResourceFailure => KairoxErrorCode::SessionAborted,

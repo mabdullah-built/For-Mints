@@ -38,6 +38,7 @@ async fn run_with(config_path: Option<std::path::PathBuf>, command: Command) -> 
         Command::Bench(args) => commands::bench::run(args, config_path).await,
         Command::Init(args) => commands::init::run(args),
         Command::Receipt(args) => commands::receipt::run(args, config_path).await,
+        Command::Watch(args) => commands::watch::run(args, config_path).await,
     };
 
     match result {

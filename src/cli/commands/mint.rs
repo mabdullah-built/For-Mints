@@ -17,7 +17,7 @@ use crate::cli::commands::plan::{build_mint_plan, print_plan};
 use crate::cli::context::resolve_chain_and_runtime;
 use crate::cli::format::{format_unix, parse_wei};
 use crate::domain::fees::SafetyCaps;
-use crate::domain::timing::{SleepSegment, StageStatus};
+use crate::domain::timing::SleepSegment;
 use crate::execution::broadcast::BroadcastSummary;
 use crate::execution::errors::{KairoxError, SessionError, SessionErrorKind};
 use crate::execution::live::{LiveMintConfig, LiveProgress, run_live_mint};
@@ -42,15 +42,13 @@ enum SelectedEngine {
 
 /// Resolve `--engine`/`--slug` into exactly one concrete engine.
 ///
-/// `Auto` without `--slug` always resolves to `Public` (the OpenSea engine
-/// can never be reached without an explicit slug — see `EngineSelection`'s
-/// docs; Kairox never guesses a slug). `Auto` with `--slug` prefers
-/// `Public` when the public on-chain stage is currently active and the
-/// public engine can fully prepare it (checked by actually building the
-/// dry-run plan); otherwise it falls back to `OpenSea`, on the reasoning
-/// that a wallet-specific/off-chain-gated stage needs OpenSea's
-/// transaction data. `Explicit Public`/`Explicit Opensea` always win
-/// outright.
+/// `Explicit Public`/`Explicit Opensea` always win outright -- the operator
+/// already decided. `Auto` goes through the shared
+/// [`crate::execution::resolver::AdapterRegistry`] (native on-chain SeaDrop
+/// tried first, the official OpenSea Drops route only as a fallback), which
+/// fails closed with `UNSUPPORTED_PROTOCOL`/`AMBIGUOUS_PROTOCOL` rather than
+/// silently defaulting to a guess. The resolved evidence is printed so an
+/// operator can see *why* Kairox picked what it picked.
 async fn select_engine(
     args: &MintArgs,
     config_path: Option<&std::path::Path>,
@@ -66,20 +64,51 @@ async fn select_engine(
             Ok(SelectedEngine::OpenSea { slug })
         }
         EngineSelection::Auto => {
-            let Some(slug) = args.plan_args.slug.clone() else {
-                return Ok(SelectedEngine::Public);
-            };
-            let public_active = build_mint_plan(&args.plan_args, config_path)
-                .await
-                .map(|plan| matches!(plan.stage_status, StageStatus::Active { .. }))
-                .unwrap_or(false);
-            if public_active {
-                Ok(SelectedEngine::Public)
-            } else {
-                Ok(SelectedEngine::OpenSea { slug })
-            }
+            let detection = resolve_auto_engine(&args.plan_args, config_path, false).await?;
+            print_resolution_evidence(&detection);
+            Ok(match detection.engine {
+                crate::execution::resolver::ResolvedEngine::Public => SelectedEngine::Public,
+                crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
+                    SelectedEngine::OpenSea { slug }
+                }
+            })
         }
     }
+}
+
+/// Shared by `mint --engine auto` and `watch --engine auto`.
+/// `allow_not_yet_started` distinguishes "I want to send right now"
+/// (`mint`, false) from "I'm willing to wait for this stage" (`watch`,
+/// true) -- see [`crate::cli::commands::resolver_adapters::SeaDropAdapter`].
+pub(crate) async fn resolve_auto_engine(
+    plan_args: &crate::cli::args::PlanArgs,
+    config_path: Option<&std::path::Path>,
+    allow_not_yet_started: bool,
+) -> Result<crate::execution::resolver::Detection, KairoxError> {
+    use crate::cli::commands::resolver_adapters::{OpenSeaDropsAdapter, SeaDropAdapter};
+    use crate::execution::resolver::{AdapterRegistry, MintAdapter};
+
+    let registry = AdapterRegistry::new(vec![
+        Box::new(SeaDropAdapter {
+            plan_args,
+            config_path,
+            allow_not_yet_started,
+        }) as Box<dyn MintAdapter>,
+        Box::new(OpenSeaDropsAdapter {
+            slug: plan_args.slug.as_deref(),
+        }) as Box<dyn MintAdapter>,
+    ]);
+    registry.resolve().await
+}
+
+pub(crate) fn print_resolution_evidence(detection: &crate::execution::resolver::Detection) {
+    eprintln!(
+        "resolved_engine: {:?} | adapter: {} | confidence: {:?} | evidence: {}",
+        detection.engine,
+        detection.evidence.adapter,
+        detection.evidence.confidence,
+        detection.evidence.source
+    );
 }
 
 pub(crate) fn load_opensea_client(timeout: StdDuration) -> Result<OpenSeaClient, KairoxError> {
@@ -245,7 +274,7 @@ async fn run_send(
 /// Connect every configured endpoint for `chain_args`'s chain and fail
 /// closed if nothing send-capable came up. Shared by both engines' `--send`
 /// paths.
-async fn connect_send_pool(
+pub(crate) async fn connect_send_pool(
     resolved: &crate::cli::context::ResolvedChain,
     rpc_url_override: Option<&url::Url>,
     config: Option<&crate::config::KairoxConfig>,
@@ -683,7 +712,7 @@ fn std_duration_from_time(d: time::Duration) -> StdDuration {
     d.try_into().unwrap_or(StdDuration::ZERO)
 }
 
-fn print_broadcast_result(
+pub(crate) fn print_broadcast_result(
     tx_hash: alloy_primitives::B256,
     broadcast_results: &[crate::execution::broadcast::EndpointBroadcastResult],
     broadcast_summary: &BroadcastSummary,

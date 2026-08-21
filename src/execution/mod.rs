@@ -12,4 +12,6 @@ pub mod plan;
 pub mod prepared;
 pub mod profile;
 pub mod receipt;
+pub mod resolver;
 pub mod scheduler;
+pub mod watch;

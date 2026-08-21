@@ -3544,3 +3544,246 @@ fn bench_chain_46630_fails_closed_when_the_endpoint_actually_reports_4663() {
         .stdout(predicates::str::contains("reported=4663"))
         .stdout(predicates::str::contains("0 of 1 endpoints connected"));
 }
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A `getPublicDrop` responder with caller-chosen start/end times, otherwise
+/// identical to [`standard_read_response`]'s fixture.
+fn read_response_with_stage_window(
+    method: &str,
+    params: &Value,
+    start_time: u64,
+    end_time: u64,
+) -> Option<Behavior> {
+    if method == "eth_call" {
+        let data = params
+            .get(0)
+            .and_then(|c| c.get("data"))
+            .and_then(Value::as_str)
+            .unwrap_or("0x");
+        let selector_hex = format!("0x{}", hex::encode(sd::getPublicDropCall::SELECTOR));
+        if data.starts_with(&selector_hex) {
+            let public_drop = PublicDropAbi {
+                mintPrice: alloy_primitives::Uint::from(10_000_000_000_000_000u128),
+                startTime: alloy_primitives::Uint::from(start_time),
+                endTime: alloy_primitives::Uint::from(end_time),
+                maxTotalMintableByWallet: 5,
+                feeBps: 0,
+                restrictFeeRecipients: false,
+            };
+            return Some(rpc_ok(serde_json::json!(format!(
+                "0x{}",
+                hex::encode(sd::getPublicDropCall::abi_encode_returns(&public_drop))
+            ))));
+        }
+    }
+    standard_read_response(method, params)
+}
+
+#[test]
+fn watch_public_future_stage_waits_then_executes_at_t0() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let stage_start = unix_now() + 2; // a genuine, short future stage
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        match method {
+            "eth_sendRawTransaction" => return echo_tx_hash_behavior(params),
+            "eth_getTransactionReceipt" => {
+                let queried_hash = params
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x")
+                    .to_string();
+                return rpc_ok(serde_json::json!({
+                    "transactionHash": queried_hash,
+                    "status": "0x1",
+                    "blockNumber": "0x1",
+                    "logs": [transfer_log_for(wallet, 9)],
+                }));
+            }
+            _ => {}
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in watch scenario: {method}"),
+            },
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("BROADCAST RESULT"))
+        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+
+    let received = server.received.lock().unwrap();
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(
+        sends.len(),
+        1,
+        "watch must broadcast exactly one transaction, got {sends:?}"
+    );
+}
+
+#[test]
+fn watch_without_auto_send_refuses_to_run_and_touches_no_endpoint() {
+    let wallet = test_signer().address();
+    // No server at all is spawned/pointed at -- if watch ever tried to
+    // connect before checking --auto-send, this test would hang or error
+    // in a way that isn't the intended "refused before doing anything"
+    // message.
+    kairox_bin()
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--auto-send"));
+}
+
+#[test]
+fn watch_public_stage_already_ended_stops_before_any_send() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let now = unix_now();
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "must never be called: stage already ended".into(),
+            };
+        }
+        // Both start and end are in the past -- a genuinely ended stage.
+        read_response_with_stage_window(method, params, now.saturating_sub(200), now - 100)
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in ended-stage watch scenario: {method}"),
+            })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+        ])
+        .assert()
+        .failure();
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an already-ended stage must never be broadcast to"
+    );
+}
+
+#[test]
+fn auto_engine_resolves_seadrop_public_with_evidence_reported() {
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in auto-resolve scenario: {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "plan",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .success();
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: Public"))
+        .stderr(predicates::str::contains("SeaDropAdapter"))
+        .stderr(predicates::str::contains("confidence: High"));
+}
+
+#[test]
+fn auto_engine_unrecognized_contract_fails_closed_as_unsupported_protocol() {
+    let wallet = test_signer().address();
+    // getPublicDrop reverts on this contract (as it genuinely would for an
+    // arbitrary non-SeaDrop ERC-721) and no --slug was given, so neither
+    // adapter can produce a confident match.
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        "eth_call" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "execution reverted".into(),
+        },
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an unrecognized protocol must never be sent to, calldata-guessed or not"
+    );
+}

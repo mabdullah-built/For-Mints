@@ -72,6 +72,17 @@ Pure, I/O-free math: `Eip1559Fees` (enforces `max_fee >= base_fee`, `priority <=
 
 Retry policy is bounded and explicit everywhere it exists, never silent/unbounded: `execution::opensea_engine`'s mint-request retry loop is capped at a fixed `MAX_ATTEMPTS` (3) and only retries `Retryable`-categorized errors (timeout, 5xx, 429) — never a `Fatal` or `MustStopSession` one. Nothing in Kairox retries a broadcast once a transaction has been signed; see [docs/security.md](security.md#uncertain-broadcast-handling).
 
+## Launch watch (`kairox watch`)
+
+`execution::watch::wait_for_stage` adds one genuinely new capability on top
+of the existing critical-path engines: a long-horizon polling loop that
+periodically re-verifies stage timing/supply/eligibility while a configured
+stage is still far from opening, then hands off unchanged to
+`run_live_mint`/`run_opensea_mint` once within the engine's own
+`state_check_lead`. `cli::commands::watch` wires this to explicitly
+operator-configured targets only (a single `--collection`/`--wallet` pair,
+or a `--manifest` watchlist) -- see [docs/watch.md](watch.md).
+
 ## Recovery utilities
 
 `.research/nft-public-mint` and `.research/osnm-z` are read-only reference implementations, used only to cross-check protocol behavior against real source when something in the SeaDrop/OpenSea integration needed independent verification (e.g. the EIP-712 domain, the exact allow-list leaf encoding, the aggregate-supply query safety argument in the security doc). Nothing in `src/` depends on them at build or run time, and `git diff -- .research` is expected to always be empty.

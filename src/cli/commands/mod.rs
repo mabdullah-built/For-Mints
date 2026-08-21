@@ -7,3 +7,5 @@ pub mod mint;
 pub mod mint_multi;
 pub mod plan;
 pub mod receipt;
+pub mod resolver_adapters;
+pub mod watch;

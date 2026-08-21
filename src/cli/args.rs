@@ -43,6 +43,12 @@ pub enum Command {
     Init(InitArgs),
     /// Read-only recheck of a known transaction's receipt and expected mint evidence. Never submits a transaction.
     Receipt(ReceiptArgs),
+    /// Wait for an explicitly-configured, not-yet-open stage to become
+    /// active, then execute automatically at the earliest valid moment.
+    /// Requires --auto-send (there is no interactive operator present to
+    /// confirm at T0 for an unattended wait). Never discovers or mints an
+    /// unconfigured collection/wallet.
+    Watch(WatchArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -262,4 +268,57 @@ pub struct BenchArgs {
     /// Delay between samples, in milliseconds. Defaults to the chain's execution profile.
     #[arg(long)]
     pub sample_delay_ms: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchArgs {
+    /// NFT collection contract address. Required unless --manifest is used;
+    /// mutually exclusive with it.
+    #[arg(conflicts_with = "manifest")]
+    pub collection: Option<Address>,
+    #[command(flatten)]
+    pub chain_args: ChainArgs,
+    /// Which mint execution engine to use once the stage opens.
+    #[arg(long, value_enum, default_value_t = EngineSelection::Auto)]
+    pub engine: EngineSelection,
+    /// OpenSea collection slug. Required for --engine opensea; used by
+    /// --engine auto only when no on-chain public stage is configured.
+    #[arg(long)]
+    pub slug: Option<String>,
+    /// Wallet address to watch/mint for. Required unless --manifest is used.
+    #[arg(long, conflicts_with = "manifest")]
+    pub wallet: Option<Address>,
+    /// Number of tokens to mint.
+    #[arg(long, default_value_t = 1)]
+    pub quantity: u64,
+    /// Preferred fee recipient address. Must be in the allowed set if the drop restricts fee recipients.
+    #[arg(long)]
+    pub fee_recipient: Option<Address>,
+    /// Maximum acceptable total mint value, in wei (decimal). Checked before signing.
+    #[arg(long, default_value = "1000000000000000000")]
+    pub max_mint_value_wei: String,
+    /// Maximum acceptable worst-case gas cost, in wei (decimal).
+    #[arg(long, default_value = "1000000000000000000")]
+    pub max_gas_cost_wei: String,
+    /// Maximum acceptable worst-case total spend (mint value + gas cost), in wei (decimal).
+    #[arg(long, default_value = "2000000000000000000")]
+    pub max_total_spend_wei: String,
+    /// Multiplier applied to the RPC's gas estimate to derive the gas limit used in worst-case calculations.
+    #[arg(long, default_value_t = 1.25)]
+    pub gas_buffer_multiplier: f64,
+    /// Required explicit informed consent for unattended automatic
+    /// broadcast at T0. Without it, `watch` refuses to run at all -- there
+    /// is deliberately no "wait, then ask" mode, since nothing would be
+    /// present to answer.
+    #[arg(long)]
+    pub auto_send: bool,
+    /// How often to re-verify stage timing/eligibility/supply while far
+    /// from T0.
+    #[arg(long, default_value_t = 60)]
+    pub poll_interval_secs: u64,
+    /// A TOML watchlist of multiple targets. Mutually exclusive with
+    /// providing a single collection/--wallet directly. See
+    /// docs/watch.md for the schema.
+    #[arg(long, conflicts_with_all = ["wallet"])]
+    pub manifest: Option<std::path::PathBuf>,
 }
