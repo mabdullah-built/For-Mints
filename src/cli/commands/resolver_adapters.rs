@@ -134,23 +134,24 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
     }
 }
 
-/// Detects the generic verified ERC-721/ERC-1155 route.
+/// Detects the generic verified ERC-721/ERC-1155 route, in order:
 ///
-/// **`Confidence::High` requires an exact
-/// [`TrustedGenericFingerprint`](crate::execution::generic_registry::TrustedGenericFingerprint)
-/// match** -- the target's (proxy-resolved) implementation bytecode hash
-/// exactly equals a manually-reviewed registry entry's. That entry alone
-/// carries the mint call semantics (selector, argument meanings, payable,
-/// price) that get executed; an operator-supplied `--generic-schema`, if
-/// also given, only ever acts as an optional maximum-price ceiling check
-/// on top (see `execution::generic_engine::GenericMintRequest`).
-///
-/// An operator-declared `--generic-schema` plus ERC-165 confirmation
-/// *alone* (no registry match) is **only ever `Confidence::Low`** and can
-/// never resolve to a live-send path -- ERC-165 proves the NFT *standard*
-/// a contract implements, never that any particular function selector
-/// means what a schema claims, what its arguments mean, or what value it
-/// expects. See `docs/generic-engine.md`'s "Confidence model" section.
+/// 1. **Trusted registry**: the target's (proxy-resolved) implementation
+///    bytecode hash exactly matches a manually-reviewed
+///    [`TrustedGenericFingerprint`](crate::execution::generic_registry::TrustedGenericFingerprint).
+///    `Confidence::High`.
+/// 2. **Verified-source semantic resolution**: a
+///    [`VerifiedContractMetadataProvider`](crate::metadata::VerifiedContractMetadataProvider)
+///    (Blockscout) reports the target's source verified, and
+///    `execution::generic_semantics::resolve_mint_function` finds exactly
+///    one unambiguous mint function using the verified ABI's parameter
+///    *names* as semantic evidence (never types alone) -- corroborated by
+///    on-chain ERC-165. `Confidence::High`.
+/// 3. **Operator-declared `--generic-schema` alone**: `Confidence::Low`,
+///    always -- ERC-165 proves the NFT *standard*, never that any
+///    particular selector means what a schema claims, what its arguments
+///    mean, or what value it expects. Can never resolve to a live-send
+///    path. See `docs/generic-engine.md`'s "Confidence model" section.
 ///
 /// Priority 2 -- only tried once neither native SeaDrop nor the OpenSea
 /// Drops route matched.
@@ -159,6 +160,8 @@ pub struct GenericVerifiedContractAdapter<'a> {
     pub config_path: Option<&'a Path>,
     pub schema: Option<&'a GenericMintSchema>,
     pub trusted_registry: &'a [crate::execution::generic_registry::TrustedGenericFingerprint],
+    pub metadata_provider:
+        Option<&'a dyn crate::metadata::VerifiedContractMetadataProvider>,
 }
 
 #[async_trait::async_trait]
@@ -172,6 +175,9 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
     }
 
     async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
+        use crate::execution::generic_engine::{ResolvedGenericTarget, ResolvedPrice};
+        use crate::execution::generic_semantics::{PriceResolution, SemanticResolution};
+
         let registry = crate::chain::registry::ChainRegistry::builtin();
         let (resolved, runtime) =
             resolve_chain_and_runtime(&registry, &self.plan_args.chain_args, self.config_path)?;
@@ -196,8 +202,16 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
         ) {
             return Ok(Some(Detection {
                 engine: ResolvedEngine::Generic {
-                    fingerprint,
-                    bytecode_hash,
+                    target: ResolvedGenericTarget {
+                        shape: fingerprint.shape,
+                        standard: fingerprint.standard,
+                        token_id: fingerprint.token_id,
+                        price: ResolvedPrice::Fixed(alloy_primitives::U256::from(
+                            fingerprint.price_per_token_wei,
+                        )),
+                        bytecode_hash,
+                        source_label: format!("TrustedRegistry:{}", fingerprint.name),
+                    },
                 },
                 evidence: ProtocolEvidence {
                     source: format!(
@@ -213,11 +227,135 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
             }));
         }
 
-        // No registry match. An operator-declared schema plus ERC-165 is
-        // real evidence of *something* (the operator's intent, and that
-        // the contract implements the claimed NFT standard), but it is
-        // deliberately never enough to authorize a live-send path -- see
-        // this adapter's doc comment.
+        // No registry match. Try verified-source semantic resolution next.
+        if let Some(provider) = self.metadata_provider {
+            let erc721 = crate::protocol::erc_standards::supports_interface(
+                &client,
+                self.plan_args.collection,
+                crate::protocol::erc_standards::ERC721_INTERFACE_ID,
+            )
+            .await?;
+            let erc1155 = if erc721 {
+                false
+            } else {
+                crate::protocol::erc_standards::supports_interface(
+                    &client,
+                    self.plan_args.collection,
+                    crate::protocol::erc_standards::ERC1155_INTERFACE_ID,
+                )
+                .await?
+            };
+            let expected_standard = if erc721 {
+                Some(crate::execution::generic_schema::GenericStandard::Erc721)
+            } else if erc1155 {
+                Some(crate::execution::generic_schema::GenericStandard::Erc1155)
+            } else {
+                None
+            };
+
+            if let Some(standard) = expected_standard {
+                let metadata = provider.fetch(self.plan_args.collection).await.map_err(|e| {
+                    KairoxError::Session(crate::execution::errors::SessionError::new(format!(
+                        "verified-metadata provider {} error: {e}",
+                        provider.name()
+                    )))
+                })?;
+                match crate::execution::generic_semantics::resolve_mint_function(
+                    &metadata, standard,
+                ) {
+                    SemanticResolution::Resolved(r) => {
+                        let price = match r.price {
+                            PriceResolution::Getter { selector, .. } => {
+                                ResolvedPrice::LiveGetter(selector)
+                            }
+                            PriceResolution::Unavailable => {
+                                return Ok(Some(Detection {
+                                    engine: ResolvedEngine::Generic {
+                                        target: ResolvedGenericTarget {
+                                            shape: r.shape,
+                                            standard: r.standard,
+                                            token_id: None,
+                                            price: ResolvedPrice::Fixed(alloy_primitives::U256::ZERO),
+                                            bytecode_hash,
+                                            source_label: "VALUE_UNVERIFIED".to_string(),
+                                        },
+                                    },
+                                    evidence: ProtocolEvidence {
+                                        source: format!(
+                                            "VALUE_UNVERIFIED: {} resolved a mint function ({}) \
+                                             but no unambiguous verified price getter exists; \
+                                             refusing to guess a payable value",
+                                            provider.name(),
+                                            r.evidence
+                                        ),
+                                        confidence: Confidence::Low,
+                                        adapter: "GenericVerifiedContractAdapter",
+                                        matched_interfaces: vec![],
+                                        matched_selectors: vec![],
+                                    },
+                                }));
+                            }
+                        };
+                        return Ok(Some(Detection {
+                            engine: ResolvedEngine::Generic {
+                                target: ResolvedGenericTarget {
+                                    shape: r.shape,
+                                    standard: r.standard,
+                                    token_id: None,
+                                    price,
+                                    bytecode_hash,
+                                    source_label: format!("VerifiedMetadata:{}", provider.name()),
+                                },
+                            },
+                            evidence: ProtocolEvidence {
+                                source: r.evidence,
+                                confidence: Confidence::High,
+                                adapter: "GenericVerifiedContractAdapter",
+                                matched_interfaces: vec![format!("{standard:?}")],
+                                matched_selectors: vec![format!("0x{}", hex::encode(r.selector))],
+                            },
+                        }));
+                    }
+                    SemanticResolution::AmbiguousMintFunction { candidates } => {
+                        return Ok(Some(Detection {
+                            engine: ResolvedEngine::Generic {
+                                target: ResolvedGenericTarget {
+                                    shape: crate::execution::generic_schema::GenericMintShape::MintQuantity,
+                                    standard,
+                                    token_id: None,
+                                    price: ResolvedPrice::Fixed(alloy_primitives::U256::ZERO),
+                                    bytecode_hash,
+                                    source_label: "AMBIGUOUS_MINT_FUNCTION".to_string(),
+                                },
+                            },
+                            evidence: ProtocolEvidence {
+                                source: format!(
+                                    "AMBIGUOUS_MINT_FUNCTION: {} candidate mint functions found \
+                                     ({}); refusing to guess which is authoritative",
+                                    candidates.len(),
+                                    candidates.join(", ")
+                                ),
+                                confidence: Confidence::Low,
+                                adapter: "GenericVerifiedContractAdapter",
+                                matched_interfaces: vec![],
+                                matched_selectors: vec![],
+                            },
+                        }));
+                    }
+                    SemanticResolution::NotFound => {
+                        // Falls through to the operator-schema Low-confidence
+                        // path below.
+                    }
+                }
+            }
+        }
+
+        // No registry match, no verified-source resolution. An
+        // operator-declared schema plus ERC-165 is real evidence of
+        // *something* (the operator's intent, and that the contract
+        // implements the claimed NFT standard), but it is deliberately
+        // never enough to authorize a live-send path -- see this
+        // adapter's doc comment.
         let Some(schema) = self.schema else {
             return Ok(None);
         };
@@ -241,20 +379,14 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
 
         Ok(Some(Detection {
             engine: ResolvedEngine::Generic {
-                // Placeholder, never reachable: this branch always
-                // carries `Confidence::Low`, and the resolver only ever
-                // returns a `High`-confidence detection -- see
-                // `AdapterRegistry::resolve`.
-                fingerprint: crate::execution::generic_registry::TrustedGenericFingerprint {
-                    name: "OPERATOR_DECLARED_UNVERIFIED_SCHEMA",
-                    chain_id: resolved.info.chain_id,
-                    implementation_bytecode_hash: bytecode_hash,
-                    standard: schema.standard,
+                target: ResolvedGenericTarget {
                     shape: schema.shape,
+                    standard: schema.standard,
                     token_id: schema.token_id,
-                    price_per_token_wei: 0,
+                    price: ResolvedPrice::Fixed(alloy_primitives::U256::ZERO),
+                    bytecode_hash,
+                    source_label: "OPERATOR_DECLARED_UNVERIFIED_SCHEMA".to_string(),
                 },
-                bytecode_hash,
             },
             evidence: ProtocolEvidence {
                 source: format!(

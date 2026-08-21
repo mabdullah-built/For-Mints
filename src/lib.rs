@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod execution;
+pub mod metadata;
 pub mod opensea;
 pub mod protocol;
 pub mod signing;

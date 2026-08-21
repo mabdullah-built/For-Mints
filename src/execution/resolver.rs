@@ -64,13 +64,15 @@ pub enum ResolvedEngine {
     },
     /// A generic verified ERC-721/ERC-1155 mint -- only ever produced when
     /// the target's implementation bytecode exactly matched a
-    /// manually-reviewed [`super::generic_registry::TrustedGenericFingerprint`]
-    /// (see `cli::commands::resolver_adapters::GenericVerifiedContractAdapter`).
+    /// manually-reviewed [`super::generic_registry::TrustedGenericFingerprint`],
+    /// or when verified source (via a
+    /// [`crate::metadata::VerifiedContractMetadataProvider`]) semantically
+    /// resolved to exactly one unambiguous mint function (see
+    /// `cli::commands::resolver_adapters::GenericVerifiedContractAdapter`).
     /// An operator-declared `--generic-schema` alone can never produce
     /// this variant -- see `docs/generic-engine.md`'s "Confidence model".
     Generic {
-        fingerprint: super::generic_registry::TrustedGenericFingerprint,
-        bytecode_hash: B256,
+        target: super::generic_engine::ResolvedGenericTarget,
     },
 }
 
