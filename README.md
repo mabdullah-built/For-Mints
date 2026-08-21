@@ -86,6 +86,7 @@ kairox doctor [--json]                 # environment/config/endpoint health chec
 kairox inspect <collection> [--wallet W] [--slug SLUG]
 kairox plan <collection> --wallet W [--json] [--output PATH]
 kairox mint <collection> --wallet W [--send [--yes]] [--json] [--output PATH]
+kairox mint <collection> --wallet W --rehearsal --yes   # PUBLIC engine only, never broadcasts
 kairox mint <collection> --wallet-manifest FILE --send --engine public|opensea
 kairox bench [--chain C]
 kairox init [--path PATH] [--force]
@@ -108,7 +109,7 @@ Builds and prints the authoritative dry-run plan for a public mint: fee recipien
 
 ### `kairox mint <collection> --wallet W`
 
-Dry-run by default (identical output shape to `plan`, for whichever engine `--engine`/`--slug` resolves to). `--send` opts into the live pipeline: a confirmation summary, signing-key load, scheduled pre-signing, identical-raw-transaction broadcast to every send-capable endpoint, and receipt verification. `--json`/`--output PATH` emit a `SessionReport` with a `session_id` generated before any signing.
+Dry-run by default (identical output shape to `plan`, for whichever engine `--engine`/`--slug` resolves to). `--send` opts into the live pipeline: a confirmation summary, signing-key load, scheduled pre-signing, identical-raw-transaction broadcast to every send-capable endpoint, and receipt verification. `--rehearsal` (single-wallet PUBLIC engine only, mutually exclusive with `--send`) runs that exact same live pipeline against real chain state — benchmarking, connection warming, every scheduler checkpoint, a fresh nonce/fee/balance read, real local signing and serialization — and stops immediately before `eth_sendRawTransaction` would be called, so timing and connectivity can be validated with zero possibility of a real transaction. `--json`/`--output PATH` emit a `SessionReport` with a `session_id` generated before any signing.
 
 ### `kairox mint <collection> --wallet-manifest FILE --engine public|opensea --send`
 
@@ -152,6 +153,7 @@ See [docs/security.md](docs/security.md) for the full model: key handling, secre
 - [docs/architecture.md](docs/architecture.md) — module layout, execution pipeline, report schemas
 - [docs/operator-guide.md](docs/operator-guide.md) — a full walkthrough: init → doctor → inspect → plan → mint
 - [docs/robinhood-testnet-validation.md](docs/robinhood-testnet-validation.md) — a noncoder-friendly, copy/paste runbook for a controlled acceptance test on Robinhood Chain Testnet
+- [docs/mainnet-launch-runbook.md](docs/mainnet-launch-runbook.md) — the same, for a real Robinhood Chain mainnet launch, covering PUBLIC/allowlist/FCFS separately
 
 ## Reference material
 
