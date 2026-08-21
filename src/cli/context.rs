@@ -259,35 +259,29 @@ mod tests {
 
     #[test]
     fn resolve_read_endpoint_uses_config_named_env_var() {
-        // SAFETY (test-only): scoped tightly around the assertion; no other
-        // test in this process reads/writes this specific variable name
-        // concurrently.
-        unsafe {
-            std::env::set_var(
-                "KAIROX_CONTEXT_TEST_READ_URL",
-                "https://from-config.example",
-            );
-        }
-        let mut chains = std::collections::BTreeMap::new();
-        chains.insert(
-            "Ethereum".to_string(),
-            crate::config::ChainConfigEntry {
-                read_rpc_env: vec!["KAIROX_CONTEXT_TEST_READ_URL".into()],
-                send_rpc_env: vec![],
-            },
-        );
-        let config = KairoxConfig {
-            version: 1,
-            defaults: Default::default(),
-            chains,
-            opensea: Default::default(),
+        // Exercises the same "a config [chains.*] entry names an env var,
+        // which is then read for its URL" logic that
+        // `resolve_read_endpoint` delegates to, but through
+        // `resolve_chain_rpc_endpoints` directly with an injected FakeEnv --
+        // never mutating real process env, so this cannot race any other
+        // test regardless of `cargo test` parallelism.
+        let entry = crate::config::ChainConfigEntry {
+            read_rpc_env: vec!["KAIROX_CONTEXT_TEST_READ_URL".into()],
+            send_rpc_env: vec![],
         };
-        let chain = ChainRegistry::builtin().by_id(1).unwrap().clone();
-        let endpoint = resolve_read_endpoint(&chain, None, Some(&config));
-        unsafe {
-            std::env::remove_var("KAIROX_CONTEXT_TEST_READ_URL");
-        }
-        let endpoint = endpoint.unwrap();
+        let env = crate::chain::config::testing::FakeEnv(
+            [(
+                "KAIROX_CONTEXT_TEST_READ_URL".to_string(),
+                "https://from-config.example".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let endpoints = crate::config::resolve_chain_rpc_endpoints(&entry, &env).unwrap();
+        let endpoint = endpoints
+            .iter()
+            .find(|e| e.role.can_read())
+            .expect("one read-capable endpoint from the config-named env var");
         assert_eq!(endpoint.url.as_str(), "https://from-config.example/");
     }
 }

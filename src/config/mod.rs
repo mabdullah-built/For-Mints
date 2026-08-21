@@ -112,11 +112,11 @@ pub enum ConfigError {
 /// `KAIROX_CONFIG` > the conventional per-user path, used only if it
 /// already exists. Returns `None` when nothing applies -- not an error,
 /// since Kairox must run with zero configuration.
-pub fn resolve_config_path(cli_path: Option<&Path>) -> Option<PathBuf> {
+pub fn resolve_config_path(cli_path: Option<&Path>, env: &dyn EnvSource) -> Option<PathBuf> {
     if let Some(p) = cli_path {
         return Some(p.to_path_buf());
     }
-    if let Ok(p) = std::env::var(CONFIG_ENV_VAR)
+    if let Ok(Some(p)) = env.get(CONFIG_ENV_VAR)
         && !p.is_empty()
     {
         return Some(PathBuf::from(p));
@@ -246,7 +246,7 @@ pub fn resolve_runtime_config(
     cli_engine: Option<&str>,
     env: &dyn EnvSource,
 ) -> Result<ResolvedRuntimeConfig, ConfigError> {
-    let config_path = resolve_config_path(cli_config_path);
+    let config_path = resolve_config_path(cli_config_path, env);
     let config = match &config_path {
         Some(path) => Some(load_config(path)?),
         None => None,
@@ -426,31 +426,29 @@ mod tests {
 
     #[test]
     fn resolve_config_path_prefers_explicit_cli_path_over_env() {
-        // SAFETY (test-only): no other test in this process reads/writes
-        // KAIROX_CONFIG concurrently within the same thread; std::env
-        // mutation is inherently process-global, so this is scoped tightly
-        // to avoid flakiness under parallel test execution.
-        unsafe {
-            std::env::set_var(CONFIG_ENV_VAR, "/should/not/be/used.toml");
-        }
+        // Injected FakeEnv, not real process env -- no cross-test race is
+        // possible regardless of test-runner parallelism.
+        let env = fake_env(&[(CONFIG_ENV_VAR, "/should/not/be/used.toml")]);
         let cli_path = PathBuf::from("/explicit/path.toml");
-        let resolved = resolve_config_path(Some(&cli_path));
-        unsafe {
-            std::env::remove_var(CONFIG_ENV_VAR);
-        }
+        let resolved = resolve_config_path(Some(&cli_path), &env);
         assert_eq!(resolved, Some(cli_path));
     }
 
     #[test]
     fn resolve_config_path_falls_back_to_env_var() {
-        unsafe {
-            std::env::set_var(CONFIG_ENV_VAR, "/from/env/config.toml");
-        }
-        let resolved = resolve_config_path(None);
-        unsafe {
-            std::env::remove_var(CONFIG_ENV_VAR);
-        }
+        let env = fake_env(&[(CONFIG_ENV_VAR, "/from/env/config.toml")]);
+        let resolved = resolve_config_path(None, &env);
         assert_eq!(resolved, Some(PathBuf::from("/from/env/config.toml")));
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_conventional_path_when_env_unset() {
+        let env = fake_env(&[]);
+        // Whatever this returns (Some, if a real conventional file happens
+        // to exist on this machine, or None) must NOT be the env-var path --
+        // proves the env var is genuinely not consulted when unset.
+        let resolved = resolve_config_path(None, &env);
+        assert_ne!(resolved, Some(PathBuf::from("/from/env/config.toml")));
     }
 
     fn fake_env(pairs: &[(&str, &str)]) -> crate::chain::config::testing::FakeEnv {

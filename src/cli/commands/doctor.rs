@@ -128,7 +128,7 @@ async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
     let opensea_api_key_configured =
         secret_env_var_present(&ProcessEnv, OPENSEA_API_KEY_ENV).unwrap_or(false);
 
-    let resolved_config_path = resolve_config_path(config_path);
+    let resolved_config_path = resolve_config_path(config_path, &ProcessEnv);
     let config_status = match &resolved_config_path {
         None => "not configured".to_string(),
         Some(path) => match crate::config::load_config(path) {

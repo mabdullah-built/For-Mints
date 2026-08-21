@@ -280,7 +280,8 @@ use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
 use alloy_sol_types::SolCall;
 use kairox::protocol::seadrop::{self as sd, MintParams as NormalizedMintParams, PublicDropAbi};
 use kairox::protocol::seadrop_crypto;
-use kairox::signing::signer::{LocalSigner, Signer};
+use kairox::signing::signer::{LocalSigner, Signer, recover_from_prehash};
+use kairox::signing::transaction::{AccessListItem, UnsignedEip1559Tx};
 
 const NFT: Address = address!("000000000000000000000000000000000000c0de");
 
@@ -2671,4 +2672,598 @@ fn opensea_response_with_unsupported_token_gated_selector_is_rejected_before_sig
 
     let received = server.received.lock().unwrap();
     assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
+fn public_mint_response_json(
+    nft_contract: Address,
+    fee_recipient: Address,
+    minter_if_not_payer: Address,
+    quantity: u64,
+    value: U256,
+    chain: &str,
+    to: Address,
+) -> Value {
+    let call = sd::mintPublicCall {
+        nftContract: nft_contract,
+        feeRecipient: fee_recipient,
+        minterIfNotPayer: minter_if_not_payer,
+        quantity: U256::from(quantity),
+    };
+    serde_json::json!({
+        "to": format!("{to:#x}"),
+        "data": format!("0x{}", hex::encode(call.abi_encode())),
+        "value": format!("0x{value:x}"),
+        "chain": chain,
+    })
+}
+
+/// Runs one malicious-response scenario end to end and asserts: the
+/// OpenSea HTTP request genuinely happened, the response was genuinely
+/// parsed (an `eth_call` for other on-chain reads may or may not occur
+/// depending on how early rejection happens), the CLI failed with the
+/// given stderr substring, and zero `eth_sendRawTransaction` occurred.
+fn assert_malicious_opensea_response_rejected(
+    test_label: &'static str,
+    slug: &'static str,
+    response: Value,
+    expected_stderr_substring: &str,
+) {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in {test_label} scenario: {method}"),
+            })
+        },
+        move || rpc_ok_status(response.clone()),
+        slug,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            slug,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            expected_stderr_substring.to_string(),
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received.iter().any(|(m, _)| m.ends_with("/mint")),
+        "[{test_label}] the OpenSea mint request must genuinely have been made"
+    );
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "[{test_label}] a malicious OpenSea response must never reach Ethereum signing"
+    );
+}
+
+#[test]
+fn opensea_response_targeting_wrong_target_address_is_rejected_before_signing() {
+    let not_the_seadrop_contract: Address = address!("00000000000000000000000000000000000bad00");
+    let response = public_mint_response_json(
+        NFT,
+        FEE_RECIPIENT,
+        Address::ZERO,
+        1,
+        U256::ZERO,
+        "ethereum",
+        not_the_seadrop_contract,
+    );
+    assert_malicious_opensea_response_rejected(
+        "wrong-target",
+        "kairox-e2e-malicious-wrong-target",
+        response,
+        "is not a target Kairox can validate",
+    );
+}
+
+#[test]
+fn opensea_response_with_wrong_chain_is_rejected_before_signing() {
+    let response = public_mint_response_json(
+        NFT,
+        FEE_RECIPIENT,
+        Address::ZERO,
+        1,
+        U256::ZERO,
+        "base", // Kairox was asked to mint on chain id 1 (ethereum), not base.
+        SEADROP,
+    );
+    assert_malicious_opensea_response_rejected(
+        "wrong-chain",
+        "kairox-e2e-malicious-wrong-chain",
+        response,
+        "does not match requested chain",
+    );
+}
+
+#[test]
+fn opensea_response_with_wrong_minter_is_rejected_before_signing() {
+    let someone_elses_wallet: Address = address!("0000000000000000000000000000000000005e1f");
+    let response = public_mint_response_json(
+        NFT,
+        FEE_RECIPIENT,
+        someone_elses_wallet, // not zero, not the requested wallet
+        1,
+        U256::ZERO,
+        "ethereum",
+        SEADROP,
+    );
+    assert_malicious_opensea_response_rejected(
+        "wrong-minter",
+        "kairox-e2e-malicious-wrong-minter",
+        response,
+        "does not match the requested wallet",
+    );
+}
+
+#[test]
+fn opensea_response_with_wrong_quantity_is_rejected_before_signing() {
+    let response = public_mint_response_json(
+        NFT,
+        FEE_RECIPIENT,
+        Address::ZERO,
+        2, // CLI was asked to mint 1 (the default --quantity)
+        U256::ZERO,
+        "ethereum",
+        SEADROP,
+    );
+    assert_malicious_opensea_response_rejected(
+        "wrong-quantity",
+        "kairox-e2e-malicious-wrong-quantity",
+        response,
+        "does not match the requested quantity",
+    );
+}
+
+#[test]
+fn opensea_response_with_unsafe_value_exceeding_safety_cap_is_rejected_before_signing() {
+    // Default --max-mint-value-wei is 1e18 (1 ETH); this response claims a
+    // 2 ETH transaction value for an otherwise well-formed public mint.
+    let response = public_mint_response_json(
+        NFT,
+        FEE_RECIPIENT,
+        Address::ZERO,
+        1,
+        U256::from(2_000_000_000_000_000_000u128),
+        "ethereum",
+        SEADROP,
+    );
+    assert_malicious_opensea_response_rejected(
+        "unsafe-value",
+        "kairox-e2e-malicious-unsafe-value",
+        response,
+        "unsafe",
+    );
+}
+
+#[test]
+fn opensea_response_signed_by_an_unauthorized_signer_is_rejected_before_signing() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-unauthorized-signer";
+    const AUTHORIZED_SEED: &str = "kairox-e2e-unauthorized-signer-test-authorized";
+    const UNAUTHORIZED_SEED: &str = "kairox-e2e-unauthorized-signer-test-actual-signer";
+
+    let mint_params = sample_mint_params_abi(true);
+    // A cryptographically VALID EIP-712 signature -- just from a signer the
+    // mocked on-chain state never authorizes. Distinct from the
+    // mutated-signature scenario, which corrupts the bytes themselves;
+    // this proves authorization is checked against the genuinely recovered
+    // signer's address, not merely "does some signature verify."
+    let response =
+        signed_mint_response_json(wallet, mint_params, UNAUTHORIZED_SEED, U256::from(7u64));
+
+    let authorized_signer = LocalSigner::from_bytes(keccak256(AUTHORIZED_SEED.as_bytes()).0)
+        .unwrap()
+        .address();
+    let zero_sentinel = sd::SignedMintValidationParamsAbi {
+        minMintPrice: alloy_primitives::Uint::from(0u64),
+        maxMaxTotalMintableByWallet: alloy_primitives::Uint::from(0u64),
+        minStartTime: alloy_primitives::Uint::from(0u64),
+        maxEndTime: alloy_primitives::Uint::from(0u64),
+        maxMaxTokenSupplyForStage: alloy_primitives::Uint::from(0u64),
+        minFeeBps: 0,
+        maxFeeBps: 0,
+    };
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| {
+            if method == "eth_call" {
+                let data = params
+                    .get(0)
+                    .and_then(|c| c.get("data"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x");
+                let val_sel = format!(
+                    "0x{}",
+                    hex::encode(sd::getSignedMintValidationParamsCall::SELECTOR)
+                );
+                if data.starts_with(&val_sel) {
+                    let queried_signer = decode_single_address_arg(data);
+                    let params_to_return = if queried_signer == authorized_signer {
+                        permissive_signed_mint_validation_params()
+                    } else {
+                        zero_sentinel.clone()
+                    };
+                    return rpc_ok(validation_params_hex(params_to_return));
+                }
+                let fee_sel = format!(
+                    "0x{}",
+                    hex::encode(sd::getFeeRecipientIsAllowedCall::SELECTOR)
+                );
+                if data.starts_with(&fee_sel) {
+                    return rpc_ok(fee_recipient_allowed_hex(true));
+                }
+            }
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in unauthorized-signer scenario: {method}"),
+            })
+        },
+        move || rpc_ok_status(response.clone()),
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--send",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not an authorized signer"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an unauthorized (but validly-signing) signer must never reach Ethereum signing"
+    );
+}
+
+// =======================================================================
+// Multi-wallet uncertain-send + out-of-order completion (Phase 6 Sections
+// 13/24): every case decodes the REAL raw signed transaction bytes
+// `eth_sendRawTransaction` received and cryptographically recovers the
+// actual sending wallet from its signature -- never inferred from request
+// order, which is not guaranteed under real concurrent dispatch.
+// =======================================================================
+
+/// The RLP field layout `SignedEip1559Tx::raw_bytes` produces (see
+/// `kairox::signing::transaction`), decodable here since that module's
+/// own decodable mirror struct is private to it.
+#[derive(alloy_rlp::RlpDecodable)]
+struct DecodedSignedTxFields {
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    gas_limit: u64,
+    to: Address,
+    value: U256,
+    data: Bytes,
+    access_list: Vec<AccessListItem>,
+    y_parity: u64,
+    r: U256,
+    s: U256,
+}
+
+/// Decode a real raw signed EIP-1559 transaction (as received by
+/// `eth_sendRawTransaction`) and cryptographically recover the address
+/// that actually signed it -- the only trustworthy way to know which
+/// manifest wallet a given broadcast request belongs to, since concurrent
+/// multi-wallet dispatch gives no ordering or connection-identity
+/// guarantee.
+fn decode_raw_tx_sender(raw_hex: &str) -> Address {
+    let bytes = hex::decode(raw_hex.trim_start_matches("0x")).expect("valid raw tx hex");
+    assert_eq!(
+        bytes[0], 0x02,
+        "expected an EIP-1559 (type 0x02) transaction"
+    );
+    let mut body = &bytes[1..];
+    let decoded: DecodedSignedTxFields =
+        alloy_rlp::Decodable::decode(&mut body).expect("valid RLP-encoded signed tx body");
+
+    let unsigned = UnsignedEip1559Tx {
+        chain_id: decoded.chain_id,
+        nonce: decoded.nonce,
+        max_priority_fee_per_gas: decoded.max_priority_fee_per_gas,
+        max_fee_per_gas: decoded.max_fee_per_gas,
+        gas_limit: decoded.gas_limit,
+        to: decoded.to,
+        value: decoded.value,
+        data: decoded.data,
+        access_list: decoded.access_list,
+    };
+    let signing_hash = unsigned.signing_hash();
+
+    let mut sig65 = [0u8; 65];
+    sig65[0..32].copy_from_slice(&decoded.r.to_be_bytes::<32>());
+    sig65[32..64].copy_from_slice(&decoded.s.to_be_bytes::<32>());
+    sig65[64] = decoded.y_parity as u8;
+
+    recover_from_prehash(signing_hash, &sig65).expect("valid ECDSA signature recovers a sender")
+}
+
+#[test]
+fn multi_wallet_uncertain_send_isolates_exactly_the_uncertain_wallet() {
+    let signer_a = signer_for_seed("kairox-e2e-uncertain-multi-a");
+    let signer_b = signer_for_seed("kairox-e2e-uncertain-multi-b");
+    let signer_c = signer_for_seed("kairox-e2e-uncertain-multi-c");
+    let wallet_a = signer_a.address();
+    let wallet_b = signer_b.address();
+    let wallet_c = signer_c.address();
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_manifest(
+        dir.path(),
+        &[
+            (wallet_a, 1, "wallet-a", "E2E_UNCERTAIN_KEY_A"),
+            (wallet_b, 1, "wallet-b", "E2E_UNCERTAIN_KEY_B"),
+            (wallet_c, 1, "wallet-c", "E2E_UNCERTAIN_KEY_C"),
+        ],
+    );
+
+    // Track exactly one send attempt per wallet, so a bug that retried or
+    // resent wallet B's transaction (a second signature, a replacement, a
+    // same-nonce altered transaction) would be caught here even though the
+    // process only observes the connection close, not a "no" answer.
+    let sends_by_wallet: Arc<Mutex<std::collections::HashMap<Address, u32>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let sends_by_wallet_for_handler = sends_by_wallet.clone();
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => {
+            let raw_hex = params.get(0).and_then(Value::as_str).unwrap_or("0x");
+            let sender = decode_raw_tx_sender(raw_hex);
+            *sends_by_wallet_for_handler
+                .lock()
+                .unwrap()
+                .entry(sender)
+                .or_insert(0) += 1;
+            if sender == wallet_b {
+                // The full raw transaction has already been read by this
+                // point (decode_raw_tx_sender only works on bytes actually
+                // received) -- now simulate a node that accepted the bytes
+                // and then vanished before answering.
+                Behavior::CloseWithoutResponding
+            } else {
+                echo_tx_hash_behavior(params)
+            }
+        }
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [
+                    transfer_log_for(wallet_a, 201),
+                    transfer_log_for(wallet_c, 203),
+                ],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in uncertain-multi scenario: {method}"),
+        }),
+    });
+
+    let key_a = signing_key_hex_for_seed("kairox-e2e-uncertain-multi-a");
+    let key_b = signing_key_hex_for_seed("kairox-e2e-uncertain-multi-b");
+    let key_c = signing_key_hex_for_seed("kairox-e2e-uncertain-multi-c");
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("E2E_UNCERTAIN_KEY_A", &key_a)
+        .env("E2E_UNCERTAIN_KEY_B", &key_b)
+        .env("E2E_UNCERTAIN_KEY_C", &key_c)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet-manifest",
+            manifest_path.to_str().unwrap(),
+            "--engine",
+            "public",
+            "--send",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout must be exactly one JSON line");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON");
+    let wallets = parsed["wallets"].as_array().unwrap();
+    assert_eq!(wallets.len(), 3);
+    // Manifest order preserved regardless of which wallet was uncertain.
+    assert_eq!(wallets[0]["label"], "wallet-a");
+    assert_eq!(wallets[1]["label"], "wallet-b");
+    assert_eq!(wallets[2]["label"], "wallet-c");
+
+    assert_eq!(wallets[0]["state"], "CONFIRMED_SUCCESS");
+    assert_eq!(wallets[1]["state"], "UNCERTAIN");
+    assert_eq!(wallets[1]["error_code"], "BROADCAST_UNCERTAIN");
+    assert_eq!(wallets[2]["state"], "CONFIRMED_SUCCESS");
+
+    let sends = sends_by_wallet.lock().unwrap();
+    assert_eq!(
+        *sends.get(&wallet_b).unwrap_or(&0),
+        1,
+        "wallet B must have been sent exactly once -- no retry, no replacement, no second signature"
+    );
+    assert_eq!(*sends.get(&wallet_a).unwrap_or(&0), 1);
+    assert_eq!(*sends.get(&wallet_c).unwrap_or(&0), 1);
+}
+
+#[test]
+fn multi_wallet_out_of_order_completion_still_reports_manifest_order() {
+    let signer_a = signer_for_seed("kairox-e2e-reorder-multi-a");
+    let signer_b = signer_for_seed("kairox-e2e-reorder-multi-b");
+    let signer_c = signer_for_seed("kairox-e2e-reorder-multi-c");
+    let wallet_a = signer_a.address();
+    let wallet_b = signer_b.address();
+    let wallet_c = signer_c.address();
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = write_manifest(
+        dir.path(),
+        &[
+            (wallet_a, 1, "wallet-a", "E2E_REORDER_KEY_A"),
+            (wallet_b, 1, "wallet-b", "E2E_REORDER_KEY_B"),
+            (wallet_c, 1, "wallet-c", "E2E_REORDER_KEY_C"),
+        ],
+    );
+
+    // Track the order in which sends actually reached the server (by real
+    // wallet identity, cryptographically recovered) -- then deliberately
+    // delay responding to whichever send arrives *first* and *second* so
+    // the real completion order is forced to differ from manifest order
+    // (A, B, C): C's send is answered immediately, then B, then A last,
+    // producing a genuine completion order of roughly C, B, A.
+    let completion_order: Arc<Mutex<Vec<Address>>> = Arc::new(Mutex::new(Vec::new()));
+    let completion_order_for_handler = completion_order.clone();
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => {
+            let raw_hex = params.get(0).and_then(Value::as_str).unwrap_or("0x");
+            let sender = decode_raw_tx_sender(raw_hex);
+            // Stagger responses so wallet A (first in manifest order) is
+            // deliberately the slowest to actually get its HTTP response,
+            // forcing the real *completion* order away from manifest
+            // order -- recorded below, AFTER the stagger, since it is the
+            // order responses are actually sent back that must differ
+            // from manifest order for this test to be meaningful (the
+            // order requests *arrive in* is expected to already roughly
+            // match manifest order, since that's dispatch/connect order,
+            // not completion order).
+            // Margins are wide (not just "a few ms") deliberately: under
+            // `cargo test`'s default parallelism, many other tests' OS
+            // threads compete for CPU at the same time, and a narrow
+            // margin was observed to occasionally not reorder completion
+            // at all under that contention.
+            if sender == wallet_a {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            } else if sender == wallet_b {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            completion_order_for_handler.lock().unwrap().push(sender);
+            echo_tx_hash_behavior(params)
+        }
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [
+                    transfer_log_for(wallet_a, 301),
+                    transfer_log_for(wallet_b, 302),
+                    transfer_log_for(wallet_c, 303),
+                ],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in out-of-order scenario: {method}"),
+        }),
+    });
+
+    let key_a = signing_key_hex_for_seed("kairox-e2e-reorder-multi-a");
+    let key_b = signing_key_hex_for_seed("kairox-e2e-reorder-multi-b");
+    let key_c = signing_key_hex_for_seed("kairox-e2e-reorder-multi-c");
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("E2E_REORDER_KEY_A", &key_a)
+        .env("E2E_REORDER_KEY_B", &key_b)
+        .env("E2E_REORDER_KEY_C", &key_c)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet-manifest",
+            manifest_path.to_str().unwrap(),
+            "--engine",
+            "public",
+            "--send",
+            "--yes",
+            "--json",
+            "--broadcast-concurrency",
+            "3",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "stdout must be exactly one JSON line");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON");
+    let wallets = parsed["wallets"].as_array().unwrap();
+    assert_eq!(wallets.len(), 3);
+
+    // The SessionReport must stay in manifest order (A, B, C) no matter
+    // what real completion order the server observed.
+    assert_eq!(wallets[0]["label"], "wallet-a");
+    assert_eq!(wallets[1]["label"], "wallet-b");
+    assert_eq!(wallets[2]["label"], "wallet-c");
+    for w in wallets {
+        assert_eq!(
+            w["state"], "CONFIRMED_SUCCESS",
+            "wallet {w:?} did not confirm"
+        );
+    }
+
+    let order = completion_order.lock().unwrap();
+    assert_eq!(
+        order.len(),
+        3,
+        "all three wallets must have genuinely reached eth_sendRawTransaction"
+    );
+    assert_ne!(
+        *order,
+        vec![wallet_a, wallet_b, wallet_c],
+        "this test is only meaningful if real dispatch/response order actually differed from \
+         manifest order -- if it didn't, the staggered delays above need adjusting, not the \
+         report-ordering assertion above"
+    );
 }
