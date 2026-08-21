@@ -1,0 +1,18 @@
+[profile.default]
+src = "src"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.17"
+optimizer = true
+optimizer_runs = 200
+
+remappings = [
+    "seadrop/=lib/seadrop/src/",
+    "openzeppelin-contracts/=lib/seadrop/lib/openzeppelin-contracts/",
+]
+
+# No default RPC endpoints are configured here on purpose -- every command
+# in the runbook passes --rpc-url explicitly (from the operator's own
+# KAIROX_RPC_46630_0_URL), so there is no config-file default that could
+# silently point at the wrong network.

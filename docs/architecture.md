@@ -75,3 +75,5 @@ Retry policy is bounded and explicit everywhere it exists, never silent/unbounde
 ## Recovery utilities
 
 `.research/nft-public-mint` and `.research/osnm-z` are read-only reference implementations, used only to cross-check protocol behavior against real source when something in the SeaDrop/OpenSea integration needed independent verification (e.g. the EIP-712 domain, the exact allow-list leaf encoding, the aggregate-supply query safety argument in the security doc). Nothing in `src/` depends on them at build or run time, and `git diff -- .research` is expected to always be empty.
+
+`testnet-lab/robinhood-testnet` is a separate, standalone Foundry project (its own `foundry.toml`/`lib/`) for deploying a disposable SeaDrop test collection on Robinhood Chain Testnet for acceptance testing -- it is not a Rust crate, is not part of the Cargo workspace, and nothing in `src/` depends on it at build or run time either. See [docs/robinhood-testnet-validation.md](robinhood-testnet-validation.md).

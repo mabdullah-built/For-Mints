@@ -8,3 +8,10 @@ node_modules/
 dist/
 coverage/
 /target/
+
+# Foundry build/dependency artifacts for testnet-lab/ -- forge install/build
+# output, never committed; the lab's source files are.
+testnet-lab/**/lib/
+testnet-lab/**/out/
+testnet-lab/**/cache/
+testnet-lab/**/broadcast/
