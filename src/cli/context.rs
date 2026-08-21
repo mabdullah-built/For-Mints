@@ -19,15 +19,15 @@ pub struct ResolvedChain {
     pub seadrop_contract: alloy_primitives::Address,
 }
 
-/// Resolve a chain (by name or numeric id) and its SeaDrop contract against
-/// the built-in chain registry. `chain` is expected to already be the
-/// fully precedence-resolved value (see [`resolve_chain_and_runtime`]).
-pub fn resolve_chain(
-    registry: &ChainRegistry,
-    chain: &str,
-    seadrop_override: Option<alloy_primitives::Address>,
-) -> Result<ResolvedChain, KairoxError> {
-    let info = if let Ok(id) = chain.parse::<u64>() {
+/// Resolve a chain (by name or numeric id) against the built-in chain
+/// registry only -- no SeaDrop contract requirement. `chain` is expected to
+/// already be the fully precedence-resolved value (see
+/// [`resolve_chain_and_runtime`]). This is the part of chain resolution
+/// every command needs, regardless of whether it ever touches SeaDrop
+/// (e.g. `bench`, which only measures RPC endpoints); [`resolve_chain`]
+/// layers the SeaDrop requirement on top of this for commands that do.
+pub fn resolve_chain_info(registry: &ChainRegistry, chain: &str) -> Result<ChainInfo, KairoxError> {
+    if let Ok(id) = chain.parse::<u64>() {
         registry.by_id(id)
     } else {
         registry.by_name(chain)
@@ -44,7 +44,23 @@ pub fn resolve_chain(
                 .collect::<Vec<_>>()
                 .join(", ")
         )))
-    })?;
+    })
+}
+
+/// Resolve a chain (by name or numeric id) and its SeaDrop contract against
+/// the built-in chain registry. `chain` is expected to already be the
+/// fully precedence-resolved value (see [`resolve_chain_and_runtime`]).
+/// Fails closed when the chain has no compiled default SeaDrop address and
+/// none was given explicitly -- e.g. a testnet with no independently
+/// verified SeaDrop deployment (see `chain::registry`'s
+/// `default_seadrop_address` docs). Use [`resolve_chain_info`] instead for
+/// a command that never actually needs a SeaDrop contract.
+pub fn resolve_chain(
+    registry: &ChainRegistry,
+    chain: &str,
+    seadrop_override: Option<alloy_primitives::Address>,
+) -> Result<ResolvedChain, KairoxError> {
+    let info = resolve_chain_info(registry, chain)?;
 
     let seadrop_contract = seadrop_override
         .or(info.default_seadrop_address)
@@ -79,6 +95,26 @@ pub fn resolve_chain_and_runtime(
     )?;
     let resolved = resolve_chain(registry, &runtime.chain, chain_args.seadrop_contract)?;
     Ok((resolved, runtime))
+}
+
+/// Same precedence resolution as [`resolve_chain_and_runtime`], but for a
+/// command (e.g. `bench`) that never needs a SeaDrop contract -- so a chain
+/// with no compiled default SeaDrop address (and no `--seadrop-contract`
+/// override, which would be meaningless here anyway) still resolves
+/// successfully.
+pub fn resolve_chain_info_and_runtime(
+    registry: &ChainRegistry,
+    chain_args: &ChainArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(ChainInfo, ResolvedRuntimeConfig), KairoxError> {
+    let runtime = crate::config::resolve_runtime_config(
+        config_path,
+        chain_args.chain.as_deref(),
+        None,
+        &ProcessEnv,
+    )?;
+    let info = resolve_chain_info(registry, &runtime.chain)?;
+    Ok((info, runtime))
 }
 
 /// Resolve which RPC endpoint to use for reads, in priority order: an

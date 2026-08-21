@@ -7,7 +7,7 @@ use crate::chain::endpoint::RpcEndpoint;
 use crate::chain::pool::RpcPool;
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::BenchArgs;
-use crate::cli::context::resolve_chain_and_runtime;
+use crate::cli::context::resolve_chain_info_and_runtime;
 use crate::cli::format::{format_benchmark_report, mask_url};
 use crate::execution::errors::KairoxError;
 use crate::execution::profile::ExecutionProfile;
@@ -17,7 +17,8 @@ pub async fn run(
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
     let registry = ChainRegistry::builtin();
-    let (resolved, runtime) = resolve_chain_and_runtime(&registry, &args.chain_args, config_path)?;
+    let (resolved, runtime) =
+        resolve_chain_info_and_runtime(&registry, &args.chain_args, config_path)?;
 
     let endpoints: Vec<RpcEndpoint> = if let Some(url) = &args.chain_args.rpc_url {
         vec![RpcEndpoint::new(
@@ -25,36 +26,34 @@ pub async fn run(
             crate::chain::endpoint::EndpointRole::ReadWrite,
         )]
     } else {
-        let from_config = crate::cli::context::config_endpoints_for_chain(
-            &resolved.info,
-            runtime.config.as_ref(),
-        );
+        let from_config =
+            crate::cli::context::config_endpoints_for_chain(&resolved, runtime.config.as_ref());
         if !from_config.is_empty() {
             from_config
         } else {
-            load_chain_endpoints(&ProcessEnv, resolved.info.chain_id)?.endpoints
+            load_chain_endpoints(&ProcessEnv, resolved.chain_id)?.endpoints
         }
     };
 
     println!(
         "Benchmarking {} endpoint(s) on {} (chain id {})",
         endpoints.len(),
-        resolved.info.name,
-        resolved.info.chain_id
+        resolved.name,
+        resolved.chain_id
     );
     if endpoints.is_empty() {
         println!(
             "No endpoints configured. Set KAIROX_RPC_{}_0_URL or pass --rpc-url.",
-            resolved.info.chain_id
+            resolved.chain_id
         );
         return Ok(());
     }
 
     // BENCHMARK/WARM: connecting is the pre-warm step; benchmark_all takes
     // the bounded, repeated read-latency samples on top of it.
-    let (mut pool, reports) = RpcPool::connect_all(resolved.info.chain_id, &endpoints).await;
+    let (mut pool, reports) = RpcPool::connect_all(resolved.chain_id, &endpoints).await;
 
-    let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
+    let profile = ExecutionProfile::for_chain(resolved.chain_id);
     let mut benchmark_config = profile.benchmark_policy;
     if let Some(samples) = args.samples {
         benchmark_config.sample_count = samples;
@@ -117,7 +116,7 @@ pub async fn run(
                 let selected_send = selected_send_ptrs.contains(&client_ptr);
                 let block = format_benchmark_report(
                     &masked_url,
-                    resolved.info.chain_id,
+                    resolved.chain_id,
                     bench,
                     selected_read,
                     selected_send,

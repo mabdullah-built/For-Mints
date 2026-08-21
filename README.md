@@ -10,13 +10,16 @@ Kairox does not fund wallets, generate wallets, sweep/withdraw funds, sponsor ga
 
 ## Supported chains
 
-| Chain | Chain ID |
-|---|---|
-| Ethereum | 1 |
-| Base | 8453 |
-| Robinhood Chain | 4663 |
+| Chain | Chain ID | Aliases | Default SeaDrop address |
+|---|---|---|---|
+| Ethereum | 1 | | the SeaDrop 1.0 singleton |
+| Base | 8453 | | the SeaDrop 1.0 singleton |
+| Robinhood Chain | 4663 | | the SeaDrop 1.0 singleton |
+| Robinhood Chain Testnet | 46630 | `robinhood-testnet`, `rh-testnet` | none -- `--seadrop-contract` is required |
 
-Any other chain works too if you pass `--seadrop-contract` explicitly (Kairox only ships a default SeaDrop address for the three above).
+Robinhood Chain Testnet deliberately has **no** compiled default SeaDrop address: no genuine SeaDrop deployment there has been independently verified, so Kairox refuses to guess one. Every SeaDrop operation on that chain requires an explicit `--seadrop-contract 0x...`. See [docs/robinhood-testnet-validation.md](docs/robinhood-testnet-validation.md) for a full acceptance-test runbook.
+
+Any other chain works too if you pass `--seadrop-contract` explicitly (Kairox only ships a default SeaDrop address for the chains marked above).
 
 ## Supported mint paths
 
@@ -148,6 +151,7 @@ See [docs/security.md](docs/security.md) for the full model: key handling, secre
 - [docs/security.md](docs/security.md) — key handling, redaction, uncertain-broadcast policy, receipt truth, privacy
 - [docs/architecture.md](docs/architecture.md) — module layout, execution pipeline, report schemas
 - [docs/operator-guide.md](docs/operator-guide.md) — a full walkthrough: init → doctor → inspect → plan → mint
+- [docs/robinhood-testnet-validation.md](docs/robinhood-testnet-validation.md) — a noncoder-friendly, copy/paste runbook for a controlled acceptance test on Robinhood Chain Testnet
 
 ## Reference material
 

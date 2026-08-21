@@ -3267,3 +3267,159 @@ fn multi_wallet_out_of_order_completion_still_reports_manifest_order() {
          report-ordering assertion above"
     );
 }
+
+// =======================================================================
+// Robinhood Chain Testnet enablement: chain id 46630 must appear
+// separately from Robinhood Chain mainnet (4663) in real CLI output, and
+// chain-id mismatch protection must apply to it exactly like every other
+// chain -- no special-cased fallback to 4663.
+// =======================================================================
+
+#[test]
+fn doctor_json_shows_robinhood_testnet_separately_from_mainnet() {
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let parsed = assert_stdout_is_exactly_one_json_object(&assert.get_output().stdout);
+    let chains = parsed["chains"].as_array().unwrap();
+
+    let mainnet = chains
+        .iter()
+        .find(|c| c["chain_id"] == 4663)
+        .expect("Robinhood Chain mainnet must be listed");
+    assert_eq!(mainnet["name"], "Robinhood Chain");
+
+    let testnet = chains
+        .iter()
+        .find(|c| c["chain_id"] == 46630)
+        .expect("Robinhood Chain Testnet must be listed");
+    assert_eq!(testnet["name"], "Robinhood Chain Testnet");
+    assert_ne!(mainnet["name"], testnet["name"]);
+    assert_ne!(mainnet["chain_id"], testnet["chain_id"]);
+}
+
+#[test]
+fn doctor_json_connects_both_robinhood_testnet_endpoints_with_the_documented_env_vars() {
+    // Exactly the two-endpoint configuration documented for operators:
+    // a READ_WRITE public RPC and a SEQUENCER endpoint.
+    let public_server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0xb626")),
+        "eth_blockNumber" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+    let sequencer_server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0xb626")),
+        "eth_blockNumber" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_46630_0_URL", public_server.url())
+        .env("KAIROX_RPC_46630_0_ROLE", "READ_WRITE")
+        .env("KAIROX_RPC_46630_0_LABEL", "robinhood-testnet-public")
+        .env("KAIROX_RPC_46630_1_URL", sequencer_server.url())
+        .env("KAIROX_RPC_46630_1_ROLE", "SEQUENCER")
+        .env("KAIROX_RPC_46630_1_LABEL", "robinhood-testnet-sequencer")
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let parsed = assert_stdout_is_exactly_one_json_object(&assert.get_output().stdout);
+    let chains = parsed["chains"].as_array().unwrap();
+    let testnet = chains
+        .iter()
+        .find(|c| c["chain_id"] == 46630)
+        .expect("Robinhood Chain Testnet must be listed");
+    assert_eq!(testnet["endpoint_count"], 2);
+    assert_eq!(testnet["connected_count"], 2);
+    let details = testnet["endpoint_details"].as_array().unwrap();
+    let joined = details
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("robinhood-testnet-public"));
+    assert!(joined.contains("robinhood-testnet-sequencer"));
+}
+
+#[test]
+fn bench_chain_46630_connects_to_a_real_local_endpoint_reporting_the_right_chain_id() {
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0xb626")), // 46630 in hex
+        "eth_blockNumber" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_46630_0_URL", server.url())
+        .args(["bench", "--chain", "46630"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Robinhood Chain Testnet"))
+        .stdout(predicates::str::contains("chain id 46630"))
+        .stdout(predicates::str::contains("1 of 1 endpoints connected"));
+}
+
+#[test]
+fn bench_chain_robinhood_dash_testnet_alias_resolves_the_same_as_46630() {
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0xb626")),
+        "eth_blockNumber" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_46630_0_URL", server.url())
+        .args(["bench", "--chain", "robinhood-testnet"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Robinhood Chain Testnet"))
+        .stdout(predicates::str::contains("chain id 46630"));
+}
+
+#[test]
+fn bench_chain_46630_fails_closed_when_the_endpoint_actually_reports_4663() {
+    // A real localhost endpoint that (mistakenly, or as a misconfigured
+    // testnet operator error) reports Robinhood Chain MAINNET's id (4663)
+    // when Kairox asked for Robinhood Chain TESTNET (46630). This must be
+    // reported as a wrong-chain endpoint, never silently accepted and
+    // never silently treated as a fallback to 4663.
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1237")), // 4663 in hex
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_46630_0_URL", server.url())
+        .args(["bench", "--chain", "46630"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("WRONG_CHAIN"))
+        .stdout(predicates::str::contains("expected=46630"))
+        .stdout(predicates::str::contains("reported=4663"))
+        .stdout(predicates::str::contains("0 of 1 endpoints connected"));
+}
