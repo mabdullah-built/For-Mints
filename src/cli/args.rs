@@ -294,15 +294,19 @@ pub struct WatchArgs {
     /// Preferred fee recipient address. Must be in the allowed set if the drop restricts fee recipients.
     #[arg(long)]
     pub fee_recipient: Option<Address>,
-    /// Maximum acceptable total mint value, in wei (decimal). Checked before signing.
-    #[arg(long, default_value = "1000000000000000000")]
-    pub max_mint_value_wei: String,
-    /// Maximum acceptable worst-case gas cost, in wei (decimal).
-    #[arg(long, default_value = "1000000000000000000")]
-    pub max_gas_cost_wei: String,
-    /// Maximum acceptable worst-case total spend (mint value + gas cost), in wei (decimal).
-    #[arg(long, default_value = "2000000000000000000")]
-    pub max_total_spend_wei: String,
+    /// Maximum acceptable total mint value, in wei (decimal). No default --
+    /// `watch --auto-send` refuses to run without an explicit value (pass
+    /// "0" for an explicitly-confirmed free mint).
+    #[arg(long)]
+    pub max_mint_value_wei: Option<String>,
+    /// Maximum acceptable worst-case gas cost, in wei (decimal). No default,
+    /// same reasoning as `--max-mint-value-wei`.
+    #[arg(long)]
+    pub max_gas_cost_wei: Option<String>,
+    /// Maximum acceptable worst-case total spend (mint value + gas cost), in
+    /// wei (decimal). No default, same reasoning as `--max-mint-value-wei`.
+    #[arg(long)]
+    pub max_total_spend_wei: Option<String>,
     /// Multiplier applied to the RPC's gas estimate to derive the gas limit used in worst-case calculations.
     #[arg(long, default_value_t = 1.25)]
     pub gas_buffer_multiplier: f64,
@@ -317,8 +321,18 @@ pub struct WatchArgs {
     #[arg(long, default_value_t = 60)]
     pub poll_interval_secs: u64,
     /// A TOML watchlist of multiple targets. Mutually exclusive with
-    /// providing a single collection/--wallet directly. See
-    /// docs/watch.md for the schema.
+    /// providing a single collection/--wallet directly. Every entry must
+    /// declare its own explicit spend caps -- see docs/watch.md for the
+    /// schema.
     #[arg(long, conflicts_with_all = ["wallet"])]
     pub manifest: Option<std::path::PathBuf>,
+    /// Maximum number of watchlist targets prepared/probed/broadcast
+    /// concurrently. Only meaningful with --manifest (a single target has
+    /// no concurrency to bound).
+    #[arg(long, default_value_t = 5)]
+    pub max_concurrent_targets: usize,
+    /// Emit a single JSON object per target on stdout instead of
+    /// human-readable text on stderr.
+    #[arg(long)]
+    pub json: bool,
 }

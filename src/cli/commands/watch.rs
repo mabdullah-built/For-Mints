@@ -14,13 +14,16 @@ use std::path::Path;
 use std::time::Duration as StdDuration;
 
 use alloy_primitives::Address;
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime};
 
 use crate::chain::config::ProcessEnv;
 use crate::chain::registry::ChainRegistry;
 use crate::cli::args::{ChainArgs, EngineSelection, PlanArgs, WatchArgs};
-use crate::cli::commands::mint::{connect_send_pool, load_opensea_client, print_broadcast_result};
+use crate::cli::commands::mint::{
+    connect_send_pool, emit_report, load_opensea_client, print_broadcast_result,
+};
 use crate::cli::commands::plan::build_mint_plan;
 use crate::cli::context::resolve_chain_and_runtime;
 use crate::cli::format::{format_unix, parse_wei};
@@ -78,6 +81,40 @@ impl WatchTarget {
     }
 }
 
+/// `watch --auto-send` must never fall back to a permissive monetary
+/// default -- checked before chain resolution, signing-key load, or any
+/// network activity at all, for every target (single or manifest).
+fn require_explicit_caps(
+    label: &str,
+    max_mint_value_wei: &Option<String>,
+    max_gas_cost_wei: &Option<String>,
+    max_total_spend_wei: &Option<String>,
+) -> Result<(), KairoxError> {
+    let mut missing = Vec::new();
+    if max_mint_value_wei.is_none() {
+        missing.push("--max-mint-value-wei");
+    }
+    if max_gas_cost_wei.is_none() {
+        missing.push("--max-gas-cost-wei");
+    }
+    if max_total_spend_wei.is_none() {
+        missing.push("--max-total-spend-wei");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::MissingSpendCaps,
+            format!(
+                "{label} is missing explicit spend cap(s): {}. watch --auto-send never assumes \
+                 a permissive default for unattended broadcast -- pass all three explicitly \
+                 (use \"0\" for a mint you have explicitly confirmed is free).",
+                missing.join(", ")
+            ),
+        )))
+    }
+}
+
 pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), KairoxError> {
     if !args.auto_send {
         return Err(KairoxError::Session(SessionError::new(
@@ -91,6 +128,12 @@ pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), Kair
     let targets = if let Some(manifest_path) = &args.manifest {
         load_manifest(manifest_path)?
     } else {
+        require_explicit_caps(
+            "this watch invocation",
+            &args.max_mint_value_wei,
+            &args.max_gas_cost_wei,
+            &args.max_total_spend_wei,
+        )?;
         let collection = args.collection.ok_or_else(|| {
             KairoxError::Session(SessionError::new(
                 "a collection address is required unless --manifest is used",
@@ -109,9 +152,18 @@ pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), Kair
             quantity: args.quantity,
             engine: args.engine,
             fee_recipient: args.fee_recipient,
-            max_mint_value_wei: args.max_mint_value_wei.clone(),
-            max_gas_cost_wei: args.max_gas_cost_wei.clone(),
-            max_total_spend_wei: args.max_total_spend_wei.clone(),
+            max_mint_value_wei: args
+                .max_mint_value_wei
+                .clone()
+                .expect("checked by require_explicit_caps above"),
+            max_gas_cost_wei: args
+                .max_gas_cost_wei
+                .clone()
+                .expect("checked by require_explicit_caps above"),
+            max_total_spend_wei: args
+                .max_total_spend_wei
+                .clone()
+                .expect("checked by require_explicit_caps above"),
             gas_buffer_multiplier: args.gas_buffer_multiplier,
         }]
     };
@@ -123,15 +175,24 @@ pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), Kair
     }
 
     let poll_interval = StdDuration::from_secs(args.poll_interval_secs.max(1));
+    let concurrency = args.max_concurrent_targets.max(1);
+    let json = args.json;
 
     // Every target's watch is independent (own chain connection, own
     // signer-address check, own stage/eligibility state) and none of them
-    // shares mutable state, so a manifest with multiple entries runs them
-    // concurrently rather than serially waiting on each in turn.
-    let futures = targets
-        .into_iter()
-        .map(|target| run_single_target(target, poll_interval, config_path));
-    let results = futures_util::future::join_all(futures).await;
+    // shares mutable state, so a manifest with multiple entries can run
+    // concurrently rather than serially waiting on each in turn -- but
+    // bounded, via the same `stream::iter(...).buffered(n)` pattern
+    // `execution::multi_wallet` uses, never an unbounded `join_all` over an
+    // arbitrarily large manifest and never a detached task.
+    let results: Vec<Result<(), KairoxError>> = stream::iter(
+        targets
+            .into_iter()
+            .map(|target| run_single_target(target, poll_interval, config_path, json)),
+    )
+    .buffered(concurrency)
+    .collect()
+    .await;
 
     let mut first_err = None;
     for result in results {
@@ -177,6 +238,7 @@ async fn run_single_target(
     target: WatchTarget,
     poll_interval: StdDuration,
     config_path: Option<&Path>,
+    json: bool,
 ) -> Result<(), KairoxError> {
     eprintln!(
         "=== watch target: collection={} wallet={} ===",
@@ -190,10 +252,16 @@ async fn run_single_target(
 
     // Fail fast, before any waiting: an unattended multi-day wait that ends
     // in a signing-key/wallet mismatch would waste the entire wait for
-    // nothing.
-    let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
+    // nothing. `allow_interactive = false` is deliberate and load-bearing,
+    // unlike `mint --send`'s prompt fallback: watch is meant to run
+    // unattended (cron/systemd/CI), and blocking on a hidden stdin prompt
+    // that will never receive input would hang forever instead of failing
+    // closed -- a real, previously-untested production hang found while
+    // adding this pass's e2e coverage.
+    let signer = load_signing_key(&ProcessEnv, false).map_err(|e| {
         KairoxError::Session(SessionError::new(format!(
-            "failed to load signing key: {e}"
+            "failed to load signing key: {e} (watch never falls back to an interactive prompt; \
+             set KAIROX_SIGNING_KEY before running watch --auto-send)"
         )))
     })?;
     if signer.address() != target.wallet {
@@ -231,6 +299,7 @@ async fn run_single_target(
                 &profile,
                 &signer,
                 safety_caps,
+                json,
             )
             .await
         }
@@ -244,6 +313,7 @@ async fn run_single_target(
                 &profile,
                 &signer,
                 safety_caps,
+                json,
             )
             .await
         }
@@ -382,7 +452,11 @@ async fn run_public_watch(
     profile: &ExecutionProfile,
     signer: &dyn Signer,
     safety_caps: SafetyCaps,
+    json: bool,
 ) -> Result<(), KairoxError> {
+    let started_at = OffsetDateTime::now_utc();
+    let session_id = crate::cli::report::generate_session_id();
+
     let probe = PublicStageProbe {
         plan_args: &plan_args,
         config_path,
@@ -417,6 +491,34 @@ async fn run_public_watch(
     .await?;
 
     print_state(&WatchState::Success);
+
+    if json {
+        let broadcast =
+            crate::cli::report::build_broadcast_outcome_reports(&outcome.broadcast_results);
+        let wallet_report = crate::cli::report::wallet_report_from_receipt(
+            None,
+            target.wallet,
+            target.quantity,
+            Some(outcome.prepared.tx_hash),
+            outcome.receipt_state.as_ref(),
+            broadcast,
+        );
+        let report = crate::cli::report::build_session_report(
+            session_id,
+            None,
+            started_at,
+            resolved.info.name,
+            resolved.info.chain_id,
+            target.collection,
+            "public",
+            false,
+            vec![wallet_report],
+            Some(outcome.metrics),
+        );
+        emit_report(&report, true, None)?;
+        return Ok(());
+    }
+
     print_broadcast_result(
         outcome.prepared.tx_hash,
         &outcome.broadcast_results,
@@ -438,7 +540,10 @@ async fn run_opensea_watch(
     profile: &ExecutionProfile,
     signer: &dyn Signer,
     safety_caps: SafetyCaps,
+    json: bool,
 ) -> Result<(), KairoxError> {
+    let started_at = OffsetDateTime::now_utc();
+    let session_id = crate::cli::report::generate_session_id();
     let opensea = load_opensea_client(StdDuration::from_secs(10))?;
     let probe = OpenSeaStageProbe {
         opensea: &opensea,
@@ -475,6 +580,34 @@ async fn run_opensea_watch(
     .await?;
 
     print_state(&WatchState::Success);
+
+    if json {
+        let broadcast =
+            crate::cli::report::build_broadcast_outcome_reports(&outcome.broadcast_results);
+        let wallet_report = crate::cli::report::wallet_report_from_receipt(
+            None,
+            target.wallet,
+            target.quantity,
+            Some(outcome.prepared.tx_hash),
+            outcome.receipt_state.as_ref(),
+            broadcast,
+        );
+        let report = crate::cli::report::build_session_report(
+            session_id,
+            None,
+            started_at,
+            resolved.info.name,
+            resolved.info.chain_id,
+            target.collection,
+            "opensea",
+            false,
+            vec![wallet_report],
+            Some(outcome.metrics),
+        );
+        emit_report(&report, true, None)?;
+        return Ok(());
+    }
+
     print_broadcast_result(
         outcome.prepared.tx_hash,
         &outcome.broadcast_results,
@@ -591,7 +724,15 @@ fn load_manifest(path: &Path) -> Result<Vec<WatchTarget>, KairoxError> {
 
     file.target
         .into_iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(index, entry)| {
+            let label = format!("watchlist target #{index} ({})", entry.collection);
+            require_explicit_caps(
+                &label,
+                &entry.max_mint_value_wei,
+                &entry.max_gas_cost_wei,
+                &entry.max_total_spend_wei,
+            )?;
             let collection = parse_address("collection", &entry.collection)?;
             let wallet = parse_address("wallet", &entry.wallet)?;
             let fee_recipient = entry
@@ -613,13 +754,13 @@ fn load_manifest(path: &Path) -> Result<Vec<WatchTarget>, KairoxError> {
                 fee_recipient,
                 max_mint_value_wei: entry
                     .max_mint_value_wei
-                    .unwrap_or_else(|| "1000000000000000000".to_string()),
+                    .expect("checked by require_explicit_caps above"),
                 max_gas_cost_wei: entry
                     .max_gas_cost_wei
-                    .unwrap_or_else(|| "1000000000000000000".to_string()),
+                    .expect("checked by require_explicit_caps above"),
                 max_total_spend_wei: entry
                     .max_total_spend_wei
-                    .unwrap_or_else(|| "2000000000000000000".to_string()),
+                    .expect("checked by require_explicit_caps above"),
                 gas_buffer_multiplier: entry.gas_buffer_multiplier,
             })
         })

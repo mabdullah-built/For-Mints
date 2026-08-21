@@ -233,7 +233,7 @@ async fn run_dry_run(
 /// write it to `output` iff given. At least one of the two is always true
 /// when this is called. stdout carries ONLY the JSON object -- diagnostic
 /// text about where a file was written goes to stderr.
-fn emit_report<T: serde::Serialize>(
+pub(crate) fn emit_report<T: serde::Serialize>(
     report: &T,
     json: bool,
     output: Option<&std::path::Path>,

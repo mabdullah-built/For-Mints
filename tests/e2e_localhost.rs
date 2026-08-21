@@ -3629,6 +3629,12 @@ fn watch_public_future_stage_waits_then_executes_at_t0() {
             "--auto-send",
             "--poll-interval-secs",
             "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
@@ -3697,16 +3703,78 @@ fn watch_public_stage_already_ended_stops_before_any_send() {
             &format!("{NFT:#x}"),
             "--wallet",
             &format!("{wallet:#x}"),
+            "--engine",
+            "public",
             "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
         ])
+        .timeout(std::time::Duration::from_secs(30))
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicates::str::contains("ended"));
 
     let received = server.received.lock().unwrap();
     assert!(
         !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
         "an already-ended stage must never be broadcast to"
     );
+}
+
+#[test]
+fn watch_auto_send_without_explicit_spend_caps_refuses_before_touching_anything() {
+    let wallet = test_signer().address();
+    // No KAIROX_SIGNING_KEY set, and no server pointed at all -- if the cap
+    // check isn't the very first thing watch does, this test would either
+    // hang trying to connect or fail with a different, misleading error.
+    kairox_bin()
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("MISSING_SPEND_CAPS"))
+        .stderr(predicates::str::contains("failed to load signing key").not());
+}
+
+#[test]
+fn watch_manifest_target_missing_spend_caps_is_rejected_before_any_target_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("watchlist.toml");
+    std::fs::write(
+        &manifest_path,
+        format!(
+            r#"
+[[target]]
+collection = "{NFT:#x}"
+wallet = "0x000000000000000000000000000000000000dEaD"
+max_mint_value_wei = "0"
+max_gas_cost_wei = "1000000000000000000"
+# max_total_spend_wei intentionally omitted
+"#
+        ),
+    )
+    .unwrap();
+
+    kairox_bin()
+        .args([
+            "watch",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--auto-send",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("MISSING_SPEND_CAPS"))
+        .stderr(predicates::str::contains("max-total-spend-wei"));
 }
 
 #[test]
@@ -3786,4 +3854,281 @@ fn auto_engine_unrecognized_contract_fails_closed_as_unsupported_protocol() {
         !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
         "an unrecognized protocol must never be sent to, calldata-guessed or not"
     );
+}
+
+#[test]
+fn watchlist_concurrency_never_exceeds_the_configured_bound() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const BOUND: usize = 2;
+    const TARGET_COUNT: usize = 6;
+
+    let current = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let current_h = current.clone();
+    let peak_h = peak.clone();
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        let n = current_h.fetch_add(1, Ordering::SeqCst) + 1;
+        peak_h.fetch_max(n, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let result = standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in concurrency scenario: {method}"),
+        });
+        current_h.fetch_sub(1, Ordering::SeqCst);
+        result
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("watchlist.toml");
+    let mut manifest = String::new();
+    for _ in 0..TARGET_COUNT {
+        manifest.push_str(&format!(
+            "\n[[target]]\ncollection = \"{NFT:#x}\"\nwallet = \"{wallet:#x}\"\n\
+             max_mint_value_wei = \"1\"\nmax_gas_cost_wei = \"1000000000000000000\"\n\
+             max_total_spend_wei = \"1000000000000000000\"\n"
+        ));
+    }
+    std::fs::write(&manifest_path, manifest).unwrap();
+
+    // Every target's mint value cap is set to 1 wei -- far below the
+    // fixture's mint price, so every target fails closed on
+    // SAFETY_CAP_EXCEEDED right after its reads complete, never reaching
+    // eth_sendRawTransaction. This isolates the thing under test (read
+    // concurrency across the whole watchlist) from broadcast mocking.
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--engine",
+            "public",
+            "--auto-send",
+            "--max-concurrent-targets",
+            &BOUND.to_string(),
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .failure();
+
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= BOUND,
+        "observed peak concurrent RPC connections {observed_peak} exceeded the configured \
+         bound {BOUND}"
+    );
+    assert!(
+        observed_peak >= 2,
+        "test is meaningless if concurrency never actually overlapped (observed {observed_peak})"
+    );
+}
+
+#[test]
+fn watch_wallet_allocation_exhausted_while_waiting_stops_safely() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let stage_start = unix_now() + 2;
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "must never be called: allocation exhausted".into(),
+            };
+        }
+        if method == "eth_call" {
+            let data = params
+                .get(0)
+                .and_then(|c| c.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or("0x");
+            let stats_hex = format!("0x{}", hex::encode(sd::getMintStatsCall::SELECTOR));
+            if data.starts_with(&stats_hex) {
+                // This wallet has already minted its full allocation (5, the
+                // fixture's maxTotalMintableByWallet) -- discovered only
+                // once watch actually polls, not at the very first read.
+                return rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(sd::getMintStatsCall::abi_encode_returns(
+                        &sd::getMintStatsReturn {
+                            minterNumMinted: U256::from(5u64),
+                            currentTotalSupply: U256::from(10u64),
+                            maxSupply: U256::from(1_000u64),
+                        }
+                    ))
+                )));
+            }
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in allocation-exhausted scenario: {method}"),
+            },
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "public",
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure();
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an exhausted wallet allocation must never be broadcast to"
+    );
+}
+
+#[test]
+fn watch_wrong_chain_detected_before_any_wait() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    // Reports chain id 4663 (Robinhood mainnet) when watch asked for
+    // chain 1 (the compiled default) -- must fail closed, never treated as
+    // a "not SeaDrop, try OpenSea next" resolver miss.
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1237")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("chain").or(predicates::str::contains("CHAIN")));
+}
+
+#[test]
+fn watch_without_signing_key_fails_closed_instead_of_blocking_on_an_interactive_prompt() {
+    let wallet = test_signer().address();
+    // No KAIROX_SIGNING_KEY set, and no RPC endpoint reachable either --
+    // this is a regression test for a real hang this pass found:
+    // `mint --send`'s interactive-prompt fallback (appropriate for an
+    // operator sitting at a terminal) must never be reachable from `watch
+    // --auto-send`, since nothing is present to answer a hidden-stdin
+    // prompt in an unattended run. Bounded by --timeout so a regression
+    // fails the test instead of hanging the suite.
+    kairox_bin()
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("failed to load signing key"))
+        .stderr(predicates::str::contains(
+            "never falls back to an interactive prompt",
+        ));
+}
+
+#[test]
+fn watch_json_report_is_exactly_one_valid_json_object_over_real_http() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [transfer_log_for(wallet, 3)],
+            }))
+        }
+        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in watch --json scenario: {method}"),
+        }),
+    });
+
+    let assert = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "public",
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+            "--json",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("watch --json stdout was not exactly one JSON object: {e}\nstdout={stdout:?}")
+    });
+    assert_eq!(parsed["wallets"][0]["state"], "CONFIRMED_SUCCESS");
 }

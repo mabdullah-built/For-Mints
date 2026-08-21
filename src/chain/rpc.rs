@@ -541,6 +541,37 @@ impl RpcClient {
         Self::hex_to_u64(&result, "estimateGas")
     }
 
+    /// `eth_getStorageAt(address, slot, "latest")` -- used only for reading
+    /// well-known standard storage slots (e.g. the EIP-1967 proxy
+    /// implementation slot), never for anything execution-critical.
+    pub async fn get_storage_at(
+        &self,
+        address: Address,
+        slot: alloy_primitives::B256,
+    ) -> Result<alloy_primitives::B256, RpcError> {
+        self.require_read_capability("eth_getStorageAt")?;
+        let result = self
+            .raw_call(
+                "eth_getStorageAt",
+                json!([address.to_string(), slot.to_string(), "latest"]),
+            )
+            .await?;
+        let s = result
+            .as_str()
+            .ok_or_else(|| RpcError::MalformedResponse("storage value was not a string".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let bytes = hex::decode(format!("{s:0>64}")).map_err(|e| {
+            RpcError::MalformedResponse(format!("storage value was not valid hex: {e}"))
+        })?;
+        if bytes.len() != 32 {
+            return Err(RpcError::MalformedResponse(format!(
+                "storage value was {} bytes, expected 32",
+                bytes.len()
+            )));
+        }
+        Ok(alloy_primitives::B256::from_slice(&bytes))
+    }
+
     /// `eth_getBalance(address, "latest")`.
     pub async fn get_balance(&self, address: Address) -> Result<U256, RpcError> {
         self.require_read_capability("eth_getBalance")?;

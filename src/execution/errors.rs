@@ -110,6 +110,12 @@ pub enum SessionErrorKind {
     /// target and the resolver has no principled way to prefer one over
     /// the other. Refused rather than picked arbitrarily.
     AmbiguousProtocol,
+    /// `watch --auto-send` was invoked without an explicit
+    /// `--max-mint-value-wei`/`--max-gas-cost-wei`/`--max-total-spend-wei`
+    /// (or, for a manifest target, without all three declared on that
+    /// entry). Unattended broadcast must never fall back to a permissive
+    /// default monetary exposure.
+    MissingSpendCaps,
 }
 
 /// An error representing a state Kairox has explicitly decided must halt
@@ -201,6 +207,7 @@ pub enum KairoxErrorCode {
     NoVerifiedReadRpc,
     UnsupportedProtocol,
     AmbiguousProtocol,
+    MissingSpendCaps,
     /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
     /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
     SessionAborted,
@@ -230,6 +237,7 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::NoVerifiedReadRpc => "NO_VERIFIED_READ_RPC",
             Self::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
             Self::AmbiguousProtocol => "AMBIGUOUS_PROTOCOL",
+            Self::MissingSpendCaps => "MISSING_SPEND_CAPS",
             Self::SessionAborted => "SESSION_ABORTED",
         };
         f.write_str(s)
@@ -306,6 +314,7 @@ impl KairoxError {
                 SessionErrorKind::NoVerifiedReadRpc => KairoxErrorCode::NoVerifiedReadRpc,
                 SessionErrorKind::UnsupportedProtocol => KairoxErrorCode::UnsupportedProtocol,
                 SessionErrorKind::AmbiguousProtocol => KairoxErrorCode::AmbiguousProtocol,
+                SessionErrorKind::MissingSpendCaps => KairoxErrorCode::MissingSpendCaps,
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest
                 | SessionErrorKind::SkippedSharedResourceFailure => KairoxErrorCode::SessionAborted,
