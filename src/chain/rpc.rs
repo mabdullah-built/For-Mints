@@ -541,6 +541,25 @@ impl RpcClient {
         Self::hex_to_u64(&result, "estimateGas")
     }
 
+    /// `eth_getCode(address, "latest")` -- used only for computing a
+    /// contract's runtime-bytecode fingerprint (`keccak256` of the
+    /// returned bytes) for the trusted generic-schema registry, never for
+    /// anything execution-critical on its own.
+    pub async fn get_code(&self, address: Address) -> Result<alloy_primitives::Bytes, RpcError> {
+        self.require_read_capability("eth_getCode")?;
+        let result = self
+            .raw_call("eth_getCode", json!([address.to_string(), "latest"]))
+            .await?;
+        let s = result
+            .as_str()
+            .ok_or_else(|| RpcError::MalformedResponse("code value was not a string".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let bytes = hex::decode(s).map_err(|e| {
+            RpcError::MalformedResponse(format!("code value was not valid hex: {e}"))
+        })?;
+        Ok(alloy_primitives::Bytes::from(bytes))
+    }
+
     /// `eth_getStorageAt(address, slot, "latest")` -- used only for reading
     /// well-known standard storage slots (e.g. the EIP-1967 proxy
     /// implementation slot), never for anything execution-critical.

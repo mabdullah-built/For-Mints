@@ -17,6 +17,8 @@
 //! between two plausible protocols, and a `Low`-confidence match alone
 //! never becomes a live-send path (see [`Confidence`]).
 
+use alloy_primitives::B256;
+
 use super::errors::{KairoxError, SessionError, SessionErrorKind};
 
 /// How trustworthy a [`MintAdapter`]'s detection is. Only [`Confidence::High`]
@@ -61,10 +63,14 @@ pub enum ResolvedEngine {
         slug: String,
     },
     /// A generic verified ERC-721/ERC-1155 mint -- only ever produced when
-    /// an operator-declared schema resolved with `Confidence::High` (see
-    /// `cli::commands::resolver_adapters::GenericVerifiedContractAdapter`).
+    /// the target's implementation bytecode exactly matched a
+    /// manually-reviewed [`super::generic_registry::TrustedGenericFingerprint`]
+    /// (see `cli::commands::resolver_adapters::GenericVerifiedContractAdapter`).
+    /// An operator-declared `--generic-schema` alone can never produce
+    /// this variant -- see `docs/generic-engine.md`'s "Confidence model".
     Generic {
-        schema: super::generic_schema::GenericMintSchema,
+        fingerprint: super::generic_registry::TrustedGenericFingerprint,
+        bytecode_hash: B256,
     },
 }
 

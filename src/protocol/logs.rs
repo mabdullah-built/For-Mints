@@ -34,6 +34,12 @@ pub enum LogError {
     Erc1155TransferSingleBadDataLength { len: usize },
     #[error("indexed address topic has non-zero padding in its upper 12 bytes")]
     NonZeroAddressPadding,
+    #[error("ERC-1155 TransferBatch log data is malformed or truncated ({len} bytes)")]
+    Erc1155TransferBatchMalformed { len: usize },
+    #[error(
+        "ERC-1155 TransferBatch log declares {ids} token ids but {values} amounts; these arrays must be the same length"
+    )]
+    Erc1155TransferBatchLengthMismatch { ids: usize, values: usize },
 }
 
 fn transfer_erc721_topic0() -> B256 {
@@ -42,6 +48,10 @@ fn transfer_erc721_topic0() -> B256 {
 
 fn transfer_single_erc1155_topic0() -> B256 {
     keccak256(b"TransferSingle(address,address,address,uint256,uint256)")
+}
+
+fn transfer_batch_erc1155_topic0() -> B256 {
+    keccak256(b"TransferBatch(address,address,address,uint256[],uint256[])")
 }
 
 /// Extract an `Address` from an indexed event topic, validating that the
@@ -121,6 +131,74 @@ pub fn try_decode_erc1155_transfer_single(
     Ok(Some((from, to, id, value)))
 }
 
+/// Reads a standard ABI-encoded dynamic `uint256[]` starting at byte offset
+/// `offset` within `data`: one length word followed by that many element
+/// words. Bounds-checked throughout -- a malformed or truncated offset/
+/// length (however it got that way) is a decode error, never a panic or an
+/// out-of-bounds read.
+fn read_dynamic_u256_array(data: &[u8], offset: usize) -> Result<Vec<U256>, LogError> {
+    let malformed = || LogError::Erc1155TransferBatchMalformed { len: data.len() };
+    let length_bytes = data.get(offset..offset + 32).ok_or_else(malformed)?;
+    let length: usize =
+        usize::try_from(U256::from_be_slice(length_bytes)).map_err(|_| malformed())?;
+    let elements_start = offset.checked_add(32).ok_or_else(malformed)?;
+    let elements_len = length.checked_mul(32).ok_or_else(malformed)?;
+    let elements_end = elements_start
+        .checked_add(elements_len)
+        .ok_or_else(malformed)?;
+    let elements = data
+        .get(elements_start..elements_end)
+        .ok_or_else(malformed)?;
+    Ok(elements.chunks_exact(32).map(U256::from_be_slice).collect())
+}
+
+/// `(from, to, ids, values)` decoded from an ERC-1155 `TransferBatch` log.
+pub type Erc1155TransferBatch = (Address, Address, Vec<U256>, Vec<U256>);
+
+/// Decode one log as an ERC-1155
+/// `TransferBatch(address,address,address,uint256[],uint256[])` event, if
+/// its `topics[0]` matches. `ids` and `values` are the exact,
+/// pairwise-corresponding token ids and amounts the event declares --
+/// their lengths must match, or the log is malformed.
+pub fn try_decode_erc1155_transfer_batch(
+    log: &RawLog,
+) -> Result<Option<Erc1155TransferBatch>, LogError> {
+    let Some(topic0) = log.topics.first() else {
+        return Ok(None);
+    };
+    if *topic0 != transfer_batch_erc1155_topic0() {
+        return Ok(None);
+    }
+    if log.topics.len() != 4 {
+        return Err(LogError::UnexpectedTopicCount {
+            actual: log.topics.len(),
+        });
+    }
+    // topics[1] is the operator, unused for mint-detection purposes.
+    let from = address_from_topic(&log.topics[2])?;
+    let to = address_from_topic(&log.topics[3])?;
+
+    let malformed = || LogError::Erc1155TransferBatchMalformed {
+        len: log.data.len(),
+    };
+    let ids_offset_bytes = log.data.get(0..32).ok_or_else(malformed)?;
+    let values_offset_bytes = log.data.get(32..64).ok_or_else(malformed)?;
+    let ids_offset =
+        usize::try_from(U256::from_be_slice(ids_offset_bytes)).map_err(|_| malformed())?;
+    let values_offset =
+        usize::try_from(U256::from_be_slice(values_offset_bytes)).map_err(|_| malformed())?;
+
+    let ids = read_dynamic_u256_array(&log.data, ids_offset)?;
+    let values = read_dynamic_u256_array(&log.data, values_offset)?;
+    if ids.len() != values.len() {
+        return Err(LogError::Erc1155TransferBatchLengthMismatch {
+            ids: ids.len(),
+            values: values.len(),
+        });
+    }
+    Ok(Some((from, to, ids, values)))
+}
+
 /// Scan every log in a receipt for mints of `nft_contract` to `minter`.
 ///
 /// A "mint" is a `Transfer`/`TransferSingle` event emitted by `nft_contract`
@@ -149,14 +227,26 @@ pub fn extract_minted_assets(
             continue;
         }
 
-        if let Some((from, to, id, value)) = try_decode_erc1155_transfer_single(log)?
+        if let Some((from, to, id, value)) = try_decode_erc1155_transfer_single(log)? {
+            if from.is_zero() && to == minter {
+                minted.push(MintedAsset {
+                    token_id: id,
+                    amount: value,
+                });
+            }
+            continue;
+        }
+
+        if let Some((from, to, ids, values)) = try_decode_erc1155_transfer_batch(log)?
             && from.is_zero()
             && to == minter
         {
-            minted.push(MintedAsset {
-                token_id: id,
-                amount: value,
-            });
+            for (id, value) in ids.into_iter().zip(values) {
+                minted.push(MintedAsset {
+                    token_id: id,
+                    amount: value,
+                });
+            }
         }
     }
 
@@ -355,6 +445,164 @@ mod tests {
             err,
             LogError::Erc1155TransferSingleBadDataLength { len: 32 }
         );
+    }
+
+    fn encode_dynamic_u256_array(values: &[U256]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&U256::from(values.len() as u64).to_be_bytes::<32>());
+        for v in values {
+            out.extend_from_slice(&v.to_be_bytes::<32>());
+        }
+        out
+    }
+
+    fn erc1155_batch_log(
+        nft_contract: Address,
+        operator: Address,
+        from: Address,
+        to: Address,
+        ids: &[U256],
+        values: &[U256],
+    ) -> RawLog {
+        let ids_offset = 64u64;
+        let ids_bytes = encode_dynamic_u256_array(ids);
+        let values_offset = ids_offset + ids_bytes.len() as u64;
+        let mut data = Vec::new();
+        data.extend_from_slice(&U256::from(ids_offset).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(values_offset).to_be_bytes::<32>());
+        data.extend_from_slice(&ids_bytes);
+        data.extend_from_slice(&encode_dynamic_u256_array(values));
+        RawLog {
+            address: nft_contract,
+            topics: vec![
+                transfer_batch_erc1155_topic0(),
+                topic_from_address(operator),
+                topic_from_address(from),
+                topic_from_address(to),
+            ],
+            data: Bytes::from(data),
+        }
+    }
+
+    #[test]
+    fn decodes_erc1155_transfer_batch_mint_with_multiple_ids() {
+        let nft_contract = address!("000000000000000000000000000000000000c0de");
+        let minter = address!("0000000000000000000000000000000000000aaa");
+        let operator = address!("0000000000000000000000000000000000000ccc");
+        let ids = [U256::from(1u64), U256::from(2u64), U256::from(3u64)];
+        let values = [U256::from(5u64), U256::from(1u64), U256::from(10u64)];
+        let log = erc1155_batch_log(nft_contract, operator, Address::ZERO, minter, &ids, &values);
+
+        let minted = extract_minted_assets(&[log], nft_contract, minter).unwrap();
+        assert_eq!(minted.len(), 3);
+        assert_eq!(
+            minted[0],
+            MintedAsset {
+                token_id: U256::from(1u64),
+                amount: U256::from(5u64)
+            }
+        );
+        assert_eq!(
+            minted[1],
+            MintedAsset {
+                token_id: U256::from(2u64),
+                amount: U256::from(1u64)
+            }
+        );
+        assert_eq!(
+            minted[2],
+            MintedAsset {
+                token_id: U256::from(3u64),
+                amount: U256::from(10u64)
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_erc1155_transfer_batch_not_addressed_to_minter() {
+        let nft_contract = address!("000000000000000000000000000000000000c0de");
+        let minter = address!("0000000000000000000000000000000000000aaa");
+        let someone_else = address!("0000000000000000000000000000000000000bbb");
+        let operator = address!("0000000000000000000000000000000000000ccc");
+        let log = erc1155_batch_log(
+            nft_contract,
+            operator,
+            Address::ZERO,
+            someone_else,
+            &[U256::from(1u64)],
+            &[U256::from(1u64)],
+        );
+        let minted = extract_minted_assets(&[log], nft_contract, minter).unwrap();
+        assert!(minted.is_empty());
+    }
+
+    #[test]
+    fn ignores_erc1155_transfer_batch_that_is_not_a_mint() {
+        let nft_contract = address!("000000000000000000000000000000000000c0de");
+        let minter = address!("0000000000000000000000000000000000000aaa");
+        let prior_owner = address!("0000000000000000000000000000000000000bbb");
+        let operator = address!("0000000000000000000000000000000000000ccc");
+        let log = erc1155_batch_log(
+            nft_contract,
+            operator,
+            prior_owner,
+            minter,
+            &[U256::from(1u64)],
+            &[U256::from(1u64)],
+        );
+        let minted = extract_minted_assets(&[log], nft_contract, minter).unwrap();
+        assert!(minted.is_empty(), "from != 0x0 is a transfer, not a mint");
+    }
+
+    #[test]
+    fn rejects_erc1155_transfer_batch_with_mismatched_array_lengths() {
+        let nft_contract = Address::ZERO;
+        let operator = Address::ZERO;
+        // Manually build a log whose declared ids/values lengths differ --
+        // encode_dynamic_u256_array-based helper always keeps them equal,
+        // so this is constructed by hand.
+        let ids_offset = 64u64;
+        let ids_bytes = encode_dynamic_u256_array(&[U256::from(1u64), U256::from(2u64)]);
+        let values_offset = ids_offset + ids_bytes.len() as u64;
+        let mut data = Vec::new();
+        data.extend_from_slice(&U256::from(ids_offset).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(values_offset).to_be_bytes::<32>());
+        data.extend_from_slice(&ids_bytes);
+        data.extend_from_slice(&encode_dynamic_u256_array(&[U256::from(9u64)]));
+        let log = RawLog {
+            address: nft_contract,
+            topics: vec![
+                transfer_batch_erc1155_topic0(),
+                topic_from_address(operator),
+                topic_from_address(Address::ZERO),
+                topic_from_address(Address::ZERO),
+            ],
+            data: Bytes::from(data),
+        };
+        let err = try_decode_erc1155_transfer_batch(&log).unwrap_err();
+        assert_eq!(
+            err,
+            LogError::Erc1155TransferBatchLengthMismatch { ids: 2, values: 1 }
+        );
+    }
+
+    #[test]
+    fn rejects_erc1155_transfer_batch_with_truncated_data() {
+        let log = RawLog {
+            address: Address::ZERO,
+            topics: vec![
+                transfer_batch_erc1155_topic0(),
+                topic_from_address(Address::ZERO),
+                topic_from_address(Address::ZERO),
+                topic_from_address(Address::ZERO),
+            ],
+            data: Bytes::from(vec![0u8; 10]),
+        };
+        let err = try_decode_erc1155_transfer_batch(&log).unwrap_err();
+        assert!(matches!(
+            err,
+            LogError::Erc1155TransferBatchMalformed { .. }
+        ));
     }
 
     #[test]

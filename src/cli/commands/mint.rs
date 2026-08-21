@@ -41,7 +41,8 @@ enum SelectedEngine {
         slug: String,
     },
     Generic {
-        schema: crate::execution::generic_schema::GenericMintSchema,
+        fingerprint: crate::execution::generic_registry::TrustedGenericFingerprint,
+        bytecode_hash: alloy_primitives::B256,
     },
 }
 
@@ -76,9 +77,13 @@ async fn select_engine(
                 crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
                     SelectedEngine::OpenSea { slug }
                 }
-                crate::execution::resolver::ResolvedEngine::Generic { schema } => {
-                    SelectedEngine::Generic { schema }
-                }
+                crate::execution::resolver::ResolvedEngine::Generic {
+                    fingerprint,
+                    bytecode_hash,
+                } => SelectedEngine::Generic {
+                    fingerprint,
+                    bytecode_hash,
+                },
             })
         }
     }
@@ -117,6 +122,7 @@ pub(crate) async fn resolve_auto_engine(
             plan_args,
             config_path,
             schema: generic_schema.as_ref(),
+            trusted_registry: crate::execution::generic_registry::BUILTIN_REGISTRY,
         }) as Box<dyn MintAdapter>,
     ]);
     registry.resolve().await
@@ -240,7 +246,10 @@ async fn run_dry_run(
             }
             println!("--- (nothing above this line is on-chain verified state) ---");
         }
-        SelectedEngine::Generic { schema } => {
+        SelectedEngine::Generic {
+            fingerprint,
+            bytecode_hash,
+        } => {
             if json || output.is_some() {
                 return Err(KairoxError::Session(SessionError::new(
                     "--json/--output for a dry run is only supported for the PUBLIC engine today",
@@ -250,18 +259,28 @@ async fn run_dry_run(
                 .plan_args
                 .wallet
                 .expect("--wallet is required for a generic-engine dry run");
-            println!("selected engine: GENERIC (verified ERC-721/ERC-1155)");
+            println!(
+                "selected engine: GENERIC (registry-verified {:?})",
+                fingerprint.standard
+            );
             println!();
-            println!("standard:      {:?}", schema.standard);
-            println!("shape:         {:?}", schema.shape);
-            println!("token_id:      {:?}", schema.token_id);
-            println!("price/token:   {} wei", schema.price_per_token_wei);
+            println!("registry entry: {:?}", fingerprint.name);
+            println!("bytecode_hash:  {bytecode_hash}");
+            println!("shape:          {:?}", fingerprint.shape);
+            println!("token_id:       {:?}", fingerprint.token_id);
+            println!("price/token:    {} wei", fingerprint.price_per_token_wei);
+            let schema = crate::execution::generic_schema::GenericMintSchema {
+                standard: fingerprint.standard,
+                shape: fingerprint.shape,
+                token_id: fingerprint.token_id,
+                price_per_token_wei: fingerprint.price_per_token_wei.to_string(),
+            };
             let calldata = crate::execution::generic_engine::encode_calldata(
                 &schema,
                 wallet,
                 args.plan_args.quantity,
             )?;
-            println!("calldata:      0x{}", hex::encode(&calldata));
+            println!("calldata:       0x{}", hex::encode(&calldata));
         }
     }
 
@@ -312,20 +331,24 @@ async fn run_send(
             }
             run_send_opensea(args, slug, config_path).await
         }
-        SelectedEngine::Generic { schema } => {
+        SelectedEngine::Generic {
+            fingerprint,
+            bytecode_hash,
+        } => {
             if args.rehearsal {
                 return Err(KairoxError::Session(SessionError::new(
                     "--rehearsal is only supported with the PUBLIC engine today; pass --engine public",
                 )));
             }
-            run_send_generic(args, schema, config_path).await
+            run_send_generic(args, fingerprint, bytecode_hash, config_path).await
         }
     }
 }
 
 async fn run_send_generic(
     args: MintArgs,
-    schema: crate::execution::generic_schema::GenericMintSchema,
+    fingerprint: crate::execution::generic_registry::TrustedGenericFingerprint,
+    bytecode_hash: alloy_primitives::B256,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
     use crate::execution::broadcast::{
@@ -343,7 +366,10 @@ async fn run_send_generic(
     let (resolved, runtime) =
         resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
 
-    eprintln!("selected engine: GENERIC (verified {:?})", schema.standard);
+    eprintln!(
+        "selected engine: GENERIC (registry-verified {:?}, entry {:?})",
+        fingerprint.standard, fingerprint.name
+    );
     eprintln!("=================================================");
     eprintln!(" LIVE SEND CONFIRMATION");
     eprintln!("=================================================");
@@ -351,10 +377,12 @@ async fn run_send_generic(
         "chain:      {} (chain id {})",
         resolved.info.name, resolved.info.chain_id
     );
-    eprintln!("wallet:     {wallet}");
-    eprintln!("collection: {}", args.plan_args.collection);
-    eprintln!("shape:      {:?}", schema.shape);
-    eprintln!("quantity:   {}", args.plan_args.quantity);
+    eprintln!("wallet:         {wallet}");
+    eprintln!("collection:     {}", args.plan_args.collection);
+    eprintln!("bytecode_hash:  {bytecode_hash}");
+    eprintln!("shape:          {:?}", fingerprint.shape);
+    eprintln!("price/token:    {} wei", fingerprint.price_per_token_wei);
+    eprintln!("quantity:       {}", args.plan_args.quantity);
     eprintln!("=================================================");
 
     if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
@@ -399,12 +427,34 @@ async fn run_send_generic(
         max_total_spend: parse_wei("--max-total-spend-wei", &args.plan_args.max_total_spend_wei)?,
     };
 
+    // An operator-supplied --generic-schema, if present, only ever acts as
+    // a maximum-price ceiling check against the registry-verified price --
+    // never as the source of truth. See GenericMintRequest's docs.
+    let operator_max_price_per_token_wei = args
+        .plan_args
+        .generic_schema
+        .as_deref()
+        .map(crate::execution::generic_schema::load_schema)
+        .transpose()?
+        .map(|s| {
+            s.price_per_token_wei
+                .parse::<alloy_primitives::U256>()
+                .map_err(|e| {
+                    KairoxError::Session(SessionError::new(format!(
+                        "--generic-schema: invalid price_per_token_wei: {e}"
+                    )))
+                })
+        })
+        .transpose()?;
+
     let request = GenericMintRequest {
         chain: resolved.info.clone(),
         collection: args.plan_args.collection,
         wallet,
         quantity: args.plan_args.quantity,
-        schema,
+        fingerprint,
+        expected_bytecode_hash: bytecode_hash,
+        operator_max_price_per_token_wei,
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
         safety_caps,
     };

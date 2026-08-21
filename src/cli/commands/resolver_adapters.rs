@@ -134,19 +134,31 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
     }
 }
 
-/// Detects the generic verified ERC-721/ERC-1155 route. Matches only when
-/// BOTH are true: the operator supplied an explicit schema (via
-/// `--generic-schema`, never invented by Kairox), AND on-chain ERC-165
-/// `supportsInterface` for that schema's declared standard actually returns
-/// `true` for this collection. Either alone is `Confidence::Low` --
-/// operator intent without on-chain corroboration, or standard
-/// corroboration for a contract nobody declared a schema for -- and never
-/// resolves a live-send path on its own. Priority 2 -- only tried once
-/// neither native SeaDrop nor the OpenSea Drops route matched.
+/// Detects the generic verified ERC-721/ERC-1155 route.
+///
+/// **`Confidence::High` requires an exact
+/// [`TrustedGenericFingerprint`](crate::execution::generic_registry::TrustedGenericFingerprint)
+/// match** -- the target's (proxy-resolved) implementation bytecode hash
+/// exactly equals a manually-reviewed registry entry's. That entry alone
+/// carries the mint call semantics (selector, argument meanings, payable,
+/// price) that get executed; an operator-supplied `--generic-schema`, if
+/// also given, only ever acts as an optional maximum-price ceiling check
+/// on top (see `execution::generic_engine::GenericMintRequest`).
+///
+/// An operator-declared `--generic-schema` plus ERC-165 confirmation
+/// *alone* (no registry match) is **only ever `Confidence::Low`** and can
+/// never resolve to a live-send path -- ERC-165 proves the NFT *standard*
+/// a contract implements, never that any particular function selector
+/// means what a schema claims, what its arguments mean, or what value it
+/// expects. See `docs/generic-engine.md`'s "Confidence model" section.
+///
+/// Priority 2 -- only tried once neither native SeaDrop nor the OpenSea
+/// Drops route matched.
 pub struct GenericVerifiedContractAdapter<'a> {
     pub plan_args: &'a PlanArgs,
     pub config_path: Option<&'a Path>,
     pub schema: Option<&'a GenericMintSchema>,
+    pub trusted_registry: &'a [crate::execution::generic_registry::TrustedGenericFingerprint],
 }
 
 #[async_trait::async_trait]
@@ -160,17 +172,6 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
     }
 
     async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
-        let Some(schema) = self.schema else {
-            return Ok(None);
-        };
-        if let Err(e) = schema.validate() {
-            return Err(KairoxError::Session(
-                crate::execution::errors::SessionError::new(format!(
-                    "invalid --generic-schema: {e}"
-                )),
-            ));
-        }
-
         let registry = crate::chain::registry::ChainRegistry::builtin();
         let (resolved, runtime) =
             resolve_chain_and_runtime(&registry, &self.plan_args.chain_args, self.config_path)?;
@@ -181,6 +182,56 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
         )
         .await?;
 
+        let (implementation, bytecode_hash) =
+            crate::execution::generic_engine::resolve_implementation_and_code_hash(
+                &client,
+                self.plan_args.collection,
+            )
+            .await?;
+
+        if let Some(fingerprint) = crate::execution::generic_registry::find_fingerprint(
+            self.trusted_registry,
+            resolved.info.chain_id,
+            bytecode_hash,
+        ) {
+            return Ok(Some(Detection {
+                engine: ResolvedEngine::Generic {
+                    fingerprint,
+                    bytecode_hash,
+                },
+                evidence: ProtocolEvidence {
+                    source: format!(
+                        "exact trusted-registry fingerprint match {:?} for implementation {} \
+                         (bytecode hash {bytecode_hash})",
+                        fingerprint.name, implementation
+                    ),
+                    confidence: Confidence::High,
+                    adapter: "GenericVerifiedContractAdapter",
+                    matched_interfaces: vec![],
+                    matched_selectors: vec![],
+                },
+            }));
+        }
+
+        // No registry match. An operator-declared schema plus ERC-165 is
+        // real evidence of *something* (the operator's intent, and that
+        // the contract implements the claimed NFT standard), but it is
+        // deliberately never enough to authorize a live-send path -- see
+        // this adapter's doc comment.
+        let Some(schema) = self.schema else {
+            return Ok(None);
+        };
+        if let Err(e) = schema.validate() {
+            return Err(KairoxError::Session(
+                crate::execution::errors::SessionError::new(format!(
+                    "invalid --generic-schema: {e}"
+                )),
+            ));
+        }
+        let standard_name = match schema.standard {
+            crate::execution::generic_schema::GenericStandard::Erc721 => "ERC-721",
+            crate::execution::generic_schema::GenericStandard::Erc1155 => "ERC-1155",
+        };
         let confirmed = crate::protocol::erc_standards::supports_interface(
             &client,
             self.plan_args.collection,
@@ -188,25 +239,32 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
         )
         .await?;
 
-        let confidence = if confirmed {
-            Confidence::High
-        } else {
-            Confidence::Low
-        };
-        let standard_name = match schema.standard {
-            crate::execution::generic_schema::GenericStandard::Erc721 => "ERC-721",
-            crate::execution::generic_schema::GenericStandard::Erc1155 => "ERC-1155",
-        };
         Ok(Some(Detection {
             engine: ResolvedEngine::Generic {
-                schema: schema.clone(),
+                // Placeholder, never reachable: this branch always
+                // carries `Confidence::Low`, and the resolver only ever
+                // returns a `High`-confidence detection -- see
+                // `AdapterRegistry::resolve`.
+                fingerprint: crate::execution::generic_registry::TrustedGenericFingerprint {
+                    name: "OPERATOR_DECLARED_UNVERIFIED_SCHEMA",
+                    chain_id: resolved.info.chain_id,
+                    implementation_bytecode_hash: bytecode_hash,
+                    standard: schema.standard,
+                    shape: schema.shape,
+                    token_id: schema.token_id,
+                    price_per_token_wei: 0,
+                },
+                bytecode_hash,
             },
             evidence: ProtocolEvidence {
                 source: format!(
-                    "operator-declared {:?} schema for {}; on-chain ERC-165 supportsInterface({standard_name}) = {confirmed}",
+                    "OPERATOR_DECLARED_UNVERIFIED_SCHEMA: {:?} for {} (on-chain ERC-165 \
+                     supportsInterface({standard_name}) = {confirmed}); this is NOT independent \
+                     verification of mint-function semantics and can never authorize a live \
+                     send -- see docs/generic-engine.md",
                     schema.shape, self.plan_args.collection
                 ),
-                confidence,
+                confidence: Confidence::Low,
                 adapter: "GenericVerifiedContractAdapter",
                 matched_interfaces: if confirmed {
                     vec![standard_name.to_string()]

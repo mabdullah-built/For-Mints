@@ -1677,6 +1677,15 @@ fn erc165_and_seadrop_revert_response(
             });
         }
     }
+    // Not an EIP-1967 proxy (zero slot), and some arbitrary non-empty
+    // runtime bytecode -- BUILTIN_REGISTRY ships empty, so no hash could
+    // ever match it regardless of what's returned here.
+    if method == "eth_getStorageAt" {
+        return Some(rpc_ok(serde_json::json!(format!("0x{}", "0".repeat(64)))));
+    }
+    if method == "eth_getCode" {
+        return Some(rpc_ok(serde_json::json!("0x6080604052")));
+    }
     None
 }
 
@@ -1719,35 +1728,36 @@ fn generic_engine_requires_both_schema_and_erc165_confirmation() {
         .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"));
 }
 
+/// Mandatory adversarial test (correction pass): a perfectly valid ERC-721
+/// contract (ERC-165 confirms it) that does NOT actually implement the
+/// operator-declared mint semantics. ERC-165 + an operator schema must
+/// never be enough to authorize a live send -- confirmed here by proving
+/// the CLI never even reaches signing/broadcast, regardless of what
+/// `--send --yes` and matching caps say, because no trusted-registry
+/// fingerprint exists for this (or any, in this build) contract.
 #[test]
-fn generic_erc721_verified_mint_succeeds_end_to_end() {
+fn generic_engine_erc165_true_plus_operator_schema_alone_never_signs_or_broadcasts() {
     let signer = test_signer();
     let wallet = signer.address();
     let key_hex = signing_key_hex(&signer);
 
     let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
-        match method {
-            "eth_sendRawTransaction" => return echo_tx_hash_behavior(params),
-            "eth_getTransactionReceipt" => {
-                let queried_hash = params
-                    .get(0)
-                    .and_then(Value::as_str)
-                    .unwrap_or("0x")
-                    .to_string();
-                return rpc_ok(serde_json::json!({
-                    "transactionHash": queried_hash,
-                    "status": "0x1",
-                    "blockNumber": "0x1",
-                    "logs": [transfer_log_for(wallet, 11)],
-                }));
-            }
-            _ => {}
+        if method == "eth_estimateGas" || method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: format!(
+                    "must never be called: no independent evidence the declared mint schema is \
+                     correct ({method})"
+                ),
+            };
         }
+        // ERC-165 genuinely confirms ERC-721 -- a "perfectly valid" NFT
+        // contract by that one measure alone.
         erc165_and_seadrop_revert_response(method, params, true)
             .or_else(|| standard_read_response(method, params))
             .unwrap_or(Behavior::JsonRpcError {
                 code: -32601,
-                message: format!("unexpected method in generic-mint scenario: {method}"),
+                message: format!("unexpected method: {method}"),
             })
     });
 
@@ -1781,34 +1791,45 @@ fn generic_erc721_verified_mint_succeeds_end_to_end() {
             "2000000000000000000",
         ])
         .assert()
-        .success()
-        .stdout(predicates::str::contains("BROADCAST RESULT"))
-        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+        .failure()
+        .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"))
+        .stderr(predicates::str::contains(
+            "OPERATOR_DECLARED_UNVERIFIED_SCHEMA",
+        ));
 
     let received = server.received.lock().unwrap();
-    assert_eq!(
-        received
-            .iter()
-            .filter(|(m, _)| m == "eth_sendRawTransaction")
-            .count(),
-        1
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_estimateGas"),
+        "must never even attempt to simulate against an unverified schema"
     );
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
 }
 
+/// Mandatory adversarial test (correction pass): an ERC-721 contract with a
+/// permissive `fallback()` that accepts arbitrary calldata -- so
+/// `eth_estimateGas` against the operator's declared (but unverified)
+/// `mint(uint256)` selector would genuinely succeed. A successful
+/// simulation must never be treated as proof the declared selector is
+/// really a mint function: resolution must still stop before ever
+/// attempting that simulation.
 #[test]
-fn generic_engine_definitive_simulation_revert_stops_before_signing() {
-    let wallet = test_signer().address();
+fn generic_engine_permissive_fallback_estimate_gas_success_is_never_treated_as_proof() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
     let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
         if method == "eth_estimateGas" {
-            return Behavior::JsonRpcError {
-                code: -32000,
-                message: "execution reverted".into(),
-            };
+            // The permissive fallback would genuinely accept this and
+            // report a plausible gas estimate -- which is exactly why
+            // resolution must never reach this call at all for an
+            // unverified schema.
+            return rpc_ok(serde_json::json!("0x30d40"));
         }
         if method == "eth_sendRawTransaction" {
             return Behavior::JsonRpcError {
                 code: -32000,
-                message: "must never be called after a definitive simulation revert".into(),
+                message: "must never be called".into(),
             };
         }
         erc165_and_seadrop_revert_response(method, params, true)
@@ -1829,7 +1850,7 @@ fn generic_engine_definitive_simulation_revert_stops_before_signing() {
 
     kairox_bin()
         .env("KAIROX_RPC_1_0_URL", server.url())
-        .env("KAIROX_SIGNING_KEY", signing_key_hex(&test_signer()))
+        .env("KAIROX_SIGNING_KEY", &key_hex)
         .args([
             "mint",
             &format!("{NFT:#x}"),
@@ -1850,9 +1871,14 @@ fn generic_engine_definitive_simulation_revert_stops_before_signing() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("DEFINITIVE_REVERT"));
+        .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"));
 
     let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_estimateGas"),
+        "a permissive fallback's willingness to accept the calldata must never even be probed \
+         for an unverified schema"
+    );
     assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
 }
 
@@ -4051,6 +4077,11 @@ fn auto_engine_unrecognized_contract_fails_closed_as_unsupported_protocol() {
             code: -32000,
             message: "execution reverted".into(),
         },
+        // The generic-engine adapter always resolves an implementation
+        // bytecode hash to check against the (empty) trusted registry,
+        // regardless of whether --generic-schema was given.
+        "eth_getStorageAt" => rpc_ok(serde_json::json!(format!("0x{}", "0".repeat(64)))),
+        "eth_getCode" => rpc_ok(serde_json::json!("0x6080604052")),
         _ => Behavior::JsonRpcError {
             code: -32601,
             message: "method not found".into(),

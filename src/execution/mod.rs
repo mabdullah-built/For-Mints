@@ -3,6 +3,7 @@
 pub mod broadcast;
 pub mod errors;
 pub mod generic_engine;
+pub mod generic_registry;
 pub mod generic_schema;
 pub mod live;
 pub mod manifest;

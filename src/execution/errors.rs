@@ -110,6 +110,11 @@ pub enum SessionErrorKind {
     /// target and the resolver has no principled way to prefer one over
     /// the other. Refused rather than picked arbitrarily.
     AmbiguousProtocol,
+    /// A generic-engine target's implementation bytecode hash changed
+    /// between resolution and the immediately-before-signing re-check
+    /// (e.g. a proxy was upgraded). The evidence a fingerprint match was
+    /// verified against no longer describes what would actually execute.
+    ProxyImplementationChanged,
     /// `watch --auto-send` was invoked without an explicit
     /// `--max-mint-value-wei`/`--max-gas-cost-wei`/`--max-total-spend-wei`
     /// (or, for a manifest target, without all three declared on that
@@ -207,6 +212,7 @@ pub enum KairoxErrorCode {
     NoVerifiedReadRpc,
     UnsupportedProtocol,
     AmbiguousProtocol,
+    ProxyImplementationChanged,
     MissingSpendCaps,
     /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
     /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
@@ -237,6 +243,7 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::NoVerifiedReadRpc => "NO_VERIFIED_READ_RPC",
             Self::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
             Self::AmbiguousProtocol => "AMBIGUOUS_PROTOCOL",
+            Self::ProxyImplementationChanged => "PROXY_IMPLEMENTATION_CHANGED",
             Self::MissingSpendCaps => "MISSING_SPEND_CAPS",
             Self::SessionAborted => "SESSION_ABORTED",
         };
@@ -314,6 +321,9 @@ impl KairoxError {
                 SessionErrorKind::NoVerifiedReadRpc => KairoxErrorCode::NoVerifiedReadRpc,
                 SessionErrorKind::UnsupportedProtocol => KairoxErrorCode::UnsupportedProtocol,
                 SessionErrorKind::AmbiguousProtocol => KairoxErrorCode::AmbiguousProtocol,
+                SessionErrorKind::ProxyImplementationChanged => {
+                    KairoxErrorCode::ProxyImplementationChanged
+                }
                 SessionErrorKind::MissingSpendCaps => KairoxErrorCode::MissingSpendCaps,
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest
