@@ -210,7 +210,7 @@ pub async fn broadcast_to_all_with_limiter(
 ) -> Vec<EndpointBroadcastResult> {
     let attempts = clients.iter().enumerate().map(|(i, client)| async move {
         let Some(limiter) = limiter else {
-            return attempt_broadcast(client, prepared, format!("endpoint[{i}]")).await;
+            return attempt_broadcast(client, prepared, i).await;
         };
         let _permit = limiter
             .semaphore
@@ -219,7 +219,7 @@ pub async fn broadcast_to_all_with_limiter(
             .expect("BroadcastLimiter's semaphore is never closed");
         let now_active = limiter.active.fetch_add(1, Ordering::SeqCst) + 1;
         limiter.peak.fetch_max(now_active, Ordering::SeqCst);
-        let result = attempt_broadcast(client, prepared, format!("endpoint[{i}]")).await;
+        let result = attempt_broadcast(client, prepared, i).await;
         limiter.active.fetch_sub(1, Ordering::SeqCst);
         result
     });
@@ -235,9 +235,14 @@ pub async fn broadcast_to_all_with_limiter(
 async fn attempt_broadcast(
     client: &RpcClient,
     prepared: &PreparedBroadcast,
-    default_label: String,
+    default_index: usize,
 ) -> EndpointBroadcastResult {
-    let label = client.label().map(str::to_string).unwrap_or(default_label);
+    // Lazily formatted: the common case is a labeled endpoint, so the
+    // T=0 hot path never pays for a `format!` allocation it discards.
+    let label = client
+        .label()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("endpoint[{default_index}]"));
     let dispatched_at = OffsetDateTime::now_utc();
     let started = Instant::now();
     let result = client.broadcast_prepared(prepared).await;
@@ -363,9 +368,7 @@ pub async fn dispatch_broadcast_matrix(
                 let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now_active, Ordering::SeqCst);
 
-                let result =
-                    attempt_broadcast(job.client, job.prepared, format!("endpoint[{job_index}]"))
-                        .await;
+                let result = attempt_broadcast(job.client, job.prepared, job_index).await;
 
                 active.fetch_sub(1, Ordering::SeqCst);
                 {
@@ -427,6 +430,13 @@ pub enum BroadcastSummary {
     /// or may not have reached a mempool — this is the
     /// `MUST_STOP_SESSION` case.
     Uncertain,
+    /// A `--rehearsal` run: everything up to and including signing and
+    /// serialization completed, but `eth_sendRawTransaction` was
+    /// deliberately never called. Never produced by [`summarize_broadcast`]
+    /// (which only ever runs against real endpoint results) — constructed
+    /// directly by the rehearsal short-circuit in
+    /// [`crate::execution::live::run_live_mint`] instead.
+    NotSent,
 }
 
 pub fn summarize_broadcast(results: &[EndpointBroadcastResult]) -> BroadcastSummary {

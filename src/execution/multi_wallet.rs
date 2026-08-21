@@ -670,6 +670,15 @@ pub async fn run_multi_wallet_public_mint(
                         None,
                     ),
                     BroadcastSummary::Uncertain => (WalletExecutionState::Uncertain, None),
+                    // Unreachable in multi-wallet sessions: `rehearsal` is
+                    // only ever set on the single-wallet public live path.
+                    // Handled anyway to keep this match exhaustive.
+                    BroadcastSummary::NotSent => (
+                        WalletExecutionState::Failed {
+                            reason: "internal error: rehearsal outcome reached multi-wallet broadcast handling".into(),
+                        },
+                        None,
+                    ),
                     BroadcastSummary::Confirmed { tx_hash } => {
                         let receipt_state = poll_receipt(
                             read_client,
@@ -1174,6 +1183,15 @@ fn wallet_result_from_opensea_outcome(
                     None,
                 ),
                 BroadcastSummary::Uncertain => (WalletExecutionState::Uncertain, None),
+                // Unreachable in multi-wallet sessions: `rehearsal` is only
+                // ever set on the single-wallet public live path. Handled
+                // anyway to keep this match exhaustive.
+                BroadcastSummary::NotSent => (
+                    WalletExecutionState::Failed {
+                        reason: "internal error: rehearsal outcome reached multi-wallet broadcast handling".into(),
+                    },
+                    None,
+                ),
                 BroadcastSummary::Confirmed { tx_hash } => {
                     let state = match o.receipt_state {
                         Some(ReceiptState::ConfirmedSuccess { minted }) => {

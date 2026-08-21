@@ -106,9 +106,14 @@ pub(crate) fn load_opensea_client(timeout: StdDuration) -> Result<OpenSeaClient,
 
 pub async fn run(args: MintArgs, config_path: Option<&std::path::Path>) -> Result<(), KairoxError> {
     if args.wallet_manifest.is_some() {
+        if args.rehearsal {
+            return Err(KairoxError::Session(SessionError::new(
+                "--rehearsal is not supported with --wallet-manifest yet; rehearse a single wallet first",
+            )));
+        }
         return crate::cli::commands::mint_multi::run_manifest(args, config_path).await;
     }
-    if !args.send {
+    if !args.send && !args.rehearsal {
         return run_dry_run(args, config_path).await;
     }
 
@@ -226,7 +231,14 @@ async fn run_send(
 ) -> Result<(), KairoxError> {
     match select_engine(&args, config_path).await? {
         SelectedEngine::Public => run_send_public(args, config_path).await,
-        SelectedEngine::OpenSea { slug } => run_send_opensea(args, slug, config_path).await,
+        SelectedEngine::OpenSea { slug } => {
+            if args.rehearsal {
+                return Err(KairoxError::Session(SessionError::new(
+                    "--rehearsal is only supported with the PUBLIC engine today; pass --engine public",
+                )));
+            }
+            run_send_opensea(args, slug, config_path).await
+        }
     }
 }
 
@@ -316,7 +328,11 @@ async fn run_send_public(
     eprintln!("selected engine: PUBLIC (pure on-chain PublicSeaDropEngine)");
     eprintln!("session_id: {session_id}");
     eprintln!("=================================================");
-    eprintln!(" LIVE SEND CONFIRMATION");
+    if args.rehearsal {
+        eprintln!(" REHEARSAL CONFIRMATION (no transaction will be broadcast)");
+    } else {
+        eprintln!(" LIVE SEND CONFIRMATION");
+    }
     eprintln!("=================================================");
     eprintln!(
         "chain:                {} (chain id {})",
@@ -341,7 +357,9 @@ async fn run_send_public(
     eprintln!("=================================================");
 
     if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
-        eprintln!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        eprintln!(
+            "Aborted: confirmation not received. Nothing was signed, prepared, or broadcast."
+        );
         if json || output.is_some() {
             let report = crate::cli::report::build_session_report(
                 session_id,
@@ -423,6 +441,7 @@ async fn run_send_public(
     if let Some(samples) = args.benchmark_samples {
         config.benchmark.sample_count = samples;
     }
+    config.rehearsal = args.rehearsal;
 
     let mut receipt_pending_announced = false;
     let outcome = run_live_mint(&mut pool, &signer, &request, &config, |progress| {
@@ -463,6 +482,7 @@ async fn run_send_public(
         &outcome.broadcast_summary,
         &outcome.receipt_state,
         &outcome.metrics,
+        args.rehearsal,
     );
 
     Ok(())
@@ -653,6 +673,7 @@ async fn run_send_opensea(
         &outcome.broadcast_summary,
         &outcome.receipt_state,
         &outcome.metrics,
+        args.rehearsal,
     );
 
     Ok(())
@@ -668,10 +689,15 @@ fn print_broadcast_result(
     broadcast_summary: &BroadcastSummary,
     receipt_state: &Option<ReceiptState>,
     metrics: &crate::execution::metrics::LatencyMetrics,
+    is_rehearsal: bool,
 ) {
     println!();
     println!("=================================================");
-    println!(" BROADCAST RESULT");
+    if is_rehearsal {
+        println!(" REHEARSAL RESULT (nothing was broadcast)");
+    } else {
+        println!(" BROADCAST RESULT");
+    }
     println!("=================================================");
     println!("tx hash: 0x{}", hex::encode(tx_hash));
     for r in broadcast_results {
@@ -690,6 +716,9 @@ fn print_broadcast_result(
         }
         BroadcastSummary::AllRejected => println!("summary: ALL_REJECTED — nothing was broadcast"),
         BroadcastSummary::Uncertain => unreachable!("uncertain outcomes are returned as Err"),
+        BroadcastSummary::NotSent => println!(
+            "summary: REHEARSAL COMPLETE — signed and serialized, but eth_sendRawTransaction was never called. Pass --send to actually broadcast."
+        ),
     }
 
     match receipt_state {

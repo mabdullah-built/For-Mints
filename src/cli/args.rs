@@ -198,8 +198,16 @@ pub struct MintArgs {
     #[command(flatten)]
     pub plan_args: PlanArgs,
     /// Broadcast the transaction live. Without this flag, `mint` is always dry-run only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "rehearsal")]
     pub send: bool,
+    /// Run the full live pipeline -- benchmarking, connection warming,
+    /// scheduler checkpoints, state refresh, and real local signing/
+    /// serialization -- but stop immediately before the broadcast step.
+    /// Never calls eth_sendRawTransaction. Only supported for a
+    /// single-wallet `--engine public` mint today. Mutually exclusive
+    /// with --send.
+    #[arg(long)]
+    pub rehearsal: bool,
     /// Skip the interactive "type yes to continue" confirmation prompt. Only meaningful with --send.
     #[arg(long)]
     pub yes: bool,

@@ -507,6 +507,74 @@ fn public_single_wallet_live_send_signs_and_broadcasts_exactly_one_transaction()
 }
 
 #[test]
+fn public_single_wallet_rehearsal_prepares_and_signs_but_never_broadcasts() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        // No eth_sendRawTransaction or eth_getTransactionReceipt handler at
+        // all -- if rehearsal ever actually broadcasts or polls a receipt,
+        // this server errors instead of silently returning a plausible
+        // 200, so a bug here cannot masquerade as a pass.
+        standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in rehearsal scenario (must never broadcast or poll a receipt): {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--rehearsal",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"))
+        .stdout(predicates::str::contains("tx hash: 0x"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "rehearsal must never call eth_sendRawTransaction"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|(m, _)| m == "eth_getTransactionReceipt"),
+        "rehearsal must never poll for a receipt -- nothing was broadcast to have one"
+    );
+    // The real read pipeline (nonce, fee, balance, gas estimate, stage
+    // state) genuinely ran -- proves this is not a stub.
+    assert!(received.iter().any(|(m, _)| m == "eth_getTransactionCount"));
+    assert!(received.iter().any(|(m, _)| m == "eth_estimateGas"));
+}
+
+#[test]
+fn public_single_wallet_rehearsal_and_send_are_mutually_exclusive_cli_flags() {
+    kairox_bin()
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            "0x000000000000000000000000000000000000dEaD",
+            "--send",
+            "--rehearsal",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
 fn public_single_wallet_uncertain_send_never_retries_or_replaces() {
     let signer = test_signer();
     let wallet = signer.address();

@@ -50,6 +50,14 @@ pub struct LiveMintConfig {
     /// StateCheck checkpoint) preserves Phase 3's original behavior:
     /// rewarm runs immediately, right after benchmarking.
     pub known_stage_start: Option<OffsetDateTime>,
+    /// When true, `run_live_mint` runs the entire pipeline (benchmark,
+    /// prewarm, scheduler checkpoints, fresh state read, real local
+    /// signing/serialization) exactly as normal, then stops immediately
+    /// before the broadcast step -- `eth_sendRawTransaction` is never
+    /// called. Lets an operator rehearse timing, connection warming, and
+    /// preparation against real chain state without any possibility of a
+    /// real transaction. Defaults to `false` (a normal live send).
+    pub rehearsal: bool,
 }
 
 impl Default for LiveMintConfig {
@@ -62,6 +70,7 @@ impl Default for LiveMintConfig {
             health: HealthPolicy::default(),
             prewarm_lead: StdDuration::from_secs(8),
             known_stage_start: None,
+            rehearsal: false,
         }
     }
 }
@@ -76,6 +85,7 @@ impl From<&ExecutionProfile> for LiveMintConfig {
             health: profile.health_policy,
             prewarm_lead: std_duration_from_time(profile.prewarm_lead),
             known_stage_start: None,
+            rehearsal: false,
         }
     }
 }
@@ -287,6 +297,22 @@ pub async fn run_live_mint(
 
     metrics.broadcast_prepare_ms = Some(prepared.broadcast_prepare_ms);
 
+    // REHEARSAL: everything above this line -- benchmarking, prewarming,
+    // every scheduler checkpoint, the fresh state read, and real local
+    // signing/serialization -- already happened exactly as it would for a
+    // real send. Stop here, before touching a single network send
+    // endpoint. `eth_sendRawTransaction` is never called on this path.
+    if config.rehearsal {
+        return Ok(LiveMintOutcome {
+            prepared,
+            broadcast_results: Vec::new(),
+            broadcast_summary: BroadcastSummary::NotSent,
+            receipt_state: None,
+            metrics,
+            prewarm_scheduling,
+        });
+    }
+
     // send_clients was already finalized during SELECT, above — no
     // re-ranking or re-selection happens here at T=0.
     on_progress(LiveProgress::Broadcasting {
@@ -324,6 +350,12 @@ pub async fn run_live_mint(
         BroadcastSummary::Uncertain => {
             return Err(uncertain_outcome_error(&broadcast_results));
         }
+        // Unreachable here in practice: `summary` above is always built by
+        // `summarize_broadcast` from real endpoint results, which never
+        // produces `NotSent` -- the rehearsal short-circuit above returns
+        // before this line is ever reached. Handled anyway so this match
+        // stays exhaustive if that ever changes.
+        BroadcastSummary::NotSent => None,
     };
 
     Ok(LiveMintOutcome {
@@ -490,6 +522,7 @@ mod tests {
             health: crate::chain::benchmark::HealthPolicy::default(),
             prewarm_lead: StdDuration::ZERO,
             known_stage_start: None,
+            rehearsal: false,
         }
     }
 
