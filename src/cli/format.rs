@@ -73,7 +73,40 @@ pub fn mask_url(url: &Url) -> String {
     // token and must never reach a doctor/bench/report output either.
     let _ = masked.set_username("");
     let _ = masked.set_password(None);
+
+    // Some providers (e.g. Alchemy) embed the API key as a path segment
+    // (`.../v2/<key>`) rather than a query parameter or basic-auth
+    // credential -- neither of which the steps above touch. Redact any
+    // path segment that looks like a secret rather than a short,
+    // conventional path component (`v1`/`v2`/`rpc`/...), so this style of
+    // URL is never printed with its key intact either.
+    let redacted_path: Vec<&str> = masked
+        .path()
+        .split('/')
+        .map(|segment| {
+            if looks_like_path_secret(segment) {
+                "REDACTED"
+            } else {
+                segment
+            }
+        })
+        .collect();
+    let new_path = redacted_path.join("/");
+    if new_path != masked.path() {
+        masked.set_path(&new_path);
+    }
+
     masked.to_string()
+}
+
+/// Conservative heuristic (same spirit as `config::looks_like_secret_value`):
+/// a path segment long enough and shaped enough like a real API key --
+/// never a short/conventional path component like `v1`/`v2`/`rpc`/`api`.
+fn looks_like_path_secret(segment: &str) -> bool {
+    segment.len() >= 16
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Render one endpoint's connection/capability report, deliberately never
@@ -233,6 +266,32 @@ mod tests {
         let masked = mask_url(&url);
         assert!(!masked.contains("api-user"));
         assert!(!masked.contains("api-secret"));
+    }
+
+    #[test]
+    fn mask_url_redacts_a_provider_api_key_embedded_as_a_path_segment() {
+        // The shape real providers like Alchemy use: no query string, no
+        // basic auth -- the key IS the final path segment. A synthetic
+        // sentinel of the same structural shape (length, alphanumeric),
+        // never a real credential.
+        const SENTINEL: &str = "SentinelAlchemyPathToken00MustNeverLeak99";
+        let url = Url::parse(&format!(
+            "https://robinhood-mainnet.g.alchemy.com/v2/{SENTINEL}"
+        ))
+        .unwrap();
+        let masked = mask_url(&url);
+        assert!(!masked.contains(SENTINEL));
+        assert!(masked.contains("REDACTED"));
+        assert!(masked.contains("robinhood-mainnet.g.alchemy.com"));
+        // The short, conventional "v2" segment is preserved -- only the
+        // long, key-shaped segment is redacted.
+        assert!(masked.contains("/v2/"));
+    }
+
+    #[test]
+    fn mask_url_leaves_short_conventional_path_segments_alone() {
+        let url = Url::parse("https://rpc.example.com/api/v2/rpc").unwrap();
+        assert_eq!(mask_url(&url), "https://rpc.example.com/api/v2/rpc");
     }
 
     #[test]

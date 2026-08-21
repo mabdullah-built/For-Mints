@@ -1685,6 +1685,11 @@ const PRIVATE_KEY_SENTINEL_SUFFIX: &str =
     "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
 const OPENSEA_KEY_SENTINEL: &str = "sentinel-opensea-api-key-must-never-leak-9f3a";
 const RPC_QUERY_TOKEN_SENTINEL: &str = "sentinel-rpc-query-token-must-never-leak-7c21";
+// A provider-style API key embedded as a URL *path segment* rather than a
+// query parameter or basic-auth credential -- the shape real providers
+// like Alchemy actually use (`.../v2/<key>`), which `mask_url`'s original
+// query-only/userinfo-only redaction did not cover.
+const RPC_PATH_TOKEN_SENTINEL: &str = "SentinelRpcPathToken00MustNeverLeak99";
 
 fn assert_no_sentinels_leaked(haystack: &[u8]) {
     let text = String::from_utf8_lossy(haystack);
@@ -1699,6 +1704,10 @@ fn assert_no_sentinels_leaked(haystack: &[u8]) {
     assert!(
         !text.contains(RPC_QUERY_TOKEN_SENTINEL),
         "RPC query-token sentinel leaked: {text}"
+    );
+    assert!(
+        !text.contains(RPC_PATH_TOKEN_SENTINEL),
+        "RPC path-embedded token sentinel leaked: {text}"
     );
 }
 
@@ -1812,6 +1821,50 @@ fn secrets_never_leak_on_doctor_with_a_query_token_rpc_url() {
     let output = assert.get_output();
     assert_no_sentinels_leaked(&output.stdout);
     assert_no_sentinels_leaked(&output.stderr);
+}
+
+/// Regression test for a real defect found during a mainnet-hardening
+/// operational session: `mask_url` originally only redacted a query
+/// string or basic-auth userinfo, not a provider API key embedded as a
+/// URL *path segment* (`.../v2/<key>`, the shape Alchemy and similar
+/// providers actually use) -- so this exact scenario would have leaked a
+/// real production key into `doctor`'s output before the fix.
+#[test]
+fn secrets_never_leak_on_doctor_with_a_path_embedded_rpc_token_url() {
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    let assert = kairox_bin()
+        .env(
+            "KAIROX_RPC_1_0_URL",
+            format!("{}/v2/{RPC_PATH_TOKEN_SENTINEL}", server.url()),
+        )
+        .env("KAIROX_OPENSEA_API_KEY", OPENSEA_KEY_SENTINEL)
+        .env(
+            "KAIROX_SIGNING_KEY",
+            format!("0x{PRIVATE_KEY_SENTINEL_SUFFIX}"),
+        )
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let output = assert.get_output();
+    assert_no_sentinels_leaked(&output.stdout);
+    assert_no_sentinels_leaked(&output.stderr);
+    // The endpoint must still genuinely have connected (this proves the
+    // request really went to `/v2/<token>`, not that the path was simply
+    // dropped or the connection silently failed).
+    let parsed = assert_stdout_is_exactly_one_json_object(&output.stdout);
+    let chains = parsed["chains"].as_array().unwrap();
+    let ethereum = chains
+        .iter()
+        .find(|c| c["chain_id"] == 1)
+        .expect("chain 1 must be listed");
+    assert_eq!(ethereum["status"], "PASS");
 }
 
 #[test]
