@@ -159,6 +159,13 @@ pub struct PlanArgs {
     /// --engine auto only when the public on-chain stage is not active.
     #[arg(long)]
     pub slug: Option<String>,
+    /// Path to an operator-declared generic mint schema (TOML). Used by
+    /// --engine auto only when neither native SeaDrop nor OpenSea Drops
+    /// resolves, and only activates the generic engine when on-chain
+    /// ERC-165 corroborates the declared standard. See
+    /// docs/generic-engine.md.
+    #[arg(long)]
+    pub generic_schema: Option<std::path::PathBuf>,
     /// Wallet address to plan a mint for. A plain address only — never a private key (that is loaded separately via KAIROX_SIGNING_KEY or interactive prompt, only when --send is used). Required for `plan`, and for `mint` unless --wallet-manifest is used instead.
     #[arg(long)]
     pub wallet: Option<Address>,

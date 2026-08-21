@@ -6,16 +6,19 @@
 //! `src/execution/resolver.rs` for the resolution hierarchy/ambiguity
 //! rules these adapters plug into.
 //!
-//! Deliberately just two adapters. A `GenericVerifiedContractEngine` or a
-//! registered launchpad adapter would plug in here at a lower priority
-//! (tried only once neither of these matches) -- see
-//! `docs/resolver-architecture.md` for why neither is added in this pass.
+//! A third adapter, `GenericVerifiedContractAdapter`, covers a schema the
+//! operator explicitly declared (never guessed) and that on-chain ERC-165
+//! corroborates. A registered launchpad adapter would plug in below that --
+//! see `docs/generic-engine.md`/`docs/resolver-architecture.md` for why
+//! that isn't added in this pass.
 
 use std::path::Path;
 
 use crate::cli::args::PlanArgs;
+use crate::cli::context::{connect_read_client, resolve_chain_and_runtime};
 use crate::domain::timing::StageStatus;
 use crate::execution::errors::KairoxError;
+use crate::execution::generic_schema::GenericMintSchema;
 use crate::execution::resolver::{
     Confidence, Detection, MintAdapter, ProtocolEvidence, ResolvedEngine,
 };
@@ -125,6 +128,91 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
                 confidence: Confidence::High,
                 adapter: "OpenSeaDropsAdapter",
                 matched_interfaces: vec![],
+                matched_selectors: vec![],
+            },
+        }))
+    }
+}
+
+/// Detects the generic verified ERC-721/ERC-1155 route. Matches only when
+/// BOTH are true: the operator supplied an explicit schema (via
+/// `--generic-schema`, never invented by Kairox), AND on-chain ERC-165
+/// `supportsInterface` for that schema's declared standard actually returns
+/// `true` for this collection. Either alone is `Confidence::Low` --
+/// operator intent without on-chain corroboration, or standard
+/// corroboration for a contract nobody declared a schema for -- and never
+/// resolves a live-send path on its own. Priority 2 -- only tried once
+/// neither native SeaDrop nor the OpenSea Drops route matched.
+pub struct GenericVerifiedContractAdapter<'a> {
+    pub plan_args: &'a PlanArgs,
+    pub config_path: Option<&'a Path>,
+    pub schema: Option<&'a GenericMintSchema>,
+}
+
+#[async_trait::async_trait]
+impl MintAdapter for GenericVerifiedContractAdapter<'_> {
+    fn name(&self) -> &'static str {
+        "GenericVerifiedContractAdapter"
+    }
+
+    fn priority(&self) -> u8 {
+        2
+    }
+
+    async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
+        let Some(schema) = self.schema else {
+            return Ok(None);
+        };
+        if let Err(e) = schema.validate() {
+            return Err(KairoxError::Session(
+                crate::execution::errors::SessionError::new(format!(
+                    "invalid --generic-schema: {e}"
+                )),
+            ));
+        }
+
+        let registry = crate::chain::registry::ChainRegistry::builtin();
+        let (resolved, runtime) =
+            resolve_chain_and_runtime(&registry, &self.plan_args.chain_args, self.config_path)?;
+        let client = connect_read_client(
+            &resolved.info,
+            self.plan_args.chain_args.rpc_url.as_ref(),
+            runtime.config.as_ref(),
+        )
+        .await?;
+
+        let confirmed = crate::protocol::erc_standards::supports_interface(
+            &client,
+            self.plan_args.collection,
+            schema.standard.erc165_interface_id(),
+        )
+        .await?;
+
+        let confidence = if confirmed {
+            Confidence::High
+        } else {
+            Confidence::Low
+        };
+        let standard_name = match schema.standard {
+            crate::execution::generic_schema::GenericStandard::Erc721 => "ERC-721",
+            crate::execution::generic_schema::GenericStandard::Erc1155 => "ERC-1155",
+        };
+        Ok(Some(Detection {
+            engine: ResolvedEngine::Generic {
+                schema: schema.clone(),
+            },
+            evidence: ProtocolEvidence {
+                source: format!(
+                    "operator-declared {:?} schema for {}; on-chain ERC-165 supportsInterface({standard_name}) = {confirmed}",
+                    schema.shape, self.plan_args.collection
+                ),
+                confidence,
+                adapter: "GenericVerifiedContractAdapter",
+                matched_interfaces: if confirmed {
+                    vec![standard_name.to_string()]
+                } else {
+                    vec![]
+                },
                 matched_selectors: vec![],
             },
         }))

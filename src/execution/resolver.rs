@@ -57,7 +57,15 @@ pub struct ProtocolEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedEngine {
     Public,
-    OpenSea { slug: String },
+    OpenSea {
+        slug: String,
+    },
+    /// A generic verified ERC-721/ERC-1155 mint -- only ever produced when
+    /// an operator-declared schema resolved with `Confidence::High` (see
+    /// `cli::commands::resolver_adapters::GenericVerifiedContractAdapter`).
+    Generic {
+        schema: super::generic_schema::GenericMintSchema,
+    },
 }
 
 #[derive(Debug, Clone)]

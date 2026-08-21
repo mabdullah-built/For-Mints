@@ -66,6 +66,9 @@ impl WatchTarget {
             chain_args: self.chain_args.clone(),
             engine: self.engine,
             slug: self.slug.clone(),
+            // The generic verified contract engine is not wired into
+            // `watch` this pass -- see docs/generic-engine.md.
+            generic_schema: None,
             wallet: Some(self.wallet),
             quantity: self.quantity,
             fee_recipient: self.fee_recipient,
@@ -351,12 +354,26 @@ async fn resolve_watch_engine(
                 crate::cli::commands::mint::resolve_auto_engine(plan_args, config_path, true)
                     .await?;
             crate::cli::commands::mint::print_resolution_evidence(&detection);
-            Ok(match detection.engine {
-                crate::execution::resolver::ResolvedEngine::Public => ResolvedWatchEngine::Public,
-                crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
-                    ResolvedWatchEngine::OpenSea { slug }
+            match detection.engine {
+                crate::execution::resolver::ResolvedEngine::Public => {
+                    Ok(ResolvedWatchEngine::Public)
                 }
-            })
+                crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
+                    Ok(ResolvedWatchEngine::OpenSea { slug })
+                }
+                crate::execution::resolver::ResolvedEngine::Generic { .. } => {
+                    // Not wired into watch this pass: the generic engine
+                    // has no stage-timing model to wait against yet -- see
+                    // docs/generic-engine.md. Use `kairox mint --engine
+                    // auto --generic-schema ...` for an already-live
+                    // generic contract instead.
+                    Err(KairoxError::Session(SessionError::new(
+                        "the generic verified contract engine is not yet supported by `watch` \
+                         (no stage-timing model for it exists yet); use `kairox mint` for an \
+                         already-live generic contract instead",
+                    )))
+                }
+            }
         }
     }
 }

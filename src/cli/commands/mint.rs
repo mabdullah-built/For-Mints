@@ -37,7 +37,12 @@ use crate::signing::signer::Signer;
 /// before anything runs.
 enum SelectedEngine {
     Public,
-    OpenSea { slug: String },
+    OpenSea {
+        slug: String,
+    },
+    Generic {
+        schema: crate::execution::generic_schema::GenericMintSchema,
+    },
 }
 
 /// Resolve `--engine`/`--slug` into exactly one concrete engine.
@@ -71,6 +76,9 @@ async fn select_engine(
                 crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
                     SelectedEngine::OpenSea { slug }
                 }
+                crate::execution::resolver::ResolvedEngine::Generic { schema } => {
+                    SelectedEngine::Generic { schema }
+                }
             })
         }
     }
@@ -85,8 +93,16 @@ pub(crate) async fn resolve_auto_engine(
     config_path: Option<&std::path::Path>,
     allow_not_yet_started: bool,
 ) -> Result<crate::execution::resolver::Detection, KairoxError> {
-    use crate::cli::commands::resolver_adapters::{OpenSeaDropsAdapter, SeaDropAdapter};
+    use crate::cli::commands::resolver_adapters::{
+        GenericVerifiedContractAdapter, OpenSeaDropsAdapter, SeaDropAdapter,
+    };
     use crate::execution::resolver::{AdapterRegistry, MintAdapter};
+
+    let generic_schema = plan_args
+        .generic_schema
+        .as_deref()
+        .map(crate::execution::generic_schema::load_schema)
+        .transpose()?;
 
     let registry = AdapterRegistry::new(vec![
         Box::new(SeaDropAdapter {
@@ -96,6 +112,11 @@ pub(crate) async fn resolve_auto_engine(
         }) as Box<dyn MintAdapter>,
         Box::new(OpenSeaDropsAdapter {
             slug: plan_args.slug.as_deref(),
+        }) as Box<dyn MintAdapter>,
+        Box::new(GenericVerifiedContractAdapter {
+            plan_args,
+            config_path,
+            schema: generic_schema.as_ref(),
         }) as Box<dyn MintAdapter>,
     ]);
     registry.resolve().await
@@ -219,6 +240,29 @@ async fn run_dry_run(
             }
             println!("--- (nothing above this line is on-chain verified state) ---");
         }
+        SelectedEngine::Generic { schema } => {
+            if json || output.is_some() {
+                return Err(KairoxError::Session(SessionError::new(
+                    "--json/--output for a dry run is only supported for the PUBLIC engine today",
+                )));
+            }
+            let wallet = args
+                .plan_args
+                .wallet
+                .expect("--wallet is required for a generic-engine dry run");
+            println!("selected engine: GENERIC (verified ERC-721/ERC-1155)");
+            println!();
+            println!("standard:      {:?}", schema.standard);
+            println!("shape:         {:?}", schema.shape);
+            println!("token_id:      {:?}", schema.token_id);
+            println!("price/token:   {} wei", schema.price_per_token_wei);
+            let calldata = crate::execution::generic_engine::encode_calldata(
+                &schema,
+                wallet,
+                args.plan_args.quantity,
+            )?;
+            println!("calldata:      0x{}", hex::encode(&calldata));
+        }
     }
 
     println!();
@@ -268,7 +312,143 @@ async fn run_send(
             }
             run_send_opensea(args, slug, config_path).await
         }
+        SelectedEngine::Generic { schema } => {
+            if args.rehearsal {
+                return Err(KairoxError::Session(SessionError::new(
+                    "--rehearsal is only supported with the PUBLIC engine today; pass --engine public",
+                )));
+            }
+            run_send_generic(args, schema, config_path).await
+        }
     }
+}
+
+async fn run_send_generic(
+    args: MintArgs,
+    schema: crate::execution::generic_schema::GenericMintSchema,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
+    use crate::execution::broadcast::{
+        broadcast_to_all, summarize_broadcast, uncertain_outcome_error,
+    };
+    use crate::execution::generic_engine::{GenericMintRequest, prepare_generic_transaction};
+    use crate::execution::receipt::poll_receipt;
+
+    let wallet = args.plan_args.wallet.ok_or_else(|| {
+        KairoxError::Session(SessionError::new(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)",
+        ))
+    })?;
+    let registry = ChainRegistry::builtin();
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
+
+    eprintln!("selected engine: GENERIC (verified {:?})", schema.standard);
+    eprintln!("=================================================");
+    eprintln!(" LIVE SEND CONFIRMATION");
+    eprintln!("=================================================");
+    eprintln!(
+        "chain:      {} (chain id {})",
+        resolved.info.name, resolved.info.chain_id
+    );
+    eprintln!("wallet:     {wallet}");
+    eprintln!("collection: {}", args.plan_args.collection);
+    eprintln!("shape:      {:?}", schema.shape);
+    eprintln!("quantity:   {}", args.plan_args.quantity);
+    eprintln!("=================================================");
+
+    if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
+        eprintln!(
+            "Aborted: confirmation not received. Nothing was signed, prepared, or broadcast."
+        );
+        return Ok(());
+    }
+
+    let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
+        KairoxError::Session(SessionError::new(format!(
+            "failed to load signing key: {e}"
+        )))
+    })?;
+    if signer.address() != wallet {
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer.address(),
+                wallet
+            ),
+        )));
+    }
+
+    let pool = connect_send_pool(
+        &resolved,
+        args.plan_args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
+    let read_client = pool.preferred_read().ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            crate::execution::errors::SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available",
+        ))
+    })?;
+
+    let safety_caps = SafetyCaps {
+        max_mint_value: parse_wei("--max-mint-value-wei", &args.plan_args.max_mint_value_wei)?,
+        max_gas_cost: parse_wei("--max-gas-cost-wei", &args.plan_args.max_gas_cost_wei)?,
+        max_total_spend: parse_wei("--max-total-spend-wei", &args.plan_args.max_total_spend_wei)?,
+    };
+
+    let request = GenericMintRequest {
+        chain: resolved.info.clone(),
+        collection: args.plan_args.collection,
+        wallet,
+        quantity: args.plan_args.quantity,
+        schema,
+        gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
+        safety_caps,
+    };
+
+    let prepared = prepare_generic_transaction(read_client, &signer, &request).await?;
+
+    let send_clients =
+        pool.select_send_endpoints(&crate::chain::benchmark::HealthPolicy::default());
+    if send_clients.is_empty() {
+        return Err(KairoxError::Session(SessionError::new(
+            "no healthy send-capable RPC endpoint available",
+        )));
+    }
+    let broadcast_results = broadcast_to_all(&send_clients, &prepared.broadcast).await;
+    let summary = summarize_broadcast(&broadcast_results);
+
+    let receipt_state = match &summary {
+        BroadcastSummary::Confirmed { .. } => Some(
+            poll_receipt(
+                read_client,
+                prepared.tx_hash,
+                args.plan_args.collection,
+                wallet,
+                args.plan_args.quantity,
+                StdDuration::from_millis(750),
+                StdDuration::from_secs(60),
+                || {},
+            )
+            .await,
+        ),
+        BroadcastSummary::AllRejected => None,
+        BroadcastSummary::Uncertain => return Err(uncertain_outcome_error(&broadcast_results)),
+        BroadcastSummary::NotSent => None,
+    };
+
+    print_broadcast_result(
+        prepared.tx_hash,
+        &broadcast_results,
+        &summary,
+        &receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
+        false,
+    );
+    Ok(())
 }
 
 /// Connect every configured endpoint for `chain_args`'s chain and fail

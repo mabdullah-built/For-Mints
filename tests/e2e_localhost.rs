@@ -1634,6 +1634,228 @@ fn single_wallet_mint_output_file_writes_valid_schema_1_json() {
     assert_eq!(parsed["wallets"][0]["state"], "CONFIRMED_SUCCESS");
 }
 
+fn erc165_and_seadrop_revert_response(
+    method: &str,
+    params: &Value,
+    supports_erc721: bool,
+) -> Option<Behavior> {
+    if method == "eth_call" {
+        let data = params
+            .get(0)
+            .and_then(|c| c.get("data"))
+            .and_then(Value::as_str)
+            .unwrap_or("0x");
+        let supports_hex = format!(
+            "0x{}",
+            hex::encode(
+                &kairox::protocol::erc_standards::encode_supports_interface([0, 0, 0, 0])[0..4]
+            )
+        );
+        // `supportsInterface` selector alone (any interface id) -- the
+        // fixture only ever gets asked about ERC-721 in these tests.
+        if data.starts_with(&supports_hex) {
+            let mut word = [0u8; 32];
+            word[31] = supports_erc721 as u8;
+            return Some(rpc_ok(serde_json::json!(format!(
+                "0x{}",
+                hex::encode(word)
+            ))));
+        }
+        // Never a SeaDrop collection -- getPublicDrop/etc. all revert.
+        let seadrop_selectors = [
+            sd::getPublicDropCall::SELECTOR,
+            sd::getAllowedFeeRecipientsCall::SELECTOR,
+            sd::getMintStatsCall::SELECTOR,
+        ];
+        if seadrop_selectors
+            .iter()
+            .any(|sel| data.starts_with(&format!("0x{}", hex::encode(sel))))
+        {
+            return Some(Behavior::JsonRpcError {
+                code: -32000,
+                message: "execution reverted: not a SeaDrop collection".into(),
+            });
+        }
+    }
+    None
+}
+
+#[test]
+fn generic_engine_requires_both_schema_and_erc165_confirmation() {
+    let wallet = test_signer().address();
+    // ERC-165 says "no" (not ERC-721) even though a schema was declared --
+    // Low confidence alone must never resolve a live-send path.
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        erc165_and_seadrop_revert_response(method, params, false)
+            .or_else(|| standard_read_response(method, params))
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method: {method}"),
+            })
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema_path = dir.path().join("schema.toml");
+    std::fs::write(
+        &schema_path,
+        "standard = \"erc721\"\nshape = \"mint_quantity\"\nprice_per_token_wei = \"0\"\n",
+    )
+    .unwrap();
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--generic-schema",
+            schema_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"));
+}
+
+#[test]
+fn generic_erc721_verified_mint_succeeds_end_to_end() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        match method {
+            "eth_sendRawTransaction" => return echo_tx_hash_behavior(params),
+            "eth_getTransactionReceipt" => {
+                let queried_hash = params
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x")
+                    .to_string();
+                return rpc_ok(serde_json::json!({
+                    "transactionHash": queried_hash,
+                    "status": "0x1",
+                    "blockNumber": "0x1",
+                    "logs": [transfer_log_for(wallet, 11)],
+                }));
+            }
+            _ => {}
+        }
+        erc165_and_seadrop_revert_response(method, params, true)
+            .or_else(|| standard_read_response(method, params))
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in generic-mint scenario: {method}"),
+            })
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema_path = dir.path().join("schema.toml");
+    std::fs::write(
+        &schema_path,
+        "standard = \"erc721\"\nshape = \"mint_quantity\"\nprice_per_token_wei = \"10000000000000000\"\n",
+    )
+    .unwrap();
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--generic-schema",
+            schema_path.to_str().unwrap(),
+            "--send",
+            "--yes",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("BROADCAST RESULT"))
+        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+
+    let received = server.received.lock().unwrap();
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(m, _)| m == "eth_sendRawTransaction")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn generic_engine_definitive_simulation_revert_stops_before_signing() {
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_estimateGas" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "execution reverted".into(),
+            };
+        }
+        if method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "must never be called after a definitive simulation revert".into(),
+            };
+        }
+        erc165_and_seadrop_revert_response(method, params, true)
+            .or_else(|| standard_read_response(method, params))
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method: {method}"),
+            })
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema_path = dir.path().join("schema.toml");
+    std::fs::write(
+        &schema_path,
+        "standard = \"erc721\"\nshape = \"mint_quantity\"\nprice_per_token_wei = \"10000000000000000\"\n",
+    )
+    .unwrap();
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", signing_key_hex(&test_signer()))
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--generic-schema",
+            schema_path.to_str().unwrap(),
+            "--send",
+            "--yes",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("DEFINITIVE_REVERT"));
+
+    let received = server.received.lock().unwrap();
+    assert!(!received.iter().any(|(m, _)| m == "eth_sendRawTransaction"));
+}
+
 #[test]
 fn multi_wallet_mint_output_file_writes_valid_schema_1_json_in_manifest_order() {
     let a = signer_for_seed("kairox-e2e-output-a").address();
