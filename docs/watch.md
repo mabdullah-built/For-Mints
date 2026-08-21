@@ -81,6 +81,17 @@ line.
   before any waiting) and held in process memory for the full wait, the same
   trust model an unattended process already implies elsewhere in Kairox --
   there is no separate encrypted-at-rest key store.
-- A `NotStarted` PUBLIC stage and an OpenSea `next_stage` are both treated as
-  legitimate future targets; a collection with no configured public stage
-  and no `--slug` is rejected outright (never guessed).
+- A `NotStarted` on-chain public stage and an OpenSea `next_stage` are both
+  legitimate future targets. `--engine auto` (the default) no longer
+  requires `--slug`: an upcoming, currently-recognized *non-public*
+  OpenSea stage (signed-presale/allowlist/FCFS/FCFA) is auto-discovered
+  and preferred over a later on-chain public stage — see
+  `docs/resolver-architecture.md`'s tier-0 `OpenSeaDropsAdapter` section.
+  A collection with neither a configured on-chain public stage nor any
+  discoverable/explicit OpenSea drop is still rejected outright (never
+  guessed).
+- If the fresh, wallet-specific OpenSea authorization requested at T0
+  comes back with a genuine ineligibility rejection, `watch` stops that
+  target's session rather than automatically re-resolving to a later
+  supported stage (e.g. a public stage opening after the presale). This
+  is a known, disclosed limitation, not yet implemented.

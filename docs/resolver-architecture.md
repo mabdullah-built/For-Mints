@@ -35,15 +35,23 @@ Comparison against the current Kairox architecture, item by item:
 | Error handling | Ad hoc per-repo | Unchanged, extended this pass: `KairoxErrorCode::{UnsupportedProtocol,AmbiguousProtocol}` |
 | Unsupported protocol | Neither reference has this concept -- both assume the configured contract is correct | New this pass (below) |
 
-## The resolver (Parts 2-3)
+## The resolver (current)
 
 ```
 collection/wallet/quantity/[slug]
         |
         v
 AdapterRegistry::resolve()
-  tier 0: SeaDropAdapter   -- on-chain getPublicDrop(), Active/NotStarted
-  tier 1: OpenSeaDropsAdapter -- operator-supplied --slug
+  tier 0: OpenSeaDropsAdapter -- operator --slug (always wins outright), OR
+                                 auto-discovered active/upcoming NON-PUBLIC
+                                 OpenSea stage (signed-presale/allowlist/
+                                 FCFS/FCFA); never matches a plain public
+                                 stage -- see below
+  tier 1: SeaDropAdapter      -- on-chain getPublicDrop(), Active/NotStarted
+  tier 2: GenericVerifiedContractAdapter -- trusted-registry bytecode match,
+                                 OR verified-source semantic resolution
+                                 (HIGH); operator --generic-schema + ERC-165
+                                 alone (LOW, never live-sends)
         |
         v
   exactly one High-confidence Detection, or:
@@ -61,30 +69,37 @@ confidence match is recorded but never resolves anything on its own — see
 `cli::commands::mint::resolve_auto_engine` and print the winning evidence
 (`resolved_engine`, `adapter`, `confidence`, `source`) before proceeding.
 
-This intentionally matches the existing, already-tested precedence (native
-SeaDrop preferred, OpenSea Drops as fallback) rather than the more elaborate
-8-step hierarchy sketched in the request (proxy resolution, ERC-165,
-verified-source ABI matching, launchpad adapters, generic verified
-contracts, generic external transaction builder) -- see "What this pass
-does NOT add" below for why those tiers aren't implemented yet.
+**`OpenSeaDropsAdapter` is tier 0, ahead of native `SeaDropAdapter`.** This
+was a deliberate priority *swap* from an earlier pass, made to fix a real
+observed bug: an active, eligible OpenSea-hosted signed-presale stage
+existing alongside a later on-chain public stage, where an explicit
+`--engine public` invocation waited for the wrong (later, public) one
+instead. `OpenSeaDropsAdapter` only ever matches a currently-active (or,
+for `watch`, upcoming — `allow_not_yet_started`) *non-public* stage; a
+plain public stage (or no OpenSea drop at all) makes it return no match,
+which — since a tier with zero matches is simply skipped, never
+`AmbiguousProtocol` — falls straight through to `SeaDropAdapter` at tier 1.
+Slug auto-discovery (`opensea::discovery::resolve_drop`) is best-effort:
+any OpenSea transport/auth/server error is treated identically to "no
+drop discovered," never propagated, so OpenSea's availability can never
+block a collection whose native on-chain public stage still works.
+`GenericVerifiedContractAdapter` (tier 2, unchanged from its own pass) is
+tried last, and only reaches `High` confidence via an exact trusted
+bytecode-hash match or unambiguous verified-source semantic resolution —
+see `docs/generic-engine.md`.
 
-## What this pass does NOT add, and why
+## What this codebase does NOT yet add, and why
 
-The request's Parts 4, 7, 12-14 (GenericVerifiedContractEngine, a
-GenericExternalTransactionEngine that signs externally-produced calldata,
-ERC-1155 mint/receipt support, new launchpad adapters, token-gated SeaDrop)
-are **not implemented in this pass**. Each is a genuinely separate,
-safety-critical body of work — arming a live-send path against a contract
-Kairox has never encoded calldata for on its own, or trusting a third
-party's `to`/`data`/`value` tuple, is exactly the kind of decision the
-request's own safety boundaries ("never blindly guess arbitrary mint
-calldata", "never trust third-party calldata merely because the endpoint
-returned 200") demand be done carefully, with real verified-ABI/bytecode
-fingerprinting and a real validator, not a rushed pass bolted onto an
-unrelated watch-mode change. Building a `MintAdapter::detect()`-only
-resolver first (this pass) is the correct foundation for adding those
-later without disturbing the two already-hardened engines. See the final
-report for the concrete next steps.
+A `GenericExternalTransactionEngine` that signs externally-produced
+calldata from a third-party transaction builder, new dedicated launchpad
+adapters, and token-gated SeaDrop support are **not implemented**. Each is
+a genuinely separate, safety-critical body of work — trusting a third
+party's `to`/`data`/`value` tuple, or arming a live-send path against a
+contract Kairox has never independently verified mint semantics for, is
+exactly the kind of decision that demands its own dedicated pass with a
+real verified-ABI/bytecode fingerprinting model and a real validator, not
+a rushed addition bolted onto an unrelated change. See the current
+session's final report for what was and wasn't attempted.
 
 ## Adding a future adapter
 
