@@ -121,14 +121,25 @@ pub(crate) async fn resolve_auto_engine(
         metadata_provider
             .map(|p| Box::new(p) as Box<dyn crate::metadata::VerifiedContractMetadataProvider>);
 
+    // OpenSea auto-discovery is best-effort: if no API key is configured
+    // (or it's otherwise unusable), `opensea` stays `None` and
+    // `OpenSeaDropsAdapter` simply never attempts auto-discovery -- never
+    // an error, since an operator running a purely native-SeaDrop
+    // collection has no reason to configure an OpenSea key at all. An
+    // explicit `--slug` still works regardless of this.
+    let opensea = load_opensea_client(StdDuration::from_secs(10)).ok();
+
     let registry = AdapterRegistry::new(vec![
+        Box::new(OpenSeaDropsAdapter {
+            plan_args,
+            config_path,
+            slug: plan_args.slug.as_deref(),
+            opensea: opensea.as_ref(),
+        }) as Box<dyn MintAdapter>,
         Box::new(SeaDropAdapter {
             plan_args,
             config_path,
             allow_not_yet_started,
-        }) as Box<dyn MintAdapter>,
-        Box::new(OpenSeaDropsAdapter {
-            slug: plan_args.slug.as_deref(),
         }) as Box<dyn MintAdapter>,
         Box::new(GenericVerifiedContractAdapter {
             plan_args,

@@ -3,6 +3,7 @@
 //! [`client`] module docs.
 
 pub mod client;
+pub mod discovery;
 pub mod errors;
 pub mod mock;
 pub mod models;

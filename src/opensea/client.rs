@@ -14,7 +14,9 @@ use serde_json::Value;
 use url::Url;
 
 use super::errors::OpenSeaError;
-use super::models::{DropDetailedResponse, DropMintRequest, DropMintResponse, V1ErrorWrapper};
+use super::models::{
+    ContractResponse, DropDetailedResponse, DropMintRequest, DropMintResponse, V1ErrorWrapper,
+};
 use super::transport::{HttpOpenSeaTransport, OpenSeaTransport, OpenSeaTransportError};
 
 /// The official OpenSea API base URL.
@@ -76,6 +78,43 @@ impl OpenSeaClient {
                 detail: e.to_string(),
             })
         })
+    }
+
+    /// `GET /api/v2/chain/{chain}/contract/{address}` — a safe read.
+    /// Returns `Ok(None)` for a 404 (OpenSea has no record of this
+    /// contract at all -- not every contract has one, and that is not an
+    /// error), `Ok(Some(..))` for a 200, and `Err` for anything else
+    /// (auth/rate-limit/server/transport problems). The response's own
+    /// `collection` field is a *candidate* slug only -- see
+    /// [`ContractResponse`]'s docs for why callers must independently
+    /// verify it before trusting it.
+    pub async fn get_contract(
+        &self,
+        chain: &str,
+        address: Address,
+    ) -> Result<Option<ContractResponse>, OpenSeaError> {
+        let path = format!("/api/v2/chain/{chain}/contract/{address:#x}");
+        let response = self
+            .transport
+            .get(&path)
+            .await
+            .map_err(map_transport_error)?;
+        match response.status {
+            200 => serde_json::from_value(response.body.clone())
+                .map(Some)
+                .map_err(|e| OpenSeaError::MalformedApiResponse {
+                    detail: e.to_string(),
+                }),
+            404 => Ok(None),
+            401 | 403 => Err(OpenSeaError::AuthenticationFailed),
+            429 => Err(OpenSeaError::RateLimited),
+            500..=599 => Err(OpenSeaError::ServerError {
+                detail: error_detail(&response.body),
+            }),
+            other => Err(OpenSeaError::MalformedApiResponse {
+                detail: format!("unexpected HTTP status {other}"),
+            }),
+        }
     }
 
     /// `POST /api/v2/drops/{slug}/mint` — requests ready-to-sign
@@ -207,6 +246,66 @@ mod tests {
         assert_eq!(details.collection_slug, "cool-cats");
         assert_eq!(details.chain, "ethereum");
         assert!(details.is_minting);
+    }
+
+    #[tokio::test]
+    async fn get_contract_parses_a_valid_response() {
+        let addr = Address::repeat_byte(0x11);
+        let transport = MockOpenSeaTransport::builder()
+            .respond(
+                "GET",
+                &format!("/api/v2/chain/robinhood/contract/{addr:#x}"),
+                200,
+                json!({
+                    "address": format!("{addr:#x}"),
+                    "chain": "robinhood",
+                    "collection": "hide",
+                    "contract_standard": "erc721",
+                    "name": "HIDE",
+                }),
+            )
+            .build();
+        let resp = client(transport)
+            .get_contract("robinhood", addr)
+            .await
+            .unwrap();
+        assert_eq!(resp.unwrap().collection, "hide");
+    }
+
+    #[tokio::test]
+    async fn get_contract_404_is_none_not_an_error() {
+        let addr = Address::repeat_byte(0x22);
+        let transport = MockOpenSeaTransport::builder()
+            .respond(
+                "GET",
+                &format!("/api/v2/chain/robinhood/contract/{addr:#x}"),
+                404,
+                json!({"errors": ["not found"]}),
+            )
+            .build();
+        let resp = client(transport)
+            .get_contract("robinhood", addr)
+            .await
+            .unwrap();
+        assert!(resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_contract_server_error_is_a_real_error() {
+        let addr = Address::repeat_byte(0x33);
+        let transport = MockOpenSeaTransport::builder()
+            .respond(
+                "GET",
+                &format!("/api/v2/chain/robinhood/contract/{addr:#x}"),
+                500,
+                json!({"errors": ["boom"]}),
+            )
+            .build();
+        let err = client(transport)
+            .get_contract("robinhood", addr)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenSeaError::ServerError { .. }));
     }
 
     #[tokio::test]

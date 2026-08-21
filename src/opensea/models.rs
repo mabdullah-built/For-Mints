@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chain::registry::ChainId;
+use crate::domain::stage::StageProtocol;
 
 /// `POST /api/v2/drops/{slug}/mint` request body (`DropMintRequest`).
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +75,52 @@ pub struct DropStageResponse {
     pub max_per_wallet: String,
 }
 
+/// `GET /api/v2/chain/{chain}/contract/{address}` response body
+/// (`ContractResponse`). Verified directly against the current live
+/// `https://api.opensea.io/api/v2/openapi.json`/reference docs: the
+/// endpoint exists, and its schema is exactly `{address, chain, collection,
+/// contract_standard, name}` (all required strings) -- `collection` is
+/// OpenSea's collection identifier (used elsewhere in the v2 API as the
+/// `{slug}` path parameter, e.g. `GET /api/v2/collections/{collection}`),
+/// which is why [`super::discovery::resolve_drop`] treats it as a *candidate*
+/// slug rather than an assumption: it is only trusted once the resulting
+/// drop lookup independently confirms the same contract address.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContractResponse {
+    pub address: String,
+    pub chain: String,
+    pub collection: String,
+    #[serde(default)]
+    pub contract_standard: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Best-effort mapping from OpenSea's `DropStageResponse.stage_type` wire
+/// string to a [`StageProtocol`]. Deliberately conservative: an
+/// unrecognized string returns `None` rather than a guessed protocol --
+/// callers must treat `None` as "do not auto-route this stage", never as
+/// "assume public". `"public"`/`"signed_presale"` are the two values
+/// independently confirmed against real Robinhood-mainnet acceptance
+/// evidence (`GET /api/v2/drops/{slug}` for a real signed-presale-then-public
+/// collection); `"presale"`/`"fcfs"`/`"fcfa"` are SeaDrop's own well-known
+/// terminology, included defensively but not independently re-verified
+/// against a live response this pass. Misclassifying a stage here only
+/// affects Kairox's own routing *preference* -- the actual mint transaction
+/// OpenSea returns is always independently re-validated (target/collection/
+/// wallet/quantity/value) before signing, regardless of what label this
+/// function assigned.
+pub fn map_stage_type(stage_type: &str) -> Option<StageProtocol> {
+    match stage_type.to_ascii_lowercase().as_str() {
+        "public" => Some(StageProtocol::Public),
+        "signed_presale" => Some(StageProtocol::SignedPresale),
+        "presale" | "allowlist" | "whitelist" => Some(StageProtocol::Allowlist),
+        "fcfs" => Some(StageProtocol::Fcfs),
+        "fcfa" => Some(StageProtocol::Fcfa),
+        _ => None,
+    }
+}
+
 /// Map a Kairox [`ChainId`] to the `ChainIdentifier` string the official
 /// OpenSea API expects. Verified directly against the current
 /// `ChainIdentifier` enum in the live OpenAPI spec, which does include
@@ -117,6 +164,36 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["minter"], "0xabc");
         assert_eq!(json["quantity"], 2);
+    }
+
+    #[test]
+    fn contract_response_deserializes_documented_field_names() {
+        let json = serde_json::json!({
+            "address": "0x1e3e0922ea99e365f1b434391c81fefee345d1d9",
+            "chain": "robinhood",
+            "collection": "hide",
+            "contract_standard": "erc721",
+            "name": "HIDE",
+        });
+        let resp: ContractResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.collection, "hide");
+        assert_eq!(resp.chain, "robinhood");
+    }
+
+    #[test]
+    fn map_stage_type_recognizes_public_and_signed_presale() {
+        assert_eq!(map_stage_type("public"), Some(StageProtocol::Public));
+        assert_eq!(map_stage_type("PUBLIC"), Some(StageProtocol::Public));
+        assert_eq!(
+            map_stage_type("signed_presale"),
+            Some(StageProtocol::SignedPresale)
+        );
+    }
+
+    #[test]
+    fn map_stage_type_never_guesses_an_unrecognized_string() {
+        assert_eq!(map_stage_type("mystery_stage"), None);
+        assert_eq!(map_stage_type(""), None);
     }
 
     #[test]

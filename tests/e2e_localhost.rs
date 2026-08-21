@@ -4385,3 +4385,244 @@ fn watch_json_report_is_exactly_one_valid_json_object_over_real_http() {
     });
     assert_eq!(parsed["wallets"][0]["state"], "CONFIRMED_SUCCESS");
 }
+
+// =======================================================================
+// Phase C: automatic OpenSea slug discovery / stage-priority E2E. No
+// `--slug` is ever passed in these tests -- the point is proving
+// `--engine auto` genuinely discovers the drop and prefers a currently
+// -active, OpenSea-recognized non-public stage over native on-chain
+// public (the real-world bug class an explicit `--engine public` used to
+// reproduce), while never letting OpenSea's own availability block a
+// collection whose native on-chain public stage still works. Every
+// scenario here is a dry run (no `--send`) -- resolution evidence alone
+// is what is being proven.
+// =======================================================================
+
+fn opensea_stage_json(slug: &str, stage_type: &str, contract: Address) -> Value {
+    serde_json::json!({
+        "collection_slug": slug,
+        "collection_name": "Test Collection",
+        "chain": "ethereum",
+        "contract_address": format!("{contract:#x}"),
+        "drop_type": stage_type,
+        "is_minting": true,
+        "active_stage": {
+            "uuid": "stage-1",
+            "stage_type": stage_type,
+            "label": null,
+            "price": "0",
+            "price_currency_address": "0x0000000000000000000000000000000000000000",
+            "start_time": "2020-01-01T00:00:00Z",
+            "end_time": "2999-01-01T00:00:00Z",
+            "max_per_wallet": "10",
+        },
+        "next_stage": null,
+        "stages": [],
+        "total_supply": null,
+        "max_supply": null,
+    })
+}
+
+/// Serves the same "always-active on-chain PublicDrop" RPC responses as
+/// [`standard_read_response`], plus a real `GET /api/v2/chain/ethereum/
+/// contract/{NFT}` and `GET /api/v2/drops/{slug}` -- so auto-discovery has
+/// something genuine to find without an operator-supplied `--slug`.
+fn spawn_autodiscovery_server(
+    slug: &'static str,
+    active_stage_type: &'static str,
+) -> LocalHttpServer {
+    LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior =
+                standard_read_response(&method, &params).unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!("unexpected RPC method in auto-discovery scenario: {method}"),
+                });
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": slug,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{slug}") {
+            (
+                path.to_string(),
+                rpc_ok_status(opensea_stage_json(slug, active_stage_type, NFT)),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    })
+}
+
+#[test]
+fn auto_engine_prefers_auto_discovered_signed_presale_over_active_onchain_public() {
+    let wallet = test_signer().address();
+    const SLUG: &str = "kairox-e2e-auto-signed-presale";
+    let server = spawn_autodiscovery_server(SLUG, "signed_presale");
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stderr(predicates::str::contains("OpenSeaDropsAdapter"))
+        .stderr(predicates::str::contains(SLUG));
+}
+
+#[test]
+fn auto_engine_falls_back_to_native_public_when_opensea_active_stage_is_plain_public() {
+    // The on-chain PublicDrop is (per standard_read_response) always
+    // Active, and OpenSea *also* reports an active stage -- but its
+    // stage_type is plain "public", so OpenSeaDropsAdapter must defer to
+    // the cheaper, dependency-free native route rather than routing
+    // through OpenSea unnecessarily.
+    let wallet = test_signer().address();
+    const SLUG: &str = "kairox-e2e-auto-plain-public";
+    let server = spawn_autodiscovery_server(SLUG, "public");
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: Public"))
+        .stderr(predicates::str::contains("SeaDropAdapter"));
+}
+
+#[test]
+fn auto_engine_native_public_still_resolves_when_opensea_contract_lookup_errors() {
+    // OpenSea's contract-lookup endpoint returns a genuine server error --
+    // auto-discovery must be swallowed as "no drop discovered", never
+    // propagated, so the collection's still-working native on-chain
+    // public stage is unaffected by OpenSea's availability.
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior =
+                standard_read_response(&method, &params).unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!("unexpected RPC method: {method}"),
+                });
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(500, serde_json::json!({"errors": ["internal error"]})),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: Public"))
+        .stderr(predicates::str::contains("SeaDropAdapter"));
+}
+
+#[test]
+fn auto_engine_explicit_slug_still_wins_outright_without_auto_discovery() {
+    // An operator-provided --slug is still taken at face value, exactly
+    // as before auto-discovery existed -- no contract-lookup call is
+    // even attempted.
+    let wallet = test_signer().address();
+    const SLUG: &str = "kairox-e2e-explicit-slug";
+    let server = spawn_combined_rpc_and_opensea_server(
+        |method, params| {
+            standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method: {method}"),
+            })
+        },
+        || {
+            Behavior::HttpStatus(
+                500,
+                serde_json::json!({"errors": ["mint endpoint should not be reached in a dry run"]}),
+            )
+        },
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--slug",
+            SLUG,
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stderr(predicates::str::contains(format!(
+            "operator-provided OpenSea collection slug {SLUG:?}"
+        )));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(p, _)| p.contains("/contract/")),
+        "an explicit --slug must never trigger a contract-lookup auto-discovery call"
+    );
+}
