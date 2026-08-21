@@ -155,8 +155,12 @@ pub struct PlanArgs {
     /// Which mint execution engine to use.
     #[arg(long, value_enum, default_value_t = EngineSelection::Auto)]
     pub engine: EngineSelection,
-    /// OpenSea collection slug. Required for --engine opensea; used by
-    /// --engine auto only when the public on-chain stage is not active.
+    /// OpenSea collection slug. Required for --engine opensea. Never
+    /// required for --engine auto: when omitted, a currently-active (or,
+    /// for `watch`, upcoming) non-public OpenSea stage is auto-discovered
+    /// and independently verified instead -- see
+    /// cli::commands::resolver_adapters::OpenSeaDropsAdapter. Still
+    /// honored outright if given, bypassing auto-discovery entirely.
     #[arg(long)]
     pub slug: Option<String>,
     /// Path to an operator-declared generic mint schema (TOML). Used by

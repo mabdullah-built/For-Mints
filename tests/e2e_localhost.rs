@@ -4626,3 +4626,139 @@ fn auto_engine_explicit_slug_still_wins_outright_without_auto_discovery() {
         "an explicit --slug must never trigger a contract-lookup auto-discovery call"
     );
 }
+
+#[test]
+fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_active_public() {
+    // The on-chain PublicDrop is already Active right now (per
+    // standard_read_response's default 2020-2999 window) -- if the
+    // OpenSea route were not correctly preferred, watch would resolve
+    // straight to the native public engine and execute immediately,
+    // never waiting at all. Proving it genuinely waits ~2s and then
+    // requests a fresh OpenSea mint authorization is what distinguishes
+    // "auto-discovery actually wired into watch" from "resolution code
+    // exists but nothing calls it with allow_not_yet_started".
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-watch-auto-presale";
+    let stage_start = unix_now() + 2;
+    let start_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_start as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let end_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_start as i64 + 3600)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior =
+                standard_read_response(&method, &params).unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!(
+                        "unexpected RPC method in watch-auto-discovery scenario: {method}"
+                    ),
+                });
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "collection_slug": SLUG,
+                    "collection_name": "Test Collection",
+                    "chain": "ethereum",
+                    "contract_address": format!("{NFT:#x}"),
+                    "drop_type": "signed_presale",
+                    "is_minting": true,
+                    "active_stage": null,
+                    "next_stage": {
+                        "uuid": "stage-1",
+                        "stage_type": "signed_presale",
+                        "label": null,
+                        "price": "0",
+                        "price_currency_address": "0x0000000000000000000000000000000000000000",
+                        "start_time": start_rfc3339,
+                        "end_time": end_rfc3339,
+                        "max_per_wallet": "10",
+                    },
+                    "stages": [],
+                    "total_supply": null,
+                    "max_supply": null,
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            // A terminal ineligibility rejection -- this test only needs
+            // to prove resolution+waiting genuinely routed through
+            // OpenSea and reached T0, not the full signed-mint happy
+            // path (already covered by
+            // opensea_server_signed_mint_verifies_real_eip712_signature_and_completes_end_to_end).
+            (
+                path.to_string(),
+                Behavior::HttpStatus(
+                    422,
+                    serde_json::json!({"errors": ["wallet is not eligible for this stage"]}),
+                ),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stderr(predicates::str::contains("upcoming stage"))
+        .stderr(predicates::str::contains("not eligible"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received.iter().any(|(p, _)| p.ends_with("/mint")),
+        "watch should have waited for the upcoming stage and then requested a fresh mint authorization at T0"
+    );
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an ineligibility-rejected signed stage must never broadcast"
+    );
+}

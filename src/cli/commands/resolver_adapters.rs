@@ -139,6 +139,13 @@ pub struct OpenSeaDropsAdapter<'a> {
     pub config_path: Option<&'a Path>,
     pub slug: Option<&'a str>,
     pub opensea: Option<&'a crate::opensea::client::OpenSeaClient>,
+    /// `watch` (`true`) also matches a currently-*upcoming*
+    /// (`next_stage`, not yet started) non-public stage, so it can
+    /// auto-discover a future signed presale to wait for -- exactly the
+    /// same distinction [`SeaDropAdapter::allow_not_yet_started`] makes
+    /// for the native route. `mint` (`false`) only ever matches an
+    /// already-active stage, since it means "act now".
+    pub allow_not_yet_started: bool,
 }
 
 #[async_trait::async_trait]
@@ -196,31 +203,63 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
             Ok(None) | Err(_) => return Ok(None),
         };
 
-        let Some(stage) = details.active_stage.as_ref() else {
-            return Ok(None);
-        };
-        let Some(protocol) = crate::opensea::models::map_stage_type(&stage.stage_type) else {
-            return Ok(None);
-        };
-        if protocol == StageProtocol::Public {
-            return Ok(None);
+        // An already-active non-public stage always wins outright,
+        // whether called from `mint` or `watch`.
+        if let Some(stage) = details.active_stage.as_ref()
+            && let Some(protocol) = crate::opensea::models::map_stage_type(&stage.stage_type)
+            && protocol != StageProtocol::Public
+        {
+            return Ok(Some(auto_discovered_detection(
+                &details.collection_slug,
+                stage,
+                protocol,
+                "active",
+            )));
         }
 
-        Ok(Some(Detection {
-            engine: ResolvedEngine::OpenSea {
-                slug: details.collection_slug.clone(),
-            },
-            evidence: ProtocolEvidence {
-                source: format!(
-                    "auto-discovered OpenSea drop {:?}: active stage {:?} (recognized as {protocol:?})",
-                    details.collection_slug, stage.stage_type
-                ),
-                confidence: Confidence::High,
-                adapter: "OpenSeaDropsAdapter",
-                matched_interfaces: vec![],
-                matched_selectors: vec![],
-            },
-        }))
+        // `watch` also considers a genuinely *upcoming* non-public stage
+        // -- OpenSea's own `next_stage` -- so it can discover a future
+        // signed presale to wait for instead of falling through to a
+        // later native public stage. `mint` never does: it means "act
+        // now", and a stage that has not opened yet is never a match for
+        // it.
+        if self.allow_not_yet_started
+            && let Some(stage) = details.next_stage.as_ref()
+            && let Some(protocol) = crate::opensea::models::map_stage_type(&stage.stage_type)
+            && protocol != StageProtocol::Public
+        {
+            return Ok(Some(auto_discovered_detection(
+                &details.collection_slug,
+                stage,
+                protocol,
+                "upcoming",
+            )));
+        }
+
+        Ok(None)
+    }
+}
+
+fn auto_discovered_detection(
+    slug: &str,
+    stage: &crate::opensea::models::DropStageResponse,
+    protocol: StageProtocol,
+    timing: &str,
+) -> Detection {
+    Detection {
+        engine: ResolvedEngine::OpenSea {
+            slug: slug.to_string(),
+        },
+        evidence: ProtocolEvidence {
+            source: format!(
+                "auto-discovered OpenSea drop {slug:?}: {timing} stage {:?} (recognized as {protocol:?})",
+                stage.stage_type
+            ),
+            confidence: Confidence::High,
+            adapter: "OpenSeaDropsAdapter",
+            matched_interfaces: vec![],
+            matched_selectors: vec![],
+        },
     }
 }
 

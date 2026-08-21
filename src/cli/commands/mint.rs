@@ -135,6 +135,7 @@ pub(crate) async fn resolve_auto_engine(
             config_path,
             slug: plan_args.slug.as_deref(),
             opensea: opensea.as_ref(),
+            allow_not_yet_started,
         }) as Box<dyn MintAdapter>,
         Box::new(SeaDropAdapter {
             plan_args,
