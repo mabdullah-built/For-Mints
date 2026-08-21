@@ -257,35 +257,58 @@ pub async fn prepare_generic_transaction(
     }
     let mint_value = price_per_token.saturating_mul(U256::from(request.quantity));
 
-    let block = client.latest_block().await?;
+    // These five reads have no data dependency on each other -- see
+    // `opensea_engine::prepare_opensea_wallet_unsigned`'s identical
+    // optimization (and its
+    // `tests::parallel_prepare_reads_take_the_slowest_call_not_the_sum`
+    // regression test) for the full rationale.
+    let (gas_estimate, block, max_priority_fee_per_gas, nonce, balance) = tokio::try_join!(
+        async {
+            client
+                .estimate_gas(request.wallet, request.collection, &calldata, mint_value)
+                .await
+                .map_err(|_| {
+                    // A revert during simulation is a DEFINITIVE_REVERT: there is
+                    // no independently-established stage-timing model in this
+                    // pass to excuse it as "not open yet" (see SimulationOutcome
+                    // docs), so it stops the session here rather than being
+                    // signed.
+                    KairoxError::Session(SessionError::new(
+                        "generic mint simulation (eth_estimateGas) reverted: DEFINITIVE_REVERT; refusing to sign",
+                    ))
+                })
+        },
+        async { client.latest_block().await.map_err(KairoxError::from) },
+        async {
+            client
+                .max_priority_fee_per_gas()
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            client
+                .transaction_count(request.wallet)
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            client
+                .get_balance(request.wallet)
+                .await
+                .map_err(KairoxError::from)
+        },
+    )?;
+    let gas_limit = ((gas_estimate as f64) * request.gas_buffer_multiplier.max(1.0)).ceil() as u64;
+
     let base_fee_per_gas = block.base_fee_per_gas.ok_or_else(|| {
         KairoxError::Session(SessionError::new(
             "chain does not report an EIP-1559 baseFeePerGas; cannot safely price a live transaction",
         ))
     })?;
-    let max_priority_fee_per_gas = client.max_priority_fee_per_gas().await?;
     let max_fee_per_gas = base_fee_per_gas
         .saturating_mul(2)
         .saturating_add(max_priority_fee_per_gas);
     let fees = Eip1559Fees::new(base_fee_per_gas, max_priority_fee_per_gas, max_fee_per_gas)?;
-
-    let nonce = client.transaction_count(request.wallet).await?;
-    let balance = client.get_balance(request.wallet).await?;
-
-    let gas_estimate = client
-        .estimate_gas(request.wallet, request.collection, &calldata, mint_value)
-        .await
-        .map_err(|_| {
-            // A revert during simulation is a DEFINITIVE_REVERT: there is
-            // no independently-established stage-timing model in this
-            // pass to excuse it as "not open yet" (see SimulationOutcome
-            // docs), so it stops the session here rather than being
-            // signed.
-            KairoxError::Session(SessionError::new(
-                "generic mint simulation (eth_estimateGas) reverted: DEFINITIVE_REVERT; refusing to sign",
-            ))
-        })?;
-    let gas_limit = ((gas_estimate as f64) * request.gas_buffer_multiplier.max(1.0)).ceil() as u64;
 
     let worst_case_gas_cost = fees.worst_case_gas_cost(gas_limit);
     let worst_case_total = worst_case_total_spend(mint_value, worst_case_gas_cost);

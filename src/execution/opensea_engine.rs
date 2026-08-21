@@ -378,42 +378,78 @@ pub async fn prepare_opensea_wallet_unsigned(
     // used for state/simulation -- never SEND_ONLY/SEQUENCER/
     // ConfiguredSendOnly (those are excluded from `preferred_read` itself,
     // see `chain::pool`).
+    //
+    // The five reads below (gas estimate, latest block/base fee, priority
+    // fee, nonce, balance) have no data dependency on each other -- each
+    // one only combines with the *results* of the others afterward (gas
+    // limit + fees -> worst-case cost; worst-case cost + balance -> the
+    // insufficient-balance check). Real Robinhood-mainnet acceptance
+    // evidence measured this step (issued fully sequentially) at roughly
+    // 690-800ms; running them concurrently instead turns that into
+    // roughly the slowest single call's latency rather than their sum --
+    // see `execution::opensea_engine::tests::parallel_prepare_reads_take_the_slowest_call_not_the_sum`
+    // for a deterministic, mock-latency-based proof of exactly that
+    // shape, and this function's own e2e coverage
+    // (`opensea_server_signed_mint_verifies_real_eip712_signature_and_completes_end_to_end`
+    // et al.) for proof that the *values* used are unaffected by fetching
+    // them concurrently instead of one at a time.
     let prepare_sw = Stopwatch::start();
     on_progress(OpenSeaProgress::Simulating);
     let sim_sw = Stopwatch::start();
-    let gas_estimate = read_client
-        .estimate_gas(
-            params.wallet,
-            validated.target,
-            &validated.calldata,
-            validated.value,
-        )
-        .await
-        .map_err(|e| {
-            KairoxError::OpenSea(OpenSeaError::SimulationFailure {
-                detail: e.to_string(),
-            })
-        })?;
+    let (gas_estimate, block, max_priority_fee_per_gas, nonce, balance) = tokio::try_join!(
+        async {
+            read_client
+                .estimate_gas(
+                    params.wallet,
+                    validated.target,
+                    &validated.calldata,
+                    validated.value,
+                )
+                .await
+                .map_err(|e| {
+                    KairoxError::OpenSea(OpenSeaError::SimulationFailure {
+                        detail: e.to_string(),
+                    })
+                })
+        },
+        async { read_client.latest_block().await.map_err(KairoxError::from) },
+        async {
+            read_client
+                .max_priority_fee_per_gas()
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            read_client
+                .transaction_count(params.wallet)
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            read_client
+                .get_balance(params.wallet)
+                .await
+                .map_err(KairoxError::from)
+        },
+    )?;
+    // Covers the whole concurrent batch above, not gas-estimation alone --
+    // see the comment above this block for why that is the more useful
+    // number now.
     metrics.signed_engine_simulation_ms = Some(sim_sw.elapsed_ms());
     let gas_limit = ((gas_estimate as f64) * params.gas_buffer_multiplier.max(1.0)).ceil() as u64;
 
-    let block = read_client.latest_block().await?;
     let base_fee_per_gas = block.base_fee_per_gas.ok_or_else(|| {
         KairoxError::Session(SessionError::new(
             "chain does not report an EIP-1559 baseFeePerGas; cannot safely price a live transaction"
                 ,
         ))
     })?;
-    let max_priority_fee_per_gas = read_client.max_priority_fee_per_gas().await?;
     let max_fee_per_gas = base_fee_per_gas
         .saturating_mul(2)
         .saturating_add(max_priority_fee_per_gas);
     let fees = Eip1559Fees::new(base_fee_per_gas, max_priority_fee_per_gas, max_fee_per_gas)?;
-
     // Independent per-wallet pending nonce -- exactly one mint transaction
     // per wallet per session, never a chain of same-wallet transactions.
-    let nonce = read_client.transaction_count(params.wallet).await?;
-    let balance = read_client.get_balance(params.wallet).await?;
 
     let worst_case_gas_cost = fees.worst_case_gas_cost(gas_limit);
     let worst_case_total = worst_case_total_spend(validated.value, worst_case_gas_cost);
@@ -844,6 +880,88 @@ mod tests {
             "the OpenSea-dependent critical path must be honestly measured"
         );
         assert_eq!(outcome.metrics.opensea_retry_count, Some(0));
+    }
+
+    #[tokio::test]
+    async fn parallel_prepare_reads_take_the_slowest_call_not_the_sum() {
+        // Deterministic, mock-latency-based proof of the optimization
+        // described in `prepare_opensea_wallet_unsigned`'s doc comment:
+        // five independent RPC reads, each delayed identically, take
+        // roughly one delay's worth of wall-clock time when run
+        // concurrently -- not the five-delay sum a fully sequential
+        // version would take. This is a deterministic local-performance
+        // regression test (brief section 51/73), not an observational
+        // network benchmark.
+        let signer = signer();
+        let delay = StdDuration::from_millis(80);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .delay("eth_estimateGas", delay)
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .delay("eth_getBlockByNumber", delay)
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .delay("eth_maxPriorityFeePerGas", delay)
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .delay("eth_getTransactionCount", delay)
+            .respond("eth_getTransactionCount", json!("0x0"))
+            .delay("eth_getBalance", delay)
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .build();
+        let read_client = RpcClient::connect(
+            Box::new(transport),
+            1,
+            EndpointRole::ReadWrite,
+            Some("node-0".into()),
+        )
+        .await
+        .unwrap();
+
+        let opensea_transport = MockOpenSeaTransport::builder()
+            .respond(
+                "POST",
+                "/api/v2/drops/cool-cats/mint",
+                200,
+                valid_mint_response_json(1, 0),
+            )
+            .build();
+        let opensea = OpenSeaClient::with_transport(Box::new(opensea_transport));
+
+        let chain_info = ChainRegistry::builtin().by_id(1).unwrap().clone();
+        let params = OpenSeaWalletMintParams {
+            chain: &chain_info,
+            slug: "cool-cats",
+            nft_contract: NFT,
+            seadrop_contract: SEADROP,
+            wallet: signer.address(),
+            quantity: 1,
+            gas_buffer_multiplier: 1.2,
+            safety_caps: SafetyCaps {
+                max_mint_value: U256::from(1_000_000_000_000_000_000u128),
+                max_gas_cost: U256::from(1_000_000_000_000_000_000u128),
+                max_total_spend: U256::from(1_000_000_000_000_000_000u128),
+            },
+            known_stage_start: None,
+            expected_price_per_token: None,
+            receipt_poll_interval: StdDuration::from_millis(5),
+            receipt_timeout: StdDuration::from_millis(200),
+        };
+
+        let started = std::time::Instant::now();
+        prepare_opensea_wallet_unsigned(&opensea, &read_client, signer.address(), &params, |_| {})
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < delay * 3,
+            "five reads run concurrently should take roughly one delay ({delay:?}), not their \
+             sum (would be {:?}); took {elapsed:?}",
+            delay * 5
+        );
     }
 
     #[tokio::test]
