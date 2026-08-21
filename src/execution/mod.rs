@@ -5,6 +5,7 @@ pub mod errors;
 pub mod generic_engine;
 pub mod generic_registry;
 pub mod generic_schema;
+pub mod generic_semantics;
 pub mod live;
 pub mod manifest;
 pub mod metrics;

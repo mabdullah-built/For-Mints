@@ -41,8 +41,7 @@ enum SelectedEngine {
         slug: String,
     },
     Generic {
-        fingerprint: crate::execution::generic_registry::TrustedGenericFingerprint,
-        bytecode_hash: alloy_primitives::B256,
+        target: crate::execution::generic_engine::ResolvedGenericTarget,
     },
 }
 
@@ -77,13 +76,9 @@ async fn select_engine(
                 crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
                     SelectedEngine::OpenSea { slug }
                 }
-                crate::execution::resolver::ResolvedEngine::Generic {
-                    fingerprint,
-                    bytecode_hash,
-                } => SelectedEngine::Generic {
-                    fingerprint,
-                    bytecode_hash,
-                },
+                crate::execution::resolver::ResolvedEngine::Generic { target } => {
+                    SelectedEngine::Generic { target }
+                }
             })
         }
     }
@@ -109,6 +104,23 @@ pub(crate) async fn resolve_auto_engine(
         .map(crate::execution::generic_schema::load_schema)
         .transpose()?;
 
+    // Resolved once here purely to pick a chain-appropriate verified-metadata
+    // provider (if any) -- each adapter still independently resolves/connects
+    // its own chain/client inside `detect()`, exactly as before.
+    let chain_registry = ChainRegistry::builtin();
+    let metadata_provider =
+        resolve_chain_and_runtime(&chain_registry, &plan_args.chain_args, config_path)
+            .ok()
+            .and_then(|(resolved, _runtime)| {
+                crate::metadata::blockscout::BlockscoutProvider::for_chain(
+                    resolved.info.chain_id,
+                    StdDuration::from_secs(10),
+                )
+            });
+    let metadata_provider: Option<Box<dyn crate::metadata::VerifiedContractMetadataProvider>> =
+        metadata_provider
+            .map(|p| Box::new(p) as Box<dyn crate::metadata::VerifiedContractMetadataProvider>);
+
     let registry = AdapterRegistry::new(vec![
         Box::new(SeaDropAdapter {
             plan_args,
@@ -123,6 +135,7 @@ pub(crate) async fn resolve_auto_engine(
             config_path,
             schema: generic_schema.as_ref(),
             trusted_registry: crate::execution::generic_registry::BUILTIN_REGISTRY,
+            metadata_provider: metadata_provider.as_deref(),
         }) as Box<dyn MintAdapter>,
     ]);
     registry.resolve().await
@@ -246,10 +259,7 @@ async fn run_dry_run(
             }
             println!("--- (nothing above this line is on-chain verified state) ---");
         }
-        SelectedEngine::Generic {
-            fingerprint,
-            bytecode_hash,
-        } => {
+        SelectedEngine::Generic { target } => {
             if json || output.is_some() {
                 return Err(KairoxError::Session(SessionError::new(
                     "--json/--output for a dry run is only supported for the PUBLIC engine today",
@@ -259,21 +269,28 @@ async fn run_dry_run(
                 .plan_args
                 .wallet
                 .expect("--wallet is required for a generic-engine dry run");
-            println!(
-                "selected engine: GENERIC (registry-verified {:?})",
-                fingerprint.standard
-            );
+            println!("selected engine: GENERIC ({:?})", target.standard);
             println!();
-            println!("registry entry: {:?}", fingerprint.name);
-            println!("bytecode_hash:  {bytecode_hash}");
-            println!("shape:          {:?}", fingerprint.shape);
-            println!("token_id:       {:?}", fingerprint.token_id);
-            println!("price/token:    {} wei", fingerprint.price_per_token_wei);
+            println!("source:         {}", target.source_label);
+            println!("bytecode_hash:  {}", target.bytecode_hash);
+            println!("shape:          {:?}", target.shape);
+            println!("token_id:       {:?}", target.token_id);
+            match target.price {
+                crate::execution::generic_engine::ResolvedPrice::Fixed(p) => {
+                    println!("price/token:    {p} wei (fixed)")
+                }
+                crate::execution::generic_engine::ResolvedPrice::LiveGetter(selector) => {
+                    println!(
+                        "price/token:    live getter 0x{} (read immediately before signing)",
+                        hex::encode(selector)
+                    )
+                }
+            }
             let schema = crate::execution::generic_schema::GenericMintSchema {
-                standard: fingerprint.standard,
-                shape: fingerprint.shape,
-                token_id: fingerprint.token_id,
-                price_per_token_wei: fingerprint.price_per_token_wei.to_string(),
+                standard: target.standard,
+                shape: target.shape,
+                token_id: target.token_id,
+                price_per_token_wei: "0".to_string(),
             };
             let calldata = crate::execution::generic_engine::encode_calldata(
                 &schema,
@@ -331,24 +348,20 @@ async fn run_send(
             }
             run_send_opensea(args, slug, config_path).await
         }
-        SelectedEngine::Generic {
-            fingerprint,
-            bytecode_hash,
-        } => {
+        SelectedEngine::Generic { target } => {
             if args.rehearsal {
                 return Err(KairoxError::Session(SessionError::new(
                     "--rehearsal is only supported with the PUBLIC engine today; pass --engine public",
                 )));
             }
-            run_send_generic(args, fingerprint, bytecode_hash, config_path).await
+            run_send_generic(args, target, config_path).await
         }
     }
 }
 
 async fn run_send_generic(
     args: MintArgs,
-    fingerprint: crate::execution::generic_registry::TrustedGenericFingerprint,
-    bytecode_hash: alloy_primitives::B256,
+    target: crate::execution::generic_engine::ResolvedGenericTarget,
     config_path: Option<&std::path::Path>,
 ) -> Result<(), KairoxError> {
     use crate::execution::broadcast::{
@@ -367,8 +380,8 @@ async fn run_send_generic(
         resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
 
     eprintln!(
-        "selected engine: GENERIC (registry-verified {:?}, entry {:?})",
-        fingerprint.standard, fingerprint.name
+        "selected engine: GENERIC ({:?}, source {:?})",
+        target.standard, target.source_label
     );
     eprintln!("=================================================");
     eprintln!(" LIVE SEND CONFIRMATION");
@@ -379,9 +392,17 @@ async fn run_send_generic(
     );
     eprintln!("wallet:         {wallet}");
     eprintln!("collection:     {}", args.plan_args.collection);
-    eprintln!("bytecode_hash:  {bytecode_hash}");
-    eprintln!("shape:          {:?}", fingerprint.shape);
-    eprintln!("price/token:    {} wei", fingerprint.price_per_token_wei);
+    eprintln!("bytecode_hash:  {}", target.bytecode_hash);
+    eprintln!("shape:          {:?}", target.shape);
+    match target.price {
+        crate::execution::generic_engine::ResolvedPrice::Fixed(p) => {
+            eprintln!("price/token:    {p} wei (fixed)")
+        }
+        crate::execution::generic_engine::ResolvedPrice::LiveGetter(selector) => eprintln!(
+            "price/token:    live getter 0x{} (read immediately before signing)",
+            hex::encode(selector)
+        ),
+    }
     eprintln!("quantity:       {}", args.plan_args.quantity);
     eprintln!("=================================================");
 
@@ -452,8 +473,7 @@ async fn run_send_generic(
         collection: args.plan_args.collection,
         wallet,
         quantity: args.plan_args.quantity,
-        fingerprint,
-        expected_bytecode_hash: bytecode_hash,
+        target,
         operator_max_price_per_token_wei,
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
         safety_caps,

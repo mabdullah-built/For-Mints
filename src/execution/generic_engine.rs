@@ -29,8 +29,7 @@ use crate::signing::signer::Signer;
 use crate::signing::transaction::UnsignedEip1559Tx;
 
 use super::errors::{KairoxError, SessionError, SessionErrorKind};
-use super::generic_registry::TrustedGenericFingerprint;
-use super::generic_schema::{GenericMintSchema, GenericMintShape};
+use super::generic_schema::{GenericMintSchema, GenericMintShape, GenericStandard};
 use super::prepared::PreparedTransaction;
 
 /// Resolves the address whose runtime bytecode actually executes a call to
@@ -110,13 +109,36 @@ pub fn encode_calldata(
     }
 }
 
-fn schema_from_fingerprint(fp: &TrustedGenericFingerprint) -> GenericMintSchema {
-    GenericMintSchema {
-        standard: fp.standard,
-        shape: fp.shape,
-        token_id: fp.token_id,
-        price_per_token_wei: fp.price_per_token_wei.to_string(),
-    }
+/// Where a generic mint's price per token comes from. Never operator input
+/// alone -- either a manually-reviewed fixed price
+/// ([`super::generic_registry::TrustedGenericFingerprint::price_per_token_wei`])
+/// or a live read of a semantically-resolved, verified-source getter
+/// ([`super::generic_semantics::PriceResolution::Getter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPrice {
+    Fixed(U256),
+    LiveGetter([u8; 4]),
+}
+
+/// Everything the resolver established about a generic target,
+/// independent of which route (trusted registry, or verified-source
+/// semantic resolution) produced it -- the one shape `cli::commands::mint`
+/// and `execution::resolver::ResolvedEngine::Generic` deal with, so
+/// neither needs to know which route was used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGenericTarget {
+    pub shape: GenericMintShape,
+    pub standard: GenericStandard,
+    pub token_id: Option<u64>,
+    pub price: ResolvedPrice,
+    /// The implementation bytecode hash observed at resolution time --
+    /// re-checked immediately before every signing.
+    pub bytecode_hash: B256,
+    /// Human-readable description of which route resolved this target
+    /// (e.g. `"TrustedRegistry:my-collection"` or
+    /// `"VerifiedMetadata:Blockscout"`), carried through to reports --
+    /// never used for any decision.
+    pub source_label: String,
 }
 
 /// Preflight classification for the `eth_estimateGas` call this engine
@@ -145,20 +167,15 @@ pub struct GenericMintRequest {
     pub collection: Address,
     pub wallet: Address,
     pub quantity: u64,
-    /// The exact, manually-reviewed, registry-matched schema -- the only
-    /// source of truth for calldata shape and price. Never an
-    /// operator-declared schema; see module docs.
-    pub fingerprint: TrustedGenericFingerprint,
-    /// The bytecode hash observed at resolution time, for the mandatory
-    /// pre-sign re-check. Always equal to `fingerprint.implementation_bytecode_hash`
-    /// when this request was built from a real registry match -- kept as
-    /// a separate field so the re-check is an explicit, visible step
-    /// rather than an implicit assumption.
-    pub expected_bytecode_hash: B256,
+    /// Everything the resolver established -- shape, standard, token id,
+    /// price source, and the bytecode hash to re-check before signing.
+    /// Never built from an unverified operator declaration; see module
+    /// docs.
+    pub target: ResolvedGenericTarget,
     /// An optional operator-declared *ceiling* on price per token, in wei.
     /// Never the source of truth -- only ever checked as a maximum against
-    /// `fingerprint.price_per_token_wei`, so an operator can refuse to
-    /// proceed if the verified price is higher than they expected.
+    /// the resolved price, so an operator can refuse to proceed if the
+    /// verified price is higher than they expected.
     pub operator_max_price_per_token_wei: Option<U256>,
     pub gas_buffer_multiplier: f64,
     pub safety_caps: SafetyCaps,
@@ -188,32 +205,54 @@ pub async fn prepare_generic_transaction(
     }
 
     // Immediately-before-signing re-check: a proxy legitimately matched
-    // against this fingerprint at resolution time may have since been
-    // upgraded to a different implementation. Signing against stale
-    // evidence would execute code nobody verified.
+    // against this target at resolution time may have since been upgraded
+    // to a different implementation. Signing against stale evidence would
+    // execute code nobody verified.
     let (_effective_address, current_hash) =
         resolve_implementation_and_code_hash(client, request.collection).await?;
-    if current_hash != request.expected_bytecode_hash {
+    if current_hash != request.target.bytecode_hash {
         return Err(KairoxError::Session(SessionError::with_kind(
             SessionErrorKind::ProxyImplementationChanged,
             format!(
                 "implementation bytecode hash changed since resolution (expected {}, now {}); \
                  refusing to sign against stale evidence",
-                request.expected_bytecode_hash, current_hash
+                request.target.bytecode_hash, current_hash
             ),
         )));
     }
 
-    let schema = schema_from_fingerprint(&request.fingerprint);
+    let schema = GenericMintSchema {
+        standard: request.target.standard,
+        shape: request.target.shape,
+        token_id: request.target.token_id,
+        // Placeholder -- encode_calldata never reads this field, only
+        // prepare_generic_transaction's own `mint_value` (computed below)
+        // ever becomes the transaction's real value.
+        price_per_token_wei: "0".to_string(),
+    };
     let calldata = encode_calldata(&schema, request.wallet, request.quantity)?;
 
-    let price_per_token = U256::from(request.fingerprint.price_per_token_wei);
+    let price_per_token = match request.target.price {
+        ResolvedPrice::Fixed(p) => p,
+        ResolvedPrice::LiveGetter(selector) => {
+            let raw = client
+                .eth_call(request.collection, &Bytes::from(selector.to_vec()))
+                .await?;
+            if raw.len() < 32 {
+                return Err(KairoxError::Session(SessionError::new(
+                    "price getter returned a malformed (short) response; refusing to proceed \
+                     without a verified value",
+                )));
+            }
+            U256::from_be_slice(&raw[raw.len() - 32..])
+        }
+    };
     if let Some(max_price) = request.operator_max_price_per_token_wei
         && price_per_token > max_price
     {
         return Err(KairoxError::Session(SessionError::new(format!(
-            "registry-verified price per token {price_per_token} wei exceeds the operator's \
-             declared maximum {max_price} wei; refusing to proceed"
+            "verified price per token {price_per_token} wei exceeds the operator's declared \
+             maximum {max_price} wei; refusing to proceed"
         ))));
     }
     let mint_value = price_per_token.saturating_mul(U256::from(request.quantity));
@@ -310,7 +349,6 @@ pub async fn prepare_generic_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::generic_schema::GenericStandard;
     fn schema(shape: GenericMintShape, token_id: Option<u64>) -> GenericMintSchema {
         GenericMintSchema {
             standard: GenericStandard::Erc721,
@@ -380,21 +418,6 @@ mod tests {
         assert_eq!(decoded.quantity, U256::from(1u64));
     }
 
-    #[test]
-    fn schema_from_fingerprint_carries_the_registry_price_not_any_operator_value() {
-        let fp = TrustedGenericFingerprint {
-            name: "test",
-            chain_id: 1,
-            implementation_bytecode_hash: B256::ZERO,
-            standard: GenericStandard::Erc721,
-            shape: GenericMintShape::MintQuantity,
-            token_id: None,
-            price_per_token_wei: 42,
-        };
-        let schema = schema_from_fingerprint(&fp);
-        assert_eq!(schema.price_per_token_wei, "42");
-    }
-
     // -- Mechanism-proving tests, MockTransport-backed --
     //
     // `BUILTIN_REGISTRY` (`generic_registry::BUILTIN_REGISTRY`) ships empty
@@ -409,12 +432,27 @@ mod tests {
     use crate::chain::endpoint::EndpointRole;
     use crate::chain::mock::MockTransport;
     use crate::chain::registry::ChainRegistry;
+    use crate::execution::generic_registry::TrustedGenericFingerprint;
     use crate::signing::signer::LocalSigner;
 
     const FAKE_BYTECODE: &[u8] = &[0x60, 0x80, 0x60, 0x40];
 
     fn signer() -> LocalSigner {
         LocalSigner::from_bytes(keccak256(b"kairox-generic-engine-test-key").0).unwrap()
+    }
+
+    fn target_from_fingerprint(
+        fp: &TrustedGenericFingerprint,
+        hash: B256,
+    ) -> ResolvedGenericTarget {
+        ResolvedGenericTarget {
+            shape: fp.shape,
+            standard: fp.standard,
+            token_id: fp.token_id,
+            price: ResolvedPrice::Fixed(U256::from(fp.price_per_token_wei)),
+            bytecode_hash: hash,
+            source_label: fp.name.to_string(),
+        }
     }
 
     fn fingerprint(hash: B256) -> TrustedGenericFingerprint {
@@ -479,8 +517,7 @@ mod tests {
             collection: Address::from([0x11; 20]),
             wallet: signer.address(),
             quantity: 1,
-            fingerprint: fp,
-            expected_bytecode_hash: resolved_hash,
+            target: target_from_fingerprint(&fp, resolved_hash),
             operator_max_price_per_token_wei: None,
             gas_buffer_multiplier: 1.25,
             safety_caps: SafetyCaps {
@@ -517,8 +554,7 @@ mod tests {
             collection: Address::from([0x11; 20]),
             wallet: signer.address(),
             quantity: 1,
-            fingerprint: fp,
-            expected_bytecode_hash: original_hash,
+            target: target_from_fingerprint(&fp, original_hash),
             operator_max_price_per_token_wei: None,
             gas_buffer_multiplier: 1.25,
             safety_caps: SafetyCaps {
@@ -553,8 +589,7 @@ mod tests {
             collection: Address::from([0x11; 20]),
             wallet: signer.address(),
             quantity: 1,
-            fingerprint: fp,
-            expected_bytecode_hash: bytecode_hash,
+            target: target_from_fingerprint(&fp, bytecode_hash),
             operator_max_price_per_token_wei: None,
             gas_buffer_multiplier: 1.25,
             safety_caps: SafetyCaps {
@@ -583,8 +618,7 @@ mod tests {
             collection: Address::from([0x11; 20]),
             wallet: signer.address(),
             quantity: 1,
-            fingerprint: fp,
-            expected_bytecode_hash: bytecode_hash,
+            target: target_from_fingerprint(&fp, bytecode_hash),
             // Operator expected at most 0.001 ETH -- the verified price is
             // 10x higher than they were willing to accept.
             operator_max_price_per_token_wei: Some(U256::from(1_000_000_000_000_000u64)),
