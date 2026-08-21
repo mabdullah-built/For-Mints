@@ -124,16 +124,48 @@ serialization happens after the barrier. See
 [docs/architecture.md](architecture.md#public-engine-hot-path-t0) for the
 implementation this describes.
 
-## 6. Allowlist mint (`--engine public`, on-chain `mintAllowList`)
+## 6. Allowlist mint (OpenSea-hosted)
+
+**Important correction:** an allow-list stage's Merkle *root* may be
+stored on-chain, but your wallet's specific Merkle *proof* is not
+derivable from that root -- Kairox does not and cannot reconstruct it.
+Today, Kairox has exactly one way to obtain a wallet-specific allow-list
+proof: the official OpenSea Drops mint endpoint,
+`POST /api/v2/drops/{slug}/mint`, which returns ready-to-validate
+target/calldata/value (including the proof) for the requested minter and
+quantity once an eligible stage is active. There is no separate
+`--engine public` allow-list path -- `--engine public` only ever
+constructs a `mintPublic(...)` transaction, never `mintAllowList(...)`
+(enforced structurally: `protocol::seadrop` has no function that encodes
+allow-list calldata locally, only one that decodes and validates it from
+an OpenSea response).
 
 ```sh
 ./target/release/kairox mint "$NFT" --chain 4663 --wallet "$WALLET" \
-    --engine public --quantity "$QUANTITY" --send --yes
+    --engine opensea --slug "$SLUG" --quantity "$QUANTITY" \
+    --max-mint-value-wei "$MAX_MINT_VALUE_WEI" \
+    --send --yes
 ```
 
-Kairox recognizes and prices an allow-list stage the same way as a public
-one once your wallet's Merkle proof is available on-chain -- no OpenSea
-API step is required for a project's own on-chain allow-list stage.
+**What happens at T0:** everything static is prepared beforehand (OpenSea
+client warmed, API key loaded, slug/wallet/quantity resolved, signer
+ready, RPC clients warmed, spend caps fixed). At (or near) stage
+activation, Kairox sends the mint request; OpenSea's response is decoded,
+then every field is validated before any Ethereum signature: target,
+chain, collection, minter, quantity, value, and the wallet's Merkle proof
+against a *freshly re-read, authoritative on-chain root* (never the root
+OpenSea itself might claim) -- see
+`execution::opensea_validate::verify_allow_list_proof`. Only after that
+passes does Kairox sign once, serialize once, and fan out. OpenSea's own
+response latency (`opensea_mint_request_ms` in the printed metrics) is
+real and external to Kairox; nothing about this path is "identical to
+PUBLIC" the way an earlier draft of this document incorrectly claimed.
+
+If a project's allow-list stage is ever independently verified to expose
+a wallet's proof through some other, non-OpenSea source *before* T0,
+Kairox could in principle validate and arm it early the same way PUBLIC
+does -- but no such path exists in Kairox today, and one must not be
+assumed or fabricated.
 
 ## 7. FCFS / server-signed mint (OpenSea-hosted)
 

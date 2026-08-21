@@ -233,11 +233,24 @@ reports each as a clear, typed failure and never broadcasts anything.
 
 ## 17. Allow-list test
 
-Follow the lab README's allow-list section to configure the single-leaf
-allow-list stage for one test wallet, then run `kairox mint --engine
-public` (SeaDrop's on-chain `mintAllowList` path) for that wallet with
-`--quantity 1`. This exercises Kairox's real Merkle-proof verification
-against genuine on-chain state, not a mock.
+**Correction:** there is no `kairox mint --engine public` allow-list path.
+An allow-list stage's Merkle *root* can live on-chain, but your wallet's
+specific Merkle *proof* is not derivable from that root, and Kairox has
+no CLI flag to supply one directly. Kairox's only wallet-specific
+allow-list mint path is `--engine opensea`'s
+`POST /api/v2/drops/{slug}/mint` response, which OpenSea has no official
+testnet support for -- so an allow-list mint cannot actually be exercised
+against this testnet lab through any Kairox CLI command today.
+
+Kairox's real Merkle-proof verification (`execution::opensea_validate::verify_allow_list_proof`,
+checked against a freshly re-read on-chain root, never a proof Kairox
+invents) is instead exercised by `tests/e2e_localhost.rs`'s
+`opensea_allow_list_mint_verifies_real_merkle_proof_and_completes_end_to_end`
+and its adjacent malicious-proof rejection tests, using real,
+locally-generated Merkle material over a real localhost HTTP server --
+that suite remains the authoritative allow-list test until genuine
+OpenSea testnet support exists and is independently verified. Skip this
+step against the live testnet lab.
 
 ## 18. Multi-wallet test (only after every single-wallet step above passes)
 

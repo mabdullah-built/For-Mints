@@ -470,6 +470,44 @@ mod tests {
         assert!(!prepared.raw_signed_bytes.is_empty());
     }
 
+    /// Regression test: the pure on-chain PUBLIC engine must never
+    /// construct (or fabricate) an allow-list mint merely because
+    /// something about on-chain state (e.g. a restrictive PublicDrop
+    /// config) might suggest a restricted stage. It has no capability to
+    /// do so at all -- `gather_unsigned_plan` always encodes exactly
+    /// `mintPublic(...)`, regardless of what it reads. Kairox's only
+    /// wallet-specific allow-list mint path is the OpenSea engine's
+    /// `POST /api/v2/drops/{slug}/mint` response, which supplies the
+    /// wallet's actual Merkle proof -- a proof is never derivable from
+    /// (or assumed present merely because of) an on-chain Merkle root
+    /// alone; see `execution::opensea_validate::verify_allow_list_proof`,
+    /// which always uses the proof decoded from that response, never one
+    /// invented locally.
+    #[tokio::test]
+    async fn public_engine_only_ever_encodes_mint_public_never_mint_allow_list() {
+        let signer = signer();
+        let client = connect(MockOpts::default(), EndpointRole::ReadOnly).await;
+        let req = request(signer.address());
+
+        let plan = gather_unsigned_plan(&client, signer.address(), &req)
+            .await
+            .unwrap();
+
+        let public_selector = seadrop::mintPublicCall::SELECTOR;
+        let allow_list_selector = seadrop::mintAllowListCall::SELECTOR;
+        assert_eq!(
+            &plan.calldata[0..4],
+            public_selector,
+            "PUBLIC engine calldata must always be mintPublic(...)"
+        );
+        assert_ne!(
+            &plan.calldata[0..4],
+            allow_list_selector,
+            "PUBLIC engine must never construct mintAllowList(...) calldata -- it has no wallet \
+             proof to do so safely, on-chain root or not"
+        );
+    }
+
     #[tokio::test]
     async fn rejects_when_signer_does_not_match_requested_wallet() {
         let signer = signer();
