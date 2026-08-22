@@ -922,6 +922,7 @@ async fn run_send_opensea(
         receipt_poll_interval,
         receipt_timeout,
         benchmark,
+        skip_benchmark: false,
         health: profile.health_policy,
         prewarm_lead: std_duration_from_time(profile.prewarm_lead),
     };

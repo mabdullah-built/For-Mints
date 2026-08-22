@@ -59,11 +59,16 @@ pub struct OpenSeaMintRequest {
     pub safety_caps: SafetyCaps,
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
-    /// Reserved for a caller-side full benchmark performed *before*
-    /// calling [`run_opensea_mint`] -- see [`super::live::LiveMintConfig::benchmark`]'s
-    /// doc comment (same rationale). `run_opensea_mint` always benchmarks
-    /// internally with [`crate::chain::benchmark::BenchmarkConfig::minimal`].
+    /// A caller-side full benchmark config, used only when the caller
+    /// itself calls `RpcPool::benchmark_all` before invoking
+    /// [`run_opensea_mint`] -- see
+    /// [`super::live::LiveMintConfig::benchmark`]'s doc comment (same
+    /// rationale). Never read by `run_opensea_mint` itself.
     pub benchmark: crate::chain::benchmark::BenchmarkConfig,
+    /// See [`super::live::LiveMintConfig::skip_benchmark`] -- identical
+    /// rationale and effect, applied to `run_opensea_mint`'s own internal
+    /// benchmark step.
+    pub skip_benchmark: bool,
     pub health: crate::chain::benchmark::HealthPolicy,
     pub prewarm_lead: StdDuration,
 }
@@ -125,12 +130,17 @@ pub async fn run_opensea_mint(
 
     // BENCHMARK — identical role to the public engine's: exactly one
     // reachability/role-correctness sample per read-capable endpoint, not
-    // the full multi-sample ranking pass -- see
-    // `live::LiveMintConfig::benchmark`'s doc comment.
+    // the full multi-sample ranking pass. Skipped when
+    // `request.skip_benchmark` -- see
+    // `live::LiveMintConfig::skip_benchmark`'s doc comment (identical
+    // rationale: preserves an earlier full-benchmark's ranking data
+    // rather than overwriting it with one noisy last-moment sample).
     on_progress(OpenSeaProgress::Benchmarking);
     let sw = Stopwatch::start();
-    pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::minimal())
-        .await;
+    if !request.skip_benchmark {
+        pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::minimal())
+            .await;
+    }
     metrics.benchmark_ms = Some(sw.elapsed_ms());
 
     // PRE-STAGE OPENSEA PREPARATION: fetching drop details is both how
@@ -845,6 +855,7 @@ mod tests {
                 sample_count: 1,
                 sample_delay: StdDuration::ZERO,
             },
+            skip_benchmark: false,
             health: crate::chain::benchmark::HealthPolicy::default(),
             prewarm_lead: StdDuration::ZERO,
         }

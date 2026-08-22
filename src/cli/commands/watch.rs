@@ -611,6 +611,17 @@ async fn run_public_watch(
     let started_at = OffsetDateTime::now_utc();
     let session_id = crate::cli::report::generate_session_id();
 
+    // EARLY POOL LIFETIME: connect and fully benchmark *before* the wait,
+    // not after -- the same pool then stays alive across the entire wait
+    // and straight into dispatch, never reconnected from scratch at T0.
+    // See `chain::benchmark::BenchmarkConfig::minimal`'s and
+    // `execution::live::LiveMintConfig::skip_benchmark`'s doc comments
+    // for why the internal near-T0 check (inside `run_live_mint`, via
+    // REWARM) deliberately does *not* repeat this full ranking pass.
+    let mut pool = connect_send_pool(resolved, target.chain_args.rpc_url.as_ref(), None).await?;
+    pool.benchmark_all(&profile.benchmark_policy).await;
+    pool.rewarm_all().await;
+
     let inner_probe = PublicStageProbe {
         plan_args: &plan_args,
         config_path,
@@ -622,15 +633,12 @@ async fn run_public_watch(
         store: &telemetry,
     };
     let stage_start = wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
-    print_telemetry_summary(&telemetry);
+    // NOTE: no telemetry/reporting output here -- this is the boundary
+    // between "stage detected as open" and dispatch preparation. Nothing
+    // optional runs between here and the broadcast; the telemetry
+    // summary is printed only after the whole send/receipt sequence
+    // completes, below.
     print_state(&WatchState::Arming);
-
-    let mut pool = connect_send_pool(
-        resolved,
-        target.chain_args.rpc_url.as_ref(),
-        None, // config-file endpoints were already consulted by resolve_chain_and_runtime's runtime; a raw connect here follows the same KAIROX_RPC_* / --rpc-url precedence mint uses.
-    )
-    .await?;
 
     let request = LiveMintRequest {
         chain: resolved.info.clone(),
@@ -645,6 +653,12 @@ async fn run_public_watch(
 
     let mut config = LiveMintConfig::from(profile);
     config.known_stage_start = Some(stage_start);
+    // The full benchmark above already ranked this exact pool; the
+    // internal minimal check would otherwise silently discard that
+    // ranking data (see `skip_benchmark`'s doc comment). REWARM (which
+    // never touches ranking) still runs unconditionally inside
+    // `run_live_mint`, giving a genuine near-T0 liveness re-check.
+    config.skip_benchmark = true;
 
     let outcome = run_live_mint(&mut pool, signer, &request, &config, |progress| {
         print_state(&live_progress_to_watch_state(&progress))
@@ -652,6 +666,10 @@ async fn run_public_watch(
     .await?;
 
     print_state(&WatchState::Success);
+    // Telemetry is printed here, after dispatch/receipt -- never between
+    // stage-open detection and broadcast. See the module's regression
+    // test proving this ordering.
+    print_telemetry_summary(&telemetry);
 
     if json {
         let broadcast =
@@ -706,6 +724,16 @@ async fn run_opensea_watch(
     let started_at = OffsetDateTime::now_utc();
     let session_id = crate::cli::report::generate_session_id();
     let opensea = load_opensea_client(StdDuration::from_secs(10))?;
+
+    // EARLY POOL LIFETIME: connect and fully benchmark the chain RPC pool
+    // *before* the wait -- see `run_public_watch`'s identical comment.
+    // The OpenSea HTTP client itself is already warmed by its own
+    // periodic drop-details polling below (a real, natural, already
+    // -required request -- never a separate speculative warm-up call).
+    let mut pool = connect_send_pool(resolved, target.chain_args.rpc_url.as_ref(), None).await?;
+    pool.benchmark_all(&profile.benchmark_policy).await;
+    pool.rewarm_all().await;
+
     let inner_probe = OpenSeaStageProbe {
         opensea: &opensea,
         slug: &slug,
@@ -721,10 +749,9 @@ async fn run_opensea_watch(
     // authorization is only ever obtained from the real mint-request call
     // `run_opensea_mint` makes below, never fabricated here.
     wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
-    print_telemetry_summary(&telemetry);
+    // No telemetry/reporting output here -- see run_public_watch's
+    // identical comment; printed only after dispatch/receipt, below.
     print_state(&WatchState::Arming);
-
-    let mut pool = connect_send_pool(resolved, target.chain_args.rpc_url.as_ref(), None).await?;
 
     let request = OpenSeaMintRequest {
         chain: resolved.info.clone(),
@@ -738,6 +765,9 @@ async fn run_opensea_watch(
         receipt_poll_interval: profile.receipt_poll_interval,
         receipt_timeout: profile.receipt_timeout,
         benchmark: profile.benchmark_policy,
+        // See run_public_watch's identical comment -- the full benchmark
+        // above already ranked this pool.
+        skip_benchmark: true,
         health: profile.health_policy,
         prewarm_lead: profile.prewarm_lead.try_into().unwrap_or(StdDuration::ZERO),
     };
@@ -748,6 +778,7 @@ async fn run_opensea_watch(
     .await?;
 
     print_state(&WatchState::Success);
+    print_telemetry_summary(&telemetry);
 
     if json {
         let broadcast =

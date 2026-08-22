@@ -31,18 +31,30 @@ pub struct LiveMintConfig {
     pub scheduler: SchedulerTimings,
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
-    /// Reserved for a caller-side full benchmark performed *before*
-    /// calling [`run_live_mint`]. No caller does this yet -- `watch` does
-    /// not currently have an early, well-before-T0 ranking pass (see
-    /// [`BenchmarkConfig::minimal`]'s doc comment for why, and for the
-    /// fact that this was previously mis-documented as already existing).
-    /// `run_live_mint` itself always benchmarks with
-    /// [`BenchmarkConfig::minimal`] internally, regardless of this
-    /// field's value. Kept on this struct (rather than removed) so a
-    /// future caller building a full profile-derived config for its own
-    /// separate early-benchmark call doesn't need a second, parallel
-    /// settings type merely to carry this value through.
+    /// A caller-side full benchmark config, used only when the caller
+    /// itself calls [`crate::chain::pool::RpcPool::benchmark_all`] before
+    /// invoking [`run_live_mint`] (as `watch` now does -- see
+    /// `cli::commands::watch::run_public_watch`) -- never read by
+    /// `run_live_mint` itself. Kept on this struct so a caller building a
+    /// full profile-derived config for its own separate early-benchmark
+    /// call doesn't need a second, parallel settings type merely to
+    /// carry this value through.
     pub benchmark: BenchmarkConfig,
+    /// When `true`, `run_live_mint` skips its own internal
+    /// `benchmark_all(&BenchmarkConfig::minimal())` call and relies
+    /// solely on the REWARM step (a liveness-only probe that never
+    /// touches ranking data -- see
+    /// [`crate::chain::pool::RpcPool::rewarm_all`]) for its near-T0
+    /// freshness check. Set by a caller (`watch`) that has *already* run
+    /// a full multi-sample benchmark on this exact pool earlier -- the
+    /// internal minimal benchmark would otherwise silently overwrite
+    /// that richer ranking data with a single fresh (but far noisier)
+    /// sample immediately before dispatch, discarding the whole point of
+    /// benchmarking early. `false` (the default, and always the case for
+    /// `mint --send`, which has no earlier benchmark to preserve) keeps
+    /// the original behavior: a minimal 1-sample reachability/role check
+    /// runs every time.
+    pub skip_benchmark: bool,
     /// Exclusion thresholds applied when selecting read/send endpoints
     /// from benchmark data.
     pub health: HealthPolicy,
@@ -76,6 +88,7 @@ impl Default for LiveMintConfig {
             receipt_poll_interval: StdDuration::from_millis(750),
             receipt_timeout: StdDuration::from_secs(60),
             benchmark: BenchmarkConfig::default(),
+            skip_benchmark: false,
             health: HealthPolicy::default(),
             prewarm_lead: StdDuration::from_secs(8),
             known_stage_start: None,
@@ -91,6 +104,7 @@ impl From<&ExecutionProfile> for LiveMintConfig {
             receipt_poll_interval: profile.receipt_poll_interval,
             receipt_timeout: profile.receipt_timeout,
             benchmark: profile.benchmark_policy,
+            skip_benchmark: false,
             health: profile.health_policy,
             prewarm_lead: std_duration_from_time(profile.prewarm_lead),
             known_stage_start: None,
@@ -158,17 +172,25 @@ pub async fn run_live_mint(
     let mut metrics = LatencyMetrics::default();
 
     // BENCHMARK: exactly one reachability/role-correctness sample per
-    // read-capable endpoint -- never the full multi-sample ranking pass
-    // (`config.benchmark`, still available to a caller with time to spare
-    // before calling this function). An already-live mint has no lead
-    // time to hide a multi-second synchronous ranking benchmark in; see
+    // read-capable endpoint -- never the full multi-sample ranking pass.
+    // An already-live mint has no lead time to hide a multi-second
+    // synchronous ranking benchmark in; see
     // `chain::benchmark::BenchmarkConfig::minimal`'s doc comment. Never
     // broadcasts anything, never sends a real transaction merely to
     // measure a send-only endpoint.
+    //
+    // Skipped entirely when `config.skip_benchmark` -- a caller (`watch`)
+    // that already ran a full multi-sample benchmark on this exact pool
+    // earlier must not have that ranking data silently overwritten by a
+    // single fresh-but-noisy sample right before dispatch; REWARM (next)
+    // still gives a genuine near-T0 liveness check either way, since it
+    // never touches ranking data regardless of which branch ran.
     on_progress(LiveProgress::Benchmarking);
     let benchmark_sw = Stopwatch::start();
-    pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::minimal())
-        .await;
+    if !config.skip_benchmark {
+        pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::minimal())
+            .await;
+    }
     metrics.benchmark_ms = Some(benchmark_sw.elapsed_ms());
 
     // REWARM (near-T0 prewarm): refresh liveness on every already-connected
@@ -534,6 +556,7 @@ mod tests {
                 sample_count: 1,
                 sample_delay: StdDuration::ZERO,
             },
+            skip_benchmark: false,
             health: crate::chain::benchmark::HealthPolicy::default(),
             prewarm_lead: StdDuration::ZERO,
             known_stage_start: None,
