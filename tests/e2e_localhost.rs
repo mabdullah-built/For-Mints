@@ -4972,7 +4972,18 @@ fn auto_engine_native_public_still_resolves_when_opensea_contract_lookup_errors(
         .assert()
         .success()
         .stderr(predicates::str::contains("resolved_engine: Public"))
-        .stderr(predicates::str::contains("SeaDropAdapter"));
+        .stderr(predicates::str::contains("SeaDropAdapter"))
+        // Round 6 item 8: the degraded-discovery evidence must survive
+        // all the way to the operator-visible output, distinct from a
+        // genuine "no drop" answer -- never silently collapsed into
+        // Vec::new() with no trace. Must never claim no signed stage
+        // exists; must say discovery was unavailable.
+        .stderr(predicates::str::contains(
+            "OpenSea auto-discovery unavailable",
+        ))
+        .stderr(predicates::str::contains(
+            "NOT proof no signed stage exists, only that it could not be checked",
+        ));
 }
 
 #[test]

@@ -962,4 +962,91 @@ mod tests {
              at an earlier point in time; the currently-healthy endpoint must be chosen"
         );
     }
+
+    /// Send-side equivalent of the read-side test above (item 4): A is a
+    /// `READ_WRITE` endpoint, fast at the early full benchmark, then fails
+    /// every call from the near-T0 rewarm onward. B is a healthy
+    /// `READ_WRITE` fallback. Per the existing, unmodified broadcast
+    /// health policy (`EndpointBenchmark::is_healthy_for_send`), a
+    /// `READ_WRITE` endpoint *with* read data showing it is clearly dead
+    /// is excluded even from the send fan-out -- unlike a genuine
+    /// `SendOnly`/`ConfiguredSendOnly` endpoint Kairox has no safe read
+    /// signal for, which always stays included regardless.
+    #[tokio::test]
+    async fn a_formerly_fastest_send_endpoint_that_dies_before_t0_is_excluded_from_the_fanout() {
+        use super::super::benchmark::{BenchmarkConfig, HealthPolicy};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const FULL_BENCHMARK_SAMPLES: u32 = 3;
+        let a_call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let a_call_count_for_closure = a_call_count.clone();
+        let a_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_dynamic_result("eth_blockNumber", move |_params| {
+                let n = a_call_count_for_closure.fetch_add(1, Ordering::SeqCst);
+                if n < FULL_BENCHMARK_SAMPLES {
+                    Ok(json!("0x1"))
+                } else {
+                    Err((-32000, "connection reset".to_string()))
+                }
+            })
+            .build();
+        let a = RpcClient::connect(
+            Box::new(a_transport),
+            1,
+            EndpointRole::ReadWrite,
+            Some("a-formerly-fastest-send".into()),
+        )
+        .await
+        .unwrap();
+
+        let b_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .delay("eth_blockNumber", Duration::from_millis(20))
+            .build();
+        let b = RpcClient::connect(
+            Box::new(b_transport),
+            1,
+            EndpointRole::ReadWrite,
+            Some("b-formerly-slower-send".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![a, b]);
+        pool.benchmark_all(&BenchmarkConfig {
+            sample_count: FULL_BENCHMARK_SAMPLES,
+            sample_delay: Duration::ZERO,
+        })
+        .await;
+
+        let policy = HealthPolicy::default();
+        let before: Vec<&str> = pool
+            .select_send_endpoints(&policy)
+            .into_iter()
+            .filter_map(|c| c.label())
+            .collect();
+        assert_eq!(
+            before,
+            vec!["a-formerly-fastest-send", "b-formerly-slower-send"],
+            "sanity check: both endpoints must start out selectable for send"
+        );
+
+        // T0 approaches: A now fails every call.
+        pool.rewarm_all().await;
+
+        let after: Vec<&str> = pool
+            .select_send_endpoints(&policy)
+            .into_iter()
+            .filter_map(|c| c.label())
+            .collect();
+        assert_eq!(
+            after,
+            vec!["b-formerly-slower-send"],
+            "a formerly-fastest send-capable endpoint that has since died must be excluded \
+             from the broadcast fan-out, leaving only the currently-healthy endpoint -- this \
+             is the existing, unmodified is_healthy_for_send policy, not new behavior"
+        );
+    }
 }

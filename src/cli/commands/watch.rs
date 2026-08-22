@@ -553,6 +553,36 @@ const MAX_RERESOLUTION_RESTARTS: u32 = 20;
 /// there is no ambiguity to re-check (`resolve_watch_engine` is
 /// deterministic for those), so this is a pure pass-through to
 /// `wait_for_stage` with no extra RPC/API traffic at all.
+///
+/// **What this mechanism does and does not detect** (Round 6 item 5 --
+/// audited explicitly, not assumed): `ResolvedWatchEngine`'s equality
+/// only compares engine type and, for OpenSea, `slug`/`stage_uuid`. A
+/// changed start/end time, price, or `max_per_wallet` for the *same*
+/// already-selected stage compares equal and is deliberately **not**
+/// treated as a material change here -- restarting the whole attempt
+/// (fresh pool, fresh benchmark) over a timing tweak to the stage already
+/// being waited on would be wasteful and is unnecessary, because:
+/// - Start/end time drift for the same stage is already handled by
+///   `wait_for_stage`/`StageProbe` itself: `PublicStageProbe`/
+///   `OpenSeaStageProbe` both re-fetch fresh state every poll and
+///   `wait_for_stage` always uses that fresh `stage_start`, in either
+///   direction -- see `execution::watch::tests::
+///   stage_start_moving_later_while_waiting_updates_the_target` and
+///   `..._moving_earlier_..._and_arms_promptly`.
+/// - Price/value drift for the same stage can never produce an
+///   incorrectly-signed transaction: `execution::opensea_validate`
+///   (unchanged, core safety code) always validates the *real*,
+///   freshly-fetched authorization response's value against a
+///   freshly-fetched expectation immediately before signing, and fails
+///   closed (`UnsafeValue`) on any mismatch -- see
+///   `execution::opensea_validate::tests::rejects_value_disagreeing_with_expected_stage_price`.
+///   Nothing here ever signs against stale, resolution-time price data.
+///
+/// What *is* a material change here: the winning engine/slug/stage
+/// identity itself changing -- a different stage becoming the better
+/// choice, including a same-slug stage UUID swap (a different stage
+/// replacing the one being waited on) -- see
+/// `cli::commands::watch::reresolution_change_detection_tests`.
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_stage_with_reresolution(
     probe: &dyn StageProbe,
@@ -594,6 +624,14 @@ async fn wait_for_stage_with_reresolution(
         changed = &mut reresolution_check => changed,
     }
 }
+
+/// Minimum spacing between optional network telemetry reads
+/// (`eth_getBlockByNumber`/`eth_maxPriorityFeePerGas`), independent of
+/// `--poll-interval-secs`. An aggressive poll interval must never turn
+/// into network telemetry traffic on every single poll for the whole
+/// (possibly very long) wait -- this is a diagnostic nicety, not
+/// something that benefits from being maximally fresh every second.
+const NETWORK_TELEMETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Decorates any [`StageProbe`] with bounded, in-memory, advisory-only
 /// latency/outcome telemetry -- see `chain::telemetry`'s module docs for
@@ -681,9 +719,25 @@ impl StageProbe for TelemetryProbe<'_> {
         // separate from `self.inner.probe()`'s own outcome above, and
         // never allowed to affect it: a failure here is silently
         // dropped, never propagated. See `NetworkTelemetry`'s doc
-        // comment for why this is safe to call every poll cycle while
-        // genuinely far from T0 (it reuses an already-connected client,
-        // never opens a new one).
+        // comment for why this reuses an already-connected client, never
+        // opens a new one. Round 6 item 9: gated to at most once every
+        // `NETWORK_TELEMETRY_MIN_INTERVAL`, independent of
+        // `--poll-interval-secs` -- an aggressive poll interval (e.g. 1s)
+        // must never turn into optional network RPC traffic every single
+        // second for the whole (possibly very long) wait. This check is a
+        // fast, in-memory lock only; it never itself performs I/O.
+        let due_for_telemetry = match self.store.lock() {
+            Ok(store) => !matches!(
+                store.network.latest_block_number(),
+                crate::chain::telemetry::Freshness::Fresh { age, .. }
+                    if age < NETWORK_TELEMETRY_MIN_INTERVAL
+            ),
+            Err(_) => false,
+        };
+        if !due_for_telemetry {
+            return result;
+        }
+
         if let Some(client) = self.network_source {
             if let Ok(mut store) = self.store.lock() {
                 store.record_endpoint_identity(
@@ -1538,5 +1592,48 @@ mod telemetry_probe_critical_path_tests {
 
         let result = probe.probe().await.unwrap();
         assert!(matches!(result.status, StageStatus::NotStarted { .. }));
+    }
+
+    /// Round 6 item 9: an aggressive poll interval must not turn into
+    /// optional network telemetry traffic on every single poll. Two
+    /// far-from-T0 probe cycles in quick succession (well under
+    /// `NETWORK_TELEMETRY_MIN_INTERVAL`) must issue the underlying
+    /// `eth_getBlockByNumber` telemetry read only once, not twice.
+    #[tokio::test]
+    async fn network_telemetry_is_not_reissued_faster_than_the_minimum_cadence() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let inner = FakeFarFromT0Probe;
+        let call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let call_count_for_closure = call_count.clone();
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", serde_json::json!("0x1"))
+            .respond_dynamic("eth_getBlockByNumber", move |_params| {
+                call_count_for_closure.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x1"})
+            })
+            .respond("eth_maxPriorityFeePerGas", serde_json::json!("0x1"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let store = Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: Some(&client),
+            arm_threshold: Duration::seconds(10),
+        };
+
+        probe.probe().await.unwrap();
+        probe.probe().await.unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a second probe cycle immediately after the first must not re-issue the network \
+             telemetry read before NETWORK_TELEMETRY_MIN_INTERVAL has elapsed"
+        );
     }
 }

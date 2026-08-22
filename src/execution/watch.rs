@@ -320,6 +320,51 @@ mod tests {
         assert!(last_seen_target.is_some());
     }
 
+    /// Round 6 item 5 (item 5.A/5.B): `wait_for_stage` adapts to a
+    /// changed stage start purely by re-reading the probe's fresh
+    /// snapshot on every poll -- this is the *same* mechanism regardless
+    /// of which direction the start time moves, and it requires no stage
+    /// identity/UUID concept at all (`StageSnapshot` doesn't carry one).
+    /// This is exactly why a periodic full re-resolution (see
+    /// `cli::commands::watch::wait_for_stage_with_reresolution`) is not
+    /// needed to keep the *already-selected* stage's own timing fresh --
+    /// only to notice when a *different* stage becomes the better choice.
+    /// Complements `stage_start_moving_later_while_waiting_updates_the_target`
+    /// above (which proves the "later" direction) with the "earlier"
+    /// direction.
+    #[tokio::test]
+    async fn stage_start_moving_earlier_while_waiting_updates_the_target_and_arms_promptly() {
+        let now = OffsetDateTime::now_utc();
+        // First estimate: comfortably beyond arm_threshold (50ms), so the
+        // first poll must not hand off yet.
+        let first_estimate = now + time::Duration::milliseconds(300);
+        // Updated estimate: the creator moved the stage earlier, now
+        // within arm_threshold -- the very next poll must hand off, using
+        // this updated, earlier target, not the original later one.
+        let updated_estimate = now + time::Duration::milliseconds(20);
+        let probe = FakeProbe::new(vec![
+            FakeResponse::Ok(StageSnapshot {
+                stage_start: first_estimate,
+                status: StageStatus::NotStarted {
+                    starts_in: time::Duration::milliseconds(300),
+                },
+            }),
+            FakeResponse::Ok(StageSnapshot {
+                stage_start: updated_estimate,
+                status: StageStatus::NotStarted {
+                    starts_in: time::Duration::milliseconds(20),
+                },
+            }),
+        ]);
+        let result = wait_for_stage(&probe, &fast_config(), |_| {}).await;
+        let armed_at = result.expect("must arm successfully against the updated, earlier target");
+        assert_eq!(
+            armed_at, updated_estimate,
+            "must hand off using the freshest known stage start, not a stale earlier-observed \
+             later estimate"
+        );
+    }
+
     fn timeout_error() -> KairoxError {
         use crate::chain::rpc::{RpcError, TransportError};
         KairoxError::Rpc(RpcError::Transport(TransportError::Timeout(
