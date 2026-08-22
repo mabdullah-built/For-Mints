@@ -94,7 +94,7 @@ pub(crate) async fn resolve_auto_engine(
     allow_not_yet_started: bool,
 ) -> Result<crate::execution::resolver::Detection, KairoxError> {
     use crate::cli::commands::resolver_adapters::{
-        GenericVerifiedContractAdapter, OpenSeaDropsAdapter, SeaDropAdapter,
+        GenericVerifiedContractAdapter, NormalizedStageAdapter,
     };
     use crate::execution::resolver::{AdapterRegistry, MintAdapter};
 
@@ -130,16 +130,11 @@ pub(crate) async fn resolve_auto_engine(
     let opensea = load_opensea_client(StdDuration::from_secs(10)).ok();
 
     let registry = AdapterRegistry::new(vec![
-        Box::new(OpenSeaDropsAdapter {
+        Box::new(NormalizedStageAdapter {
             plan_args,
             config_path,
             slug: plan_args.slug.as_deref(),
             opensea: opensea.as_ref(),
-            allow_not_yet_started,
-        }) as Box<dyn MintAdapter>,
-        Box::new(SeaDropAdapter {
-            plan_args,
-            config_path,
             allow_not_yet_started,
         }) as Box<dyn MintAdapter>,
         Box::new(GenericVerifiedContractAdapter {

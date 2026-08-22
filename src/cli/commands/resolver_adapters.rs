@@ -1,157 +1,232 @@
-//! Concrete [`MintAdapter`] implementations for the two engines Kairox
-//! actually has: native on-chain SeaDrop and the official OpenSea Drops
-//! API. Both `mint --engine auto` and `watch --engine auto` build an
-//! [`AdapterRegistry`] from these and call [`AdapterRegistry::resolve`]
-//! instead of duplicating engine-selection logic -- see
-//! `src/execution/resolver.rs` for the resolution hierarchy/ambiguity
-//! rules these adapters plug into.
+//! Concrete [`MintAdapter`] implementations for the engines Kairox
+//! actually has. Both `mint --engine auto` and `watch --engine auto`
+//! build an [`AdapterRegistry`] from these and call
+//! [`AdapterRegistry::resolve`] instead of duplicating engine-selection
+//! logic -- see `src/execution/resolver.rs` for the resolution
+//! hierarchy/ambiguity rules these adapters plug into.
 //!
-//! [`OpenSeaDropsAdapter`] is tried *before* [`SeaDropAdapter`] (priority 0
-//! vs 1): a currently-active, OpenSea-recognized non-public stage
-//! (signed-presale/allowlist/FCFS/FCFA) always outranks a later on-chain
-//! public stage the wallet might also technically satisfy -- this is the
-//! real class of mistake an explicit `--engine public` reproduced in
-//! practice (an active eligible signed presale existed, but the
-//! explicit-engine command wound up waiting for a later public stage
-//! instead). [`OpenSeaDropsAdapter`] only matches on a *plain public*
-//! active stage (or no active stage at all) by returning `None`, at which
-//! point the registry falls through to [`SeaDropAdapter`] automatically --
-//! never triggering `AmbiguousProtocol`, since a tier with zero matches is
-//! simply skipped.
+//! [`NormalizedStageAdapter`] (priority 0) is the real decision point for
+//! "native SeaDrop vs OpenSea": it discovers every candidate stage from
+//! both sources as [`crate::domain::stage::NormalizedStage`] entries and
+//! hands the *whole set* to
+//! [`crate::execution::stage_resolver::select_for_live_mint`]/
+//! [`select_for_watch`] -- the same selection algorithm proven against
+//! synthetic fixtures -- rather than an ad-hoc "try OpenSea, then try
+//! SeaDrop" priority chain. This is what makes an active, eligible,
+//! OpenSea-hosted signed presale outrank a later on-chain public stage:
+//! not adapter registration order, but the selection algorithm's own
+//! non-public-beats-public ranking rule, applied to real discovered data.
 //!
-//! A third adapter, `GenericVerifiedContractAdapter`, covers a schema the
+//! [`GenericVerifiedContractAdapter`] (priority 1) covers a schema the
 //! operator explicitly declared (never guessed) and that on-chain ERC-165
-//! corroborates. A registered launchpad adapter would plug in below that --
-//! see `docs/generic-engine.md`/`docs/resolver-architecture.md` for why
-//! that isn't added in this pass.
+//! corroborates, or a verified-source/trusted-registry match -- a
+//! fundamentally different (bytecode/ABI-based, not stage-timing-based)
+//! kind of resolution that does not fit the stage model, so it stays a
+//! separate, subsequent tier: only tried once
+//! [`NormalizedStageAdapter`] found no stage at all.
 
 use std::path::Path;
 
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
 use crate::cli::args::PlanArgs;
 use crate::cli::context::{connect_read_client, resolve_chain_and_runtime};
-use crate::domain::stage::StageProtocol;
-use crate::domain::timing::StageStatus;
+use crate::domain::stage::{EligibilityState, NormalizedStage, StageProtocol};
+use crate::domain::timing::PhaseWindow;
 use crate::execution::errors::KairoxError;
 use crate::execution::generic_schema::GenericMintSchema;
 use crate::execution::resolver::{
     Confidence, Detection, MintAdapter, ProtocolEvidence, ResolvedEngine,
 };
+use crate::execution::stage_resolver::{
+    LiveStageDecision, WatchStageDecision, select_for_live_mint, select_for_watch,
+};
 
 use super::plan::build_mint_plan;
 
-/// Detects Kairox's native on-chain SeaDrop `PublicSeaDropEngine` route:
-/// the collection's `getPublicDrop()` config is readable and its stage
-/// hasn't ended. Priority 1 -- tried only once [`OpenSeaDropsAdapter`]
-/// (priority 0) found no currently-active *non-public* OpenSea stage; see
-/// this module's docs for why.
-pub struct SeaDropAdapter<'a> {
-    pub plan_args: &'a PlanArgs,
-    pub config_path: Option<&'a Path>,
-    /// `mint --send` wants an already-`Active` stage (an operator running
-    /// it right now expects to broadcast immediately); `watch` also
-    /// accepts `NotStarted` (that's exactly the stage it waits through).
-    pub allow_not_yet_started: bool,
+/// Discovers the collection's native on-chain SeaDrop `PublicDrop` stage,
+/// if any, as a [`NormalizedStage`]. `Ok(None)` (not an error) when the
+/// contract genuinely isn't a SeaDrop collection.
+async fn discover_public_stage(
+    plan_args: &PlanArgs,
+    config_path: Option<&Path>,
+) -> Result<Option<NormalizedStage>, KairoxError> {
+    let plan = match build_mint_plan(plan_args, config_path).await {
+        Ok(plan) => plan,
+        // Only a genuine on-chain call/decode failure (a revert response
+        // or a return shape that doesn't decode as PublicDrop) is the
+        // expected signal that this contract isn't a SeaDrop collection
+        // -- treated as "no stage", not propagated, so an unrelated
+        // ERC-721 doesn't abort resolution outright. Anything else (no
+        // RPC configured, a bad config file, wrong chain, transport
+        // timeout/network failure) is a real infrastructure problem that
+        // has nothing to do with which protocol the contract implements,
+        // and must surface as itself rather than being misreported as
+        // UNSUPPORTED_PROTOCOL.
+        Err(
+            KairoxError::Rpc(
+                crate::chain::rpc::RpcError::RpcReturnedError { .. }
+                | crate::chain::rpc::RpcError::MalformedResponse(_),
+            )
+            | KairoxError::SeaDrop(_),
+        ) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let price_per_token = if plan.quantity > 0 {
+        plan.mint_value / alloy_primitives::U256::from(plan.quantity)
+    } else {
+        plan.mint_value
+    };
+
+    Ok(Some(NormalizedStage {
+        id: "on-chain-public".to_string(),
+        protocol: StageProtocol::Public,
+        label: None,
+        window: PhaseWindow {
+            start: plan.stage_start,
+            end: plan.stage_end,
+        },
+        price_per_token_wei: Some(price_per_token),
+        // MintPlan already reports *remaining* allocation/supply rather
+        // than a max/used split -- represented here as "all remaining
+        // capacity, none used yet", which produces the exact same
+        // `remaining_wallet_allocation()`/`has_known_capacity()` results
+        // NormalizedStage's own max/used fields would.
+        max_per_wallet: Some(plan.wallet_allocation_remaining),
+        wallet_minted: Some(0),
+        supply_remaining: Some(plan.collection_supply_remaining),
+        eligibility: EligibilityState::Eligible,
+        evidence: format!(
+            "on-chain SeaDrop PublicDrop config read from {}",
+            plan_args.collection
+        ),
+    }))
 }
 
-#[async_trait::async_trait]
-impl MintAdapter for SeaDropAdapter<'_> {
-    fn name(&self) -> &'static str {
-        "SeaDropAdapter"
+/// Discovers every OpenSea-hosted non-public stage worth considering (the
+/// currently-active one, and -- when `allow_not_yet_started` -- the
+/// upcoming one) as [`NormalizedStage`] entries. A plain public OpenSea
+/// stage is never included here: the cheaper, dependency-free native
+/// route covers that case when one exists, and
+/// [`crate::opensea::models::map_stage_type`] never even maps a
+/// `"public"`-shaped wire value (see its doc comment).
+async fn discover_opensea_stages(
+    plan_args: &PlanArgs,
+    config_path: Option<&Path>,
+    opensea: Option<&crate::opensea::client::OpenSeaClient>,
+    allow_not_yet_started: bool,
+) -> Result<Vec<NormalizedStage>, KairoxError> {
+    let Some(opensea) = opensea else {
+        return Ok(Vec::new());
+    };
+    let registry = crate::chain::registry::ChainRegistry::builtin();
+    let (resolved, _runtime) =
+        resolve_chain_and_runtime(&registry, &plan_args.chain_args, config_path)?;
+    let Some(chain_identifier) =
+        crate::opensea::models::opensea_chain_identifier(resolved.info.chain_id)
+    else {
+        return Ok(Vec::new());
+    };
+
+    // Auto-discovery is a best-effort enhancement, never a hard
+    // requirement: any error here (OpenSea down, rate-limited,
+    // misconfigured key) is deliberately treated the same as "no drop
+    // discovered", never propagated -- a collection with a working
+    // native on-chain public stage must not be blocked by OpenSea's
+    // availability.
+    let details = match crate::opensea::discovery::resolve_drop(
+        opensea,
+        chain_identifier,
+        plan_args.collection,
+    )
+    .await
+    {
+        Ok(Some(details)) => details,
+        Ok(None) | Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut candidates = vec![details.active_stage.as_ref()];
+    if allow_not_yet_started {
+        candidates.push(details.next_stage.as_ref());
     }
 
-    fn priority(&self) -> u8 {
-        1
-    }
-
-    async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
-        let plan = match build_mint_plan(self.plan_args, self.config_path).await {
-            Ok(plan) => plan,
-            // Only a genuine on-chain call/decode failure (a revert
-            // response or a return shape that doesn't decode as
-            // PublicDrop) is the expected signal that this contract isn't
-            // a SeaDrop collection -- treated as "no match", not
-            // propagated, so an unrelated ERC-721 doesn't abort resolution
-            // outright. Anything else (no RPC configured, a bad config
-            // file, wrong chain, transport timeout/network failure) is a
-            // real infrastructure problem that has nothing to do with
-            // which protocol the contract implements, and must surface as
-            // itself rather than being misreported as
-            // UNSUPPORTED_PROTOCOL.
-            Err(
-                KairoxError::Rpc(
-                    crate::chain::rpc::RpcError::RpcReturnedError { .. }
-                    | crate::chain::rpc::RpcError::MalformedResponse(_),
-                )
-                | KairoxError::SeaDrop(_),
-            ) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-
-        let matched = matches!(
-            (plan.stage_status, self.allow_not_yet_started),
-            (StageStatus::Active { .. }, _) | (StageStatus::NotStarted { .. }, true)
-        );
-        if !matched {
-            return Ok(None);
-        }
-
-        Ok(Some(Detection {
-            engine: ResolvedEngine::Public,
-            evidence: ProtocolEvidence {
-                source: format!(
-                    "on-chain SeaDrop PublicDrop config read from {} (stage {:?})",
-                    self.plan_args.collection, plan.stage_status
+    Ok(candidates
+        .into_iter()
+        .flatten()
+        .filter_map(|stage| {
+            let protocol = crate::opensea::models::map_stage_type(&stage.stage_type)?;
+            let start = OffsetDateTime::parse(&stage.start_time, &Rfc3339).ok()?;
+            let end = OffsetDateTime::parse(&stage.end_time, &Rfc3339).ok()?;
+            Some(NormalizedStage {
+                id: details.collection_slug.clone(),
+                protocol,
+                label: stage.label.clone(),
+                window: PhaseWindow { start, end },
+                price_per_token_wei: stage
+                    .price
+                    .as_ref()
+                    .and_then(|p| p.parse::<alloy_primitives::U256>().ok()),
+                max_per_wallet: stage.max_per_wallet.parse::<u64>().ok(),
+                // Genuinely unknown until a real, fresh, wallet-specific
+                // OpenSea authorization is requested -- never assumed
+                // zero/unused. See EligibilityState::UnknownUntilActive
+                // below.
+                wallet_minted: None,
+                supply_remaining: None,
+                eligibility: EligibilityState::UnknownUntilActive,
+                evidence: format!(
+                    "auto-discovered OpenSea drop {:?}: stage {:?} (recognized as {protocol:?})",
+                    details.collection_slug, stage.stage_type
                 ),
-                confidence: Confidence::High,
-                adapter: "SeaDropAdapter",
-                matched_interfaces: vec!["ISeaDropTokenContractMetadata".to_string()],
-                matched_selectors: vec!["getPublicDrop()".to_string()],
+            })
+        })
+        .collect())
+}
+
+fn stage_to_detection(stage: &NormalizedStage) -> Detection {
+    let (engine, adapter) = match stage.protocol {
+        StageProtocol::Public => (ResolvedEngine::Public, "SeaDropAdapter"),
+        _ => (
+            ResolvedEngine::OpenSea {
+                slug: stage.id.clone(),
             },
-        }))
+            "OpenSeaDropsAdapter",
+        ),
+    };
+    Detection {
+        engine,
+        evidence: ProtocolEvidence {
+            source: stage.evidence.clone(),
+            confidence: Confidence::High,
+            adapter,
+            matched_interfaces: vec![],
+            matched_selectors: vec![],
+        },
     }
 }
 
-/// Detects the official OpenSea Drops API route, in order:
-///
-/// 1. **Operator-provided `--slug`**: always matches outright -- an
-///    operator-confirmed fact, not a guess.
-/// 2. **Automatic slug discovery**: when `--slug` was not given and an
-///    [`OpenSeaClient`] is available (an OpenSea API key is configured --
-///    auto-discovery is best-effort, never a hard requirement), resolves
-///    the collection's OpenSea drop via
-///    [`crate::opensea::discovery::resolve_drop`] (which independently
-///    verifies any candidate slug against the drop's own reported contract
-///    address before trusting it -- see that module's docs). Matches only
-///    when the drop reports a currently-active stage whose
-///    `stage_type` is recognized ([`crate::opensea::models::map_stage_type`])
-///    as something *other than* plain [`StageProtocol::Public`] -- a plain
-///    public stage is left to [`SeaDropAdapter`], which needs no off-chain
-///    dependency for it. Any OpenSea transport/auth/server error, or an
-///    unrecognized `stage_type`, is treated identically to "no match" --
-///    never propagated as a hard failure, so OpenSea being unreachable can
-///    never block a collection whose native on-chain public stage still
-///    works.
-///
-/// Priority 0 -- see this module's docs for why this is tried *before*
-/// [`SeaDropAdapter`].
-pub struct OpenSeaDropsAdapter<'a> {
+/// The real decision point for "native SeaDrop vs OpenSea": discovers
+/// every candidate stage from both sources, then delegates the actual
+/// choice to [`select_for_live_mint`]/[`select_for_watch`] -- see this
+/// module's doc comment. Priority 0.
+pub struct NormalizedStageAdapter<'a> {
     pub plan_args: &'a PlanArgs,
     pub config_path: Option<&'a Path>,
     pub slug: Option<&'a str>,
     pub opensea: Option<&'a crate::opensea::client::OpenSeaClient>,
-    /// `watch` (`true`) also matches a currently-*upcoming*
-    /// (`next_stage`, not yet started) non-public stage, so it can
-    /// auto-discover a future signed presale to wait for -- exactly the
-    /// same distinction [`SeaDropAdapter::allow_not_yet_started`] makes
-    /// for the native route. `mint` (`false`) only ever matches an
-    /// already-active stage, since it means "act now".
+    /// `mint --send` wants an already-active stage (an operator running
+    /// it right now expects to broadcast immediately); `watch` also
+    /// considers a not-yet-started stage (that's exactly what it waits
+    /// through) -- see [`select_for_live_mint`] vs [`select_for_watch`].
     pub allow_not_yet_started: bool,
 }
 
 #[async_trait::async_trait]
-impl MintAdapter for OpenSeaDropsAdapter<'_> {
+impl MintAdapter for NormalizedStageAdapter<'_> {
     fn name(&self) -> &'static str {
-        "OpenSeaDropsAdapter"
+        "NormalizedStageAdapter"
     }
 
     fn priority(&self) -> u8 {
@@ -159,6 +234,10 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
     }
 
     async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
+        // An operator-provided --slug is still taken at face value
+        // outright, exactly as before -- an operator-confirmed fact, not
+        // a guess, and not something auto-discovery needs to (or should)
+        // re-derive.
         if let Some(slug) = self.slug {
             return Ok(Some(Detection {
                 engine: ResolvedEngine::OpenSea {
@@ -174,97 +253,34 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
             }));
         }
 
-        let Some(opensea) = self.opensea else {
-            return Ok(None);
-        };
-        let registry = crate::chain::registry::ChainRegistry::builtin();
-        let (resolved, _runtime) =
-            resolve_chain_and_runtime(&registry, &self.plan_args.chain_args, self.config_path)?;
-        let Some(chain_identifier) =
-            crate::opensea::models::opensea_chain_identifier(resolved.info.chain_id)
-        else {
-            return Ok(None);
-        };
+        let mut stages = Vec::new();
+        stages.extend(discover_public_stage(self.plan_args, self.config_path).await?);
+        stages.extend(
+            discover_opensea_stages(
+                self.plan_args,
+                self.config_path,
+                self.opensea,
+                self.allow_not_yet_started,
+            )
+            .await?,
+        );
 
-        // Auto-discovery is a best-effort enhancement, never a hard
-        // requirement: any error here (OpenSea down, rate-limited,
-        // misconfigured key) is deliberately treated the same as "no
-        // drop discovered", never propagated -- a collection with a
-        // working native on-chain public stage must not be blocked by
-        // OpenSea's availability. See this struct's docs.
-        let details = match crate::opensea::discovery::resolve_drop(
-            opensea,
-            chain_identifier,
-            self.plan_args.collection,
-        )
-        .await
-        {
-            Ok(Some(details)) => details,
-            Ok(None) | Err(_) => return Ok(None),
+        let now = OffsetDateTime::now_utc();
+        let winner = if self.allow_not_yet_started {
+            match select_for_watch(&stages, now) {
+                WatchStageDecision::AlreadyLive(stage) | WatchStageDecision::WaitFor(stage) => {
+                    Some(*stage)
+                }
+                WatchStageDecision::NoSupportedFutureStage { .. } => None,
+            }
+        } else {
+            match select_for_live_mint(&stages, now) {
+                LiveStageDecision::Selected(stage) => Some(*stage),
+                LiveStageDecision::NoActiveEligibleStage { .. } => None,
+            }
         };
 
-        // An already-active non-public stage always wins outright,
-        // whether called from `mint` or `watch`. `map_stage_type` only
-        // ever returns a non-public protocol today (see its doc comment
-        // for why "public" was removed as unverified) -- the explicit
-        // `!= Public` check is kept as defense in depth for if/when a
-        // `Public`-mapping wire value is independently re-verified and
-        // added back.
-        if let Some(stage) = details.active_stage.as_ref()
-            && let Some(protocol) = crate::opensea::models::map_stage_type(&stage.stage_type)
-            && protocol != StageProtocol::Public
-        {
-            return Ok(Some(auto_discovered_detection(
-                &details.collection_slug,
-                stage,
-                protocol,
-                "active",
-            )));
-        }
-
-        // `watch` also considers a genuinely *upcoming* non-public stage
-        // -- OpenSea's own `next_stage` -- so it can discover a future
-        // signed presale to wait for instead of falling through to a
-        // later native public stage. `mint` never does: it means "act
-        // now", and a stage that has not opened yet is never a match for
-        // it.
-        if self.allow_not_yet_started
-            && let Some(stage) = details.next_stage.as_ref()
-            && let Some(protocol) = crate::opensea::models::map_stage_type(&stage.stage_type)
-            && protocol != StageProtocol::Public
-        {
-            return Ok(Some(auto_discovered_detection(
-                &details.collection_slug,
-                stage,
-                protocol,
-                "upcoming",
-            )));
-        }
-
-        Ok(None)
-    }
-}
-
-fn auto_discovered_detection(
-    slug: &str,
-    stage: &crate::opensea::models::DropStageResponse,
-    protocol: StageProtocol,
-    timing: &str,
-) -> Detection {
-    Detection {
-        engine: ResolvedEngine::OpenSea {
-            slug: slug.to_string(),
-        },
-        evidence: ProtocolEvidence {
-            source: format!(
-                "auto-discovered OpenSea drop {slug:?}: {timing} stage {:?} (recognized as {protocol:?})",
-                stage.stage_type
-            ),
-            confidence: Confidence::High,
-            adapter: "OpenSeaDropsAdapter",
-            matched_interfaces: vec![],
-            matched_selectors: vec![],
-        },
+        Ok(winner.as_ref().map(stage_to_detection))
     }
 }
 
@@ -287,8 +303,8 @@ fn auto_discovered_detection(
 ///    mean, or what value it expects. Can never resolve to a live-send
 ///    path. See `docs/generic-engine.md`'s "Confidence model" section.
 ///
-/// Priority 2 -- only tried once neither native SeaDrop nor the OpenSea
-/// Drops route matched.
+/// Priority 1 -- only tried once [`NormalizedStageAdapter`] (priority 0)
+/// found no candidate stage at all.
 pub struct GenericVerifiedContractAdapter<'a> {
     pub plan_args: &'a PlanArgs,
     pub config_path: Option<&'a Path>,
@@ -304,7 +320,7 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
     }
 
     fn priority(&self) -> u8 {
-        2
+        1
     }
 
     async fn detect(&self) -> Result<Option<Detection>, KairoxError> {

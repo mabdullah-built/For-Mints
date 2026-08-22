@@ -4629,14 +4629,17 @@ fn auto_engine_explicit_slug_still_wins_outright_without_auto_discovery() {
 
 #[test]
 fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_active_public() {
-    // The on-chain PublicDrop is already Active right now (per
-    // standard_read_response's default 2020-2999 window) -- if the
-    // OpenSea route were not correctly preferred, watch would resolve
-    // straight to the native public engine and execute immediately,
-    // never waiting at all. Proving it genuinely waits ~2s and then
-    // requests a fresh OpenSea mint authorization is what distinguishes
-    // "auto-discovery actually wired into watch" from "resolution code
-    // exists but nothing calls it with allow_not_yet_started".
+    // Realistic launch sequencing: the on-chain PublicDrop has not opened
+    // yet either (far future window) -- both stages are genuinely
+    // NotStarted, so the correct pick is the *earlier* one, the signed
+    // presale. (An earlier version of this test made the on-chain public
+    // stage already Active, which -- correctly, once the normalized
+    // stage resolver actually weighs both candidates instead of an
+    // ad-hoc adapter-priority chain -- makes AlreadyLive(Public) the
+    // right answer, not WaitFor: a stage that is genuinely live right
+    // now must never be waited past. This version tests the real
+    // "auto-discover and wait for the earlier upcoming non-public stage"
+    // case instead.)
     let signer = test_signer();
     let wallet = signer.address();
     let key_hex = signing_key_hex(&signer);
@@ -4650,6 +4653,8 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
         .unwrap()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
+    let public_start = unix_now() + 3600;
+    let public_end = public_start + 3600;
 
     let server = LocalHttpServer::spawn_raw(move |path, body| {
         if path == "/" {
@@ -4660,12 +4665,13 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
                 .to_string();
             let params = body.get("params").cloned().unwrap_or(Value::Null);
             let behavior =
-                standard_read_response(&method, &params).unwrap_or(Behavior::JsonRpcError {
-                    code: -32601,
-                    message: format!(
-                        "unexpected RPC method in watch-auto-discovery scenario: {method}"
-                    ),
-                });
+                read_response_with_stage_window(&method, &params, public_start, public_end)
+                    .unwrap_or(Behavior::JsonRpcError {
+                        code: -32601,
+                        message: format!(
+                            "unexpected RPC method in watch-auto-discovery scenario: {method}"
+                        ),
+                    });
             (method, behavior)
         } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
             (
@@ -4749,7 +4755,7 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
         .assert()
         .failure()
         .stderr(predicates::str::contains("resolved_engine: OpenSea"))
-        .stderr(predicates::str::contains("upcoming stage"))
+        .stderr(predicates::str::contains("signed_presale"))
         .stderr(predicates::str::contains("not eligible"));
 
     let received = server.received.lock().unwrap();
