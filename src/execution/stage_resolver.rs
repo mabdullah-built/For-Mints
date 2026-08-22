@@ -379,4 +379,34 @@ mod tests {
         let decision = select_for_live_mint(&[later, earlier.clone()], NOW);
         assert_eq!(decision, LiveStageDecision::Selected(Box::new(earlier)));
     }
+
+    /// Deterministic local performance regression test (brief item 7):
+    /// pure in-memory selection over a realistically-large candidate set
+    /// must stay comfortably sub-millisecond, since it involves no I/O at
+    /// all. Not a network-latency measurement -- a hard local threshold
+    /// is legitimate here precisely because nothing here can be flaky.
+    #[test]
+    fn selection_over_a_large_candidate_set_is_comfortably_sub_millisecond() {
+        let mut stages = Vec::new();
+        for i in 0..500u32 {
+            let mut s = base(&format!("stage-{i}"), StageProtocol::Fcfs);
+            s.window.start = NOW - Duration::seconds(i as i64);
+            stages.push(s);
+        }
+        let public = base("public", StageProtocol::Public);
+        stages.push(public);
+
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = select_for_live_mint(&stages, NOW);
+            let _ = select_for_watch(&stages, NOW);
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "40 selection calls over 501 candidates took {elapsed:?}, expected well under \
+             100ms for pure in-memory logic"
+        );
+    }
 }

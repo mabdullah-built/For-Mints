@@ -136,5 +136,64 @@ pub async fn run(
         selected_read_label.unwrap_or("(unlabeled)"),
     );
 
+    report_opensea_locality(resolved.chain_id).await;
+
     Ok(())
+}
+
+/// Diagnostic-only network-locality report for the official OpenSea REST
+/// origin: real, read-only `GET /api/v2/chain/{chain}/contract/{address}`
+/// requests (the zero address -- expected to 404, which is a perfectly
+/// real round trip for latency purposes) against the address zero, timed
+/// individually so an operator can see the cold-connection cost
+/// separately from subsequent (TCP/TLS-reused) requests. Purely
+/// observational: never asserted against a threshold, never used to
+/// change any endpoint/infrastructure choice automatically -- an
+/// operator decides what (if anything) to do with this. Skipped
+/// entirely (with a clear reason) when no OpenSea API key is configured
+/// or the chain has no known OpenSea mapping -- never a hard failure of
+/// `bench` itself.
+async fn report_opensea_locality(chain_id: crate::chain::registry::ChainId) {
+    println!();
+    let Some(chain_identifier) = crate::opensea::models::opensea_chain_identifier(chain_id) else {
+        println!("OpenSea REST origin: chain id {chain_id} has no known OpenSea mapping; skipped.");
+        return;
+    };
+    let opensea = match super::mint::load_opensea_client(std::time::Duration::from_secs(10)) {
+        Ok(client) => client,
+        Err(_) => {
+            println!(
+                "OpenSea REST origin ({chain_identifier}): KAIROX_OPENSEA_API_KEY not configured; \
+                 skipped."
+            );
+            return;
+        }
+    };
+
+    println!("OpenSea REST origin ({chain_identifier}) -- diagnostic only, never authoritative:");
+    const SAMPLES: usize = 3;
+    let mut latencies_ms = Vec::with_capacity(SAMPLES);
+    for i in 0..SAMPLES {
+        let started = std::time::Instant::now();
+        let outcome = opensea
+            .get_contract(chain_identifier, alloy_primitives::Address::ZERO)
+            .await;
+        let elapsed_ms = started.elapsed().as_millis();
+        let phase = if i == 0 { "cold" } else { "warm" };
+        let status = match outcome {
+            Ok(_) => "ok",
+            Err(_) => "no-record-or-error (still a real round trip)",
+        };
+        println!("  request {} ({phase}): {elapsed_ms}ms ({status})", i + 1);
+        latencies_ms.push(elapsed_ms);
+    }
+    if latencies_ms.len() > 1 {
+        let cold = latencies_ms[0];
+        let warm_mean = latencies_ms[1..].iter().sum::<u128>() / (latencies_ms.len() - 1) as u128;
+        println!(
+            "  cold request: {cold}ms; mean of {} subsequent (connection-reused) request(s): \
+             {warm_mean}ms",
+            latencies_ms.len() - 1
+        );
+    }
 }
