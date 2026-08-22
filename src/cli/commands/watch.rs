@@ -618,21 +618,72 @@ struct TelemetryProbe<'a> {
     /// telemetry is then simply left unpopulated for this cycle, never a
     /// reason to fail the real probe.
     network_source: Option<&'a crate::chain::rpc::RpcClient>,
+    /// The exact same `arm_threshold` `wait_for_stage` itself uses to
+    /// decide whether *this* probe result is the one that hands off to
+    /// execution (`remaining <= arm_threshold`). Telemetry network calls
+    /// are skipped whenever this probe's own result would meet that same
+    /// condition -- see `probe`'s doc comment for why this must mirror
+    /// `wait_for_stage`'s criterion exactly, not merely approximate it.
+    arm_threshold: time::Duration,
 }
 
 #[async_trait::async_trait]
 impl StageProbe for TelemetryProbe<'_> {
+    /// CRITICAL ORDERING INVARIANT: the moment `self.inner.probe()`'s
+    /// result is the one `wait_for_stage` will use to hand off to
+    /// execution (`remaining <= arm_threshold`, or the stage already
+    /// `Ended`), this function returns *immediately* -- no optional
+    /// network telemetry call is ever made on that result, because doing
+    /// so would delay delivery of a MANDATORY stage observation behind
+    /// OPTIONAL diagnostic RPC traffic. An earlier version of this code
+    /// got this wrong: it always ran the telemetry reads before
+    /// returning, regardless of how close to (or past) T0 the observed
+    /// stage already was. See the regression test
+    /// `optional_telemetry_never_delays_delivery_of_an_active_stage_result`.
+    ///
+    /// Telemetry is only ever attempted on a result that is *not* about
+    /// to hand off -- i.e. only while genuinely far from T0, which is
+    /// exactly when it is safe for it to cost a little extra latency.
     async fn probe(&self) -> Result<StageSnapshot, KairoxError> {
         let started = std::time::Instant::now();
         let result = self.inner.probe().await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
+        // A poisoned telemetry mutex is never allowed to affect the real
+        // probe outcome -- telemetry is strictly advisory, so a recording
+        // failure here is silently skipped, never propagated or panicked
+        // on. Cheap and in-memory only -- never a network call -- so this
+        // always runs, even on a result about to hand off.
+        if let Ok(mut store) = self.store.lock() {
+            match &result {
+                Ok(_) => store.record_probe_success(self.label, elapsed_ms),
+                Err(_) => store.record_probe_failure(self.label),
+            }
+        }
+
+        // About to hand off (or terminate) -- skip every optional network
+        // telemetry call for this cycle and return `result` right now.
+        // Mirrors `wait_for_stage`'s own `remaining <= arm_threshold`
+        // check exactly, so this can never disagree with the real
+        // handoff decision made a moment later by the caller.
+        let about_to_hand_off_or_terminate = match &result {
+            Ok(snapshot) => {
+                matches!(snapshot.status, crate::domain::timing::StageStatus::Ended)
+                    || (snapshot.stage_start - OffsetDateTime::now_utc()) <= self.arm_threshold
+            }
+            Err(_) => true,
+        };
+        if about_to_hand_off_or_terminate {
+            return result;
+        }
+
         // A best-effort, read-only network observation -- entirely
         // separate from `self.inner.probe()`'s own outcome above, and
         // never allowed to affect it: a failure here is silently
         // dropped, never propagated. See `NetworkTelemetry`'s doc
-        // comment for why this is safe to call every poll cycle (it
-        // reuses an already-connected client, never opens a new one).
+        // comment for why this is safe to call every poll cycle while
+        // genuinely far from T0 (it reuses an already-connected client,
+        // never opens a new one).
         if let Some(client) = self.network_source {
             if let Ok(mut store) = self.store.lock() {
                 store.record_endpoint_identity(
@@ -655,16 +706,6 @@ impl StageProbe for TelemetryProbe<'_> {
             }
         }
 
-        // A poisoned telemetry mutex is never allowed to affect the real
-        // probe outcome -- telemetry is strictly advisory, so a recording
-        // failure here is silently skipped, never propagated or panicked
-        // on.
-        if let Ok(mut store) = self.store.lock() {
-            match &result {
-                Ok(_) => store.record_probe_success(self.label, elapsed_ms),
-                Err(_) => store.record_probe_failure(self.label),
-            }
-        }
         result
     }
 }
@@ -804,6 +845,7 @@ async fn run_public_watch(
         label: "public-stage-probe",
         store: &telemetry,
         network_source: pool.preferred_read(),
+        arm_threshold: poll_config.arm_threshold,
     };
     let stage_start = wait_for_stage_with_reresolution(
         &probe,
@@ -930,6 +972,7 @@ async fn run_opensea_watch(
         label: "opensea-drop-details-probe",
         store: &telemetry,
         network_source: pool.preferred_read(),
+        arm_threshold: poll_config.arm_threshold,
     };
     // Per the OpenSea engine's own design, only stage timing/supply is
     // knowable ahead of T0 -- wallet-specific eligibility/proof/
@@ -1296,5 +1339,204 @@ mod reresolution_change_detection_tests {
                 stage_uuid: None,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod telemetry_probe_critical_path_tests {
+    //! Regression coverage for the bug fixed in this pass:
+    //! `TelemetryProbe::probe` used to always run its optional network
+    //! telemetry reads before returning, even when the inner probe's
+    //! result was the exact one `wait_for_stage` was about to use to hand
+    //! off to execution -- meaning a slow/hung telemetry RPC call could
+    //! delay delivery of a MANDATORY "stage active" observation. Fixed by
+    //! skipping telemetry entirely whenever this probe's own result meets
+    //! `wait_for_stage`'s own `remaining <= arm_threshold` handoff
+    //! criterion (or the stage has `Ended`).
+
+    use super::*;
+    use crate::chain::endpoint::EndpointRole;
+    use crate::chain::mock::MockTransport;
+    use crate::chain::rpc::RpcClient;
+    use crate::domain::timing::StageStatus;
+    use std::sync::Mutex;
+    use std::time::Duration as StdDuration;
+
+    /// Always reports the stage as already active (`stage_start` in the
+    /// past) -- exactly the result that must hand off to execution
+    /// without delay.
+    struct FakeAboutToHandOffProbe;
+
+    #[async_trait::async_trait]
+    impl StageProbe for FakeAboutToHandOffProbe {
+        async fn probe(&self) -> Result<StageSnapshot, KairoxError> {
+            Ok(StageSnapshot {
+                stage_start: OffsetDateTime::now_utc() - Duration::seconds(5),
+                status: StageStatus::Active {
+                    ends_in: Duration::seconds(3600),
+                },
+            })
+        }
+    }
+
+    /// Reports a stage that starts comfortably far in the future -- a
+    /// result `wait_for_stage` will keep polling on, never hand off from.
+    struct FakeFarFromT0Probe;
+
+    #[async_trait::async_trait]
+    impl StageProbe for FakeFarFromT0Probe {
+        async fn probe(&self) -> Result<StageSnapshot, KairoxError> {
+            Ok(StageSnapshot {
+                stage_start: OffsetDateTime::now_utc() + Duration::minutes(30),
+                status: StageStatus::NotStarted {
+                    starts_in: Duration::minutes(30),
+                },
+            })
+        }
+    }
+
+    async fn slow_network_client(delay: StdDuration) -> RpcClient {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", serde_json::json!("0x1"))
+            .respond(
+                "eth_getBlockByNumber",
+                serde_json::json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x1"}),
+            )
+            .delay("eth_getBlockByNumber", delay)
+            .respond("eth_maxPriorityFeePerGas", serde_json::json!("0x1"))
+            .build();
+        RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap()
+    }
+
+    async fn erroring_network_client() -> RpcClient {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", serde_json::json!("0x1"))
+            .error("eth_getBlockByNumber", -32000, "boom")
+            .build();
+        RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap()
+    }
+
+    /// THE regression test for the bug this pass fixes: a 500ms-delayed
+    /// optional telemetry call must never delay delivery of an
+    /// already-active stage result.
+    #[tokio::test]
+    async fn optional_telemetry_never_delays_delivery_of_an_active_stage_result() {
+        let inner = FakeAboutToHandOffProbe;
+        let client = slow_network_client(StdDuration::from_millis(500)).await;
+        let store = Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: Some(&client),
+            arm_threshold: Duration::seconds(10),
+        };
+
+        let started = std::time::Instant::now();
+        let result = probe.probe().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result.status, StageStatus::Active { .. }));
+        assert!(
+            elapsed < StdDuration::from_millis(200),
+            "an about-to-hand-off probe result must never be delayed by a 500ms-delayed \
+             optional telemetry call, took {elapsed:?}"
+        );
+        // Telemetry was correctly never even attempted for this cycle.
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .network
+                .latest_block_number()
+                .displayable_value()
+                .is_none()
+        );
+    }
+
+    /// Same scenario with an even longer ("hung") telemetry delay --
+    /// still must not delay handoff at all, proving this isn't merely a
+    /// race that happens to finish under the 200ms threshold above.
+    #[tokio::test]
+    async fn a_hung_optional_telemetry_call_never_delays_an_active_stage_result() {
+        let inner = FakeAboutToHandOffProbe;
+        let client = slow_network_client(StdDuration::from_secs(5)).await;
+        let store = Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: Some(&client),
+            arm_threshold: Duration::seconds(10),
+        };
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(StdDuration::from_millis(200), probe.probe())
+            .await
+            .expect("probe() must return well within 200ms even with a 5s-hung telemetry call")
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result.status, StageStatus::Active { .. }));
+        assert!(elapsed < StdDuration::from_millis(200));
+    }
+
+    /// A failing optional telemetry read (far from T0, where telemetry
+    /// does run) must never alter or fail the real probe result.
+    #[tokio::test]
+    async fn a_failing_optional_telemetry_call_never_alters_the_stage_result() {
+        let inner = FakeFarFromT0Probe;
+        let client = erroring_network_client().await;
+        let store = Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: Some(&client),
+            arm_threshold: Duration::seconds(10),
+        };
+
+        let result = probe.probe().await.unwrap();
+        assert!(matches!(result.status, StageStatus::NotStarted { .. }));
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .network
+                .latest_block_number()
+                .displayable_value()
+                .is_none(),
+            "a failed telemetry read must never fabricate an observation"
+        );
+    }
+
+    /// A poisoned telemetry mutex (far from T0) must never alter, fail,
+    /// or panic the real probe result.
+    #[tokio::test]
+    async fn a_poisoned_telemetry_lock_never_alters_the_stage_result() {
+        let inner = FakeFarFromT0Probe;
+        let client = slow_network_client(StdDuration::ZERO).await;
+        let store = Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+        // Poison the mutex the same way a panicking holder would.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.lock().unwrap();
+            panic!("simulated panic while holding the telemetry lock");
+        }));
+        assert!(store.is_poisoned());
+
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: Some(&client),
+            arm_threshold: Duration::seconds(10),
+        };
+
+        let result = probe.probe().await.unwrap();
+        assert!(matches!(result.status, StageStatus::NotStarted { .. }));
     }
 }
