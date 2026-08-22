@@ -58,6 +58,8 @@ pub enum KairoxError {
     #[error(transparent)]
     SeaDrop(#[from] crate::protocol::seadrop::SeaDropError),
     #[error(transparent)]
+    Thirdweb(#[from] crate::protocol::thirdweb::ThirdwebError),
+    #[error(transparent)]
     Log(#[from] crate::protocol::logs::LogError),
     #[error(transparent)]
     Signing(#[from] crate::signing::signer::SigningError),
@@ -323,7 +325,9 @@ impl KairoxError {
                 | SupplyError::ZeroQuantity
                 | SupplyError::UnknownCollectionSupply => KairoxErrorCode::SupplyStateInvalid,
             },
-            KairoxError::SeaDrop(_) | KairoxError::Log(_) => KairoxErrorCode::ProtocolDecodeError,
+            KairoxError::SeaDrop(_) | KairoxError::Thirdweb(_) | KairoxError::Log(_) => {
+                KairoxErrorCode::ProtocolDecodeError
+            }
             KairoxError::Signing(_) => KairoxErrorCode::SigningError,
             KairoxError::OpenSea(e) => match e {
                 OpenSeaError::ApiKeyMissing | OpenSeaError::AuthenticationFailed => {
@@ -392,6 +396,7 @@ impl Categorize for KairoxError {
             KairoxError::SafetyCap(_) => ErrorCategory::Fatal,
             KairoxError::Supply(_) => ErrorCategory::Fatal,
             KairoxError::SeaDrop(_) => ErrorCategory::Fatal,
+            KairoxError::Thirdweb(_) => ErrorCategory::Fatal,
             KairoxError::Log(_) => ErrorCategory::Fatal,
             KairoxError::Signing(_) => ErrorCategory::Fatal,
             KairoxError::OpenSea(e) => e.category(),

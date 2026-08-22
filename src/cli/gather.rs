@@ -7,6 +7,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use crate::chain::rpc::{BlockHeader, RpcClient};
 use crate::execution::errors::{KairoxError, SessionError};
 use crate::protocol::seadrop::{self, MintStats, PublicDropConfig};
+use crate::protocol::thirdweb::{self, ClaimCondition};
 
 /// Conservative fallback gas limit used only when `eth_estimateGas` cannot
 /// be completed (e.g. the stage has not opened yet, so a live mint call
@@ -49,6 +50,31 @@ pub async fn fetch_mint_stats(
     let calldata = seadrop::encode_get_mint_stats(minter);
     let result = client.eth_call(nft_contract, &calldata).await?;
     Ok(seadrop::decode_get_mint_stats(&result)?)
+}
+
+/// Fetch `getActiveClaimConditionId()` from a thirdweb Drop contract
+/// (which is the NFT contract itself -- thirdweb Drop contracts implement
+/// the NFT and its claim logic in one deployment, unlike SeaDrop's
+/// separate protocol-singleton/collection split).
+pub async fn fetch_thirdweb_active_claim_condition_id(
+    client: &RpcClient,
+    drop_contract: Address,
+) -> Result<U256, KairoxError> {
+    let calldata = thirdweb::encode_get_active_claim_condition_id();
+    let result = client.eth_call(drop_contract, &calldata).await?;
+    Ok(thirdweb::decode_get_active_claim_condition_id(&result)?)
+}
+
+/// Fetch `getClaimConditionById(conditionId)` from a thirdweb Drop
+/// contract.
+pub async fn fetch_thirdweb_claim_condition_by_id(
+    client: &RpcClient,
+    drop_contract: Address,
+    condition_id: U256,
+) -> Result<ClaimCondition, KairoxError> {
+    let calldata = thirdweb::encode_get_claim_condition_by_id(condition_id);
+    let result = client.eth_call(drop_contract, &calldata).await?;
+    Ok(thirdweb::decode_get_claim_condition_by_id(&result)?)
 }
 
 /// Base fee plus block context, and (best-effort) a suggested priority fee.
