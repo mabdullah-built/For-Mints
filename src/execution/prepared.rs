@@ -118,24 +118,72 @@ pub async fn gather_unsigned_plan(
     }
 
     // Required on-chain reads: SeaDrop public-drop config, allowed fee
-    // recipients, and per-wallet/collection mint stats. Any RpcError here
-    // propagates via `?` — no fallback.
+    // recipients, per-wallet/collection mint stats, latest block (for base
+    // fee), priority fee, nonce, and balance. None of these seven reads
+    // has a data dependency on any of the others -- only the *values*
+    // combine afterward (allowed_fee_recipients + public_drop ->
+    // fee_recipient -> calldata; block + priority fee -> fees; balance +
+    // worst-case cost -> the insufficient-balance check). Issued
+    // concurrently instead of one at a time for the same reason as
+    // `opensea_engine::prepare_opensea_wallet_unsigned`'s identical
+    // optimization (see its doc comment and
+    // `tests::parallel_reads_take_the_slowest_call_not_the_sum` below for
+    // the deterministic proof). Any RpcError here propagates via `?` — no
+    // fallback.
     let public_drop_calldata = seadrop::encode_get_public_drop(request.nft_contract)?;
-    let public_drop_raw = client
-        .eth_call(request.seadrop_contract, &public_drop_calldata)
-        .await?;
-    let public_drop = seadrop::decode_get_public_drop(&public_drop_raw)?;
-
     let allowed_calldata = seadrop::encode_get_allowed_fee_recipients(request.nft_contract)?;
-    let allowed_raw = client
-        .eth_call(request.seadrop_contract, &allowed_calldata)
-        .await?;
-    let allowed_fee_recipients = seadrop::decode_get_allowed_fee_recipients(&allowed_raw)?;
-
     let mint_stats_calldata = seadrop::encode_get_mint_stats(request.wallet);
-    let mint_stats_raw = client
-        .eth_call(request.nft_contract, &mint_stats_calldata)
-        .await?;
+
+    let (
+        public_drop_raw,
+        allowed_raw,
+        mint_stats_raw,
+        block,
+        max_priority_fee_per_gas,
+        nonce,
+        balance,
+    ) = tokio::try_join!(
+        async {
+            client
+                .eth_call(request.seadrop_contract, &public_drop_calldata)
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            client
+                .eth_call(request.seadrop_contract, &allowed_calldata)
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            client
+                .eth_call(request.nft_contract, &mint_stats_calldata)
+                .await
+                .map_err(KairoxError::from)
+        },
+        async { client.latest_block().await.map_err(KairoxError::from) },
+        async {
+            client
+                .max_priority_fee_per_gas()
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            client
+                .transaction_count(request.wallet)
+                .await
+                .map_err(KairoxError::from)
+        },
+        async {
+            client
+                .get_balance(request.wallet)
+                .await
+                .map_err(KairoxError::from)
+        },
+    )?;
+
+    let public_drop = seadrop::decode_get_public_drop(&public_drop_raw)?;
+    let allowed_fee_recipients = seadrop::decode_get_allowed_fee_recipients(&allowed_raw)?;
     let mint_stats = seadrop::decode_get_mint_stats(&mint_stats_raw)?;
 
     let fee_recipient = select_fee_recipient(
@@ -145,26 +193,18 @@ pub async fn gather_unsigned_plan(
         request.wallet,
     )?;
 
-    // Required fresh fee data. No fallback constant on failure anywhere
-    // below — every one of these must succeed.
-    let block = client.latest_block().await?;
     let base_fee_per_gas = block.base_fee_per_gas.ok_or_else(|| {
         KairoxError::Session(SessionError::new(
             "chain does not report an EIP-1559 baseFeePerGas; cannot safely price a live transaction"
                 ,
         ))
     })?;
-    let max_priority_fee_per_gas = client.max_priority_fee_per_gas().await?;
     let max_fee_per_gas = base_fee_per_gas
         .saturating_mul(2)
         .saturating_add(max_priority_fee_per_gas);
     // Constructing this also enforces max_fee_per_gas >= base_fee and
     // max_priority_fee_per_gas <= max_fee_per_gas.
     let fees = Eip1559Fees::new(base_fee_per_gas, max_priority_fee_per_gas, max_fee_per_gas)?;
-
-    // Required fresh nonce and balance.
-    let nonce = client.transaction_count(request.wallet).await?;
-    let balance = client.get_balance(request.wallet).await?;
 
     let mint_value = public_drop
         .mint_price
@@ -454,6 +494,88 @@ mod tests {
                 max_total_spend: U256::from(1_000_000_000_000_000_000u128),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn parallel_reads_take_the_slowest_call_not_the_sum() {
+        // Deterministic, mock-latency-based proof that gather_unsigned_plan's
+        // independent reads genuinely run concurrently. The mock's
+        // `.delay()` only applies to its method-wide default entry, not to
+        // `respond_eth_call_selector`'s routed matches -- so this delays
+        // the four non-eth_call reads (block/priority-fee/nonce/balance)
+        // and asserts on those; the three eth_call reads run alongside
+        // them for free either way. Mirrors
+        // opensea_engine::tests::parallel_prepare_reads_take_the_slowest_call_not_the_sum.
+        let signer = signer();
+        let delay = std::time::Duration::from_millis(80);
+        let opts = MockOpts::default();
+        let public_drop = seadrop::PublicDropAbi {
+            mintPrice: alloy_primitives::Uint::from(10_000_000_000_000_000u128),
+            startTime: alloy_primitives::Uint::from(opts.start_time as u64),
+            endTime: alloy_primitives::Uint::from(opts.end_time as u64),
+            maxTotalMintableByWallet: opts.max_total_mintable_by_wallet,
+            feeBps: 0,
+            restrictFeeRecipients: false,
+        };
+        let public_drop_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getPublicDropCall::abi_encode_returns(&public_drop))
+        );
+        let allowed_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getAllowedFeeRecipientsCall::abi_encode_returns(
+                &Vec::<Address>::new()
+            ))
+        );
+        let mint_stats_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getMintStatsCall::abi_encode_returns(
+                &seadrop::getMintStatsReturn {
+                    minterNumMinted: U256::ZERO,
+                    currentTotalSupply: U256::ZERO,
+                    maxSupply: U256::from(1_000u64),
+                }
+            ))
+        );
+
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(seadrop::getPublicDropCall::SELECTOR, json!(public_drop_hex))
+            .respond_eth_call_selector(
+                seadrop::getAllowedFeeRecipientsCall::SELECTOR,
+                json!(allowed_hex),
+            )
+            .respond_eth_call_selector(seadrop::getMintStatsCall::SELECTOR, json!(mint_stats_hex))
+            .delay("eth_getBlockByNumber", delay)
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": opts.base_fee_hex}),
+            )
+            .delay("eth_maxPriorityFeePerGas", delay)
+            .respond("eth_maxPriorityFeePerGas", json!(opts.priority_fee_hex))
+            .delay("eth_getTransactionCount", delay)
+            .respond("eth_getTransactionCount", json!(opts.nonce_hex))
+            .delay("eth_getBalance", delay)
+            .respond("eth_getBalance", json!(opts.balance_hex))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let req = request(signer.address());
+
+        let started = std::time::Instant::now();
+        gather_unsigned_plan(&client, signer.address(), &req)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < delay * 3,
+            "the four delayed reads (block/priority-fee/nonce/balance) run concurrently should \
+             take roughly one delay ({delay:?}), not their sum (would be {:?}); took {elapsed:?}",
+            delay * 4
+        );
     }
 
     #[tokio::test]
