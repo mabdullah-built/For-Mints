@@ -326,8 +326,14 @@ async fn run_single_target(
     let mut reresolution_restarts = 0u32;
     loop {
         let plan_args = target.to_plan_args();
-        let engine =
-            resolve_watch_engine(&target, &plan_args, config_path, &excluded_stage_ids).await?;
+        let engine = resolve_watch_engine(
+            &target,
+            &plan_args,
+            config_path,
+            &excluded_stage_ids,
+            rehearsal,
+        )
+        .await?;
 
         let result = match &engine {
             ResolvedWatchEngine::Public => {
@@ -470,6 +476,18 @@ async fn resolve_watch_engine(
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
     excluded_stage_ids: &[crate::domain::stage::StageId],
+    // `false` only for the *very first* resolution of a fresh attempt
+    // (and even then, only when not `--rehearsal`): an `AlreadyLive`
+    // decision there means the operator asked `watch` to wait for
+    // something that is already live, which `watch` refuses
+    // (`STAGE_ALREADY_LIVE`). `true` for every other caller --
+    // critically, the periodic re-resolution check that runs *during* an
+    // already-in-progress wait, where the very stage being waited on
+    // transitioning to `AlreadyLive` is success, not an error: refusing
+    // there would abort a legitimate wait the instant its target stage
+    // opens, racing against (and potentially beating) `wait_for_stage`'s
+    // own correct handoff.
+    allow_already_live: bool,
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
         EngineSelection::Public => Ok(ResolvedWatchEngine::Public),
@@ -483,14 +501,66 @@ async fn resolve_watch_engine(
             })
         }
         EngineSelection::Auto => {
-            let detection = crate::cli::commands::mint::resolve_auto_engine(
+            // True-final-release-gate item 6/7: preserve the resolver's
+            // own AlreadyLive-vs-WaitFor distinction (previously
+            // collapsed by routing through the generic
+            // `resolve_auto_engine`/`Detection` path, which has no way to
+            // carry it) so a genuinely already-live, eligible-or-unknown
+            // stage refuses with STAGE_ALREADY_LIVE for a real
+            // `--auto-send` run, rather than silently minting immediately
+            // via the watch code path -- `watch` exists to wait for a
+            // *future* stage; an already-live one is `mint`'s job. The
+            // one deliberate exception is `--rehearsal`: it never
+            // broadcasts, so exercising an already-active stage's full
+            // pipeline is safe and useful for testing -- see
+            // docs/watch.md's "WATCH vs LIVE" section.
+            let opensea =
+                crate::cli::commands::mint::load_opensea_client(StdDuration::from_secs(10)).ok();
+            let decision = crate::cli::commands::resolver_adapters::resolve_watch_stage_decision(
                 plan_args,
                 config_path,
-                true,
+                opensea.as_ref(),
                 excluded_stage_ids,
             )
             .await?;
+
+            let (stage, already_live) = match decision {
+                crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(stage) => {
+                    (stage, true)
+                }
+                crate::execution::stage_resolver::WatchStageDecision::WaitFor(stage) => {
+                    (stage, false)
+                }
+                crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
+                    reason,
+                } => {
+                    return Err(KairoxError::Session(SessionError::with_kind(
+                        SessionErrorKind::UnsupportedProtocol,
+                        format!(
+                            "no supported stage (active or future) found for this collection: \
+                             {reason}"
+                        ),
+                    )));
+                }
+            };
+
+            let detection = crate::cli::commands::resolver_adapters::stage_to_detection(&stage);
             crate::cli::commands::mint::print_resolution_evidence(&detection);
+
+            if already_live && !allow_already_live {
+                return Err(KairoxError::Session(SessionError::with_kind(
+                    SessionErrorKind::StageAlreadyLive,
+                    format!(
+                        "STAGE_ALREADY_LIVE: this mint is already live (a supported, \
+                         eligible-or-unknown stage is active right now) -- watch exists to wait \
+                         for a future stage, not to act on one that already is. Use `kairox \
+                         mint {:#x} --send --yes` instead (or pass --rehearsal to safely \
+                         exercise this stage's pipeline without broadcasting).",
+                        target.collection
+                    ),
+                )));
+            }
+
             match detection.engine {
                 crate::execution::resolver::ResolvedEngine::Public => {
                     Ok(ResolvedWatchEngine::Public)
@@ -499,16 +569,10 @@ async fn resolve_watch_engine(
                     Ok(ResolvedWatchEngine::OpenSea { slug, stage_uuid })
                 }
                 crate::execution::resolver::ResolvedEngine::Generic { .. } => {
-                    // Not wired into watch this pass: the generic engine
-                    // has no stage-timing model to wait against yet -- see
-                    // docs/generic-engine.md. Use `kairox mint --engine
-                    // auto --generic-schema ...` for an already-live
-                    // generic contract instead.
-                    Err(KairoxError::Session(SessionError::new(
-                        "the generic verified contract engine is not yet supported by `watch` \
-                         (no stage-timing model for it exists yet); use `kairox mint` for an \
-                         already-live generic contract instead",
-                    )))
+                    unreachable!(
+                        "resolve_watch_stage_decision only ever discovers NormalizedStage \
+                         candidates, never a Generic-engine target"
+                    )
                 }
             }
         }
@@ -609,8 +673,14 @@ async fn wait_for_stage_with_reresolution(
     let reresolution_check = async {
         loop {
             tokio::time::sleep(reresolution_interval()).await;
+            // `allow_already_live: true` -- see `resolve_watch_engine`'s
+            // doc comment on that parameter: the stage this attempt is
+            // already waiting for transitioning to Active during the
+            // wait is success, never grounds for a STAGE_ALREADY_LIVE
+            // refusal here.
             let fresh =
-                resolve_watch_engine(target, plan_args, config_path, excluded_stage_ids).await?;
+                resolve_watch_engine(target, plan_args, config_path, excluded_stage_ids, true)
+                    .await?;
             if &fresh != currently_selected {
                 return Err(KairoxError::Session(SessionError::with_kind(
                     SessionErrorKind::StageResolutionChanged,

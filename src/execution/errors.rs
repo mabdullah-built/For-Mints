@@ -129,6 +129,15 @@ pub enum SessionErrorKind {
     /// restart resolution with the fresh answer, exactly like a clear
     /// ineligibility rejection already does.
     StageResolutionChanged,
+    /// `watch --auto-send` (real, non-rehearsal) resolved to a stage that
+    /// is already `Active`, supported, and eligible-or-unknown -- `watch`
+    /// exists to wait for a *future* stage, never to silently act on one
+    /// that is already live (that is `mint`'s job). The operator is
+    /// expected to use `kairox mint --send --yes` instead. Never emitted
+    /// merely because *some* stage is active -- only when the resolver's
+    /// own eligibility/capacity model (the same one `mint --engine auto`
+    /// uses) considers it genuinely actionable.
+    StageAlreadyLive,
 }
 
 /// An error representing a state Kairox has explicitly decided must halt
@@ -222,6 +231,9 @@ pub enum KairoxErrorCode {
     AmbiguousProtocol,
     ProxyImplementationChanged,
     MissingSpendCaps,
+    /// `watch --auto-send` refused because the resolved stage is already
+    /// live and actionable right now -- use `mint --send` instead.
+    StageAlreadyLive,
     /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
     /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
     SessionAborted,
@@ -253,6 +265,7 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::AmbiguousProtocol => "AMBIGUOUS_PROTOCOL",
             Self::ProxyImplementationChanged => "PROXY_IMPLEMENTATION_CHANGED",
             Self::MissingSpendCaps => "MISSING_SPEND_CAPS",
+            Self::StageAlreadyLive => "STAGE_ALREADY_LIVE",
             Self::SessionAborted => "SESSION_ABORTED",
         };
         f.write_str(s)
@@ -333,6 +346,7 @@ impl KairoxError {
                     KairoxErrorCode::ProxyImplementationChanged
                 }
                 SessionErrorKind::MissingSpendCaps => KairoxErrorCode::MissingSpendCaps,
+                SessionErrorKind::StageAlreadyLive => KairoxErrorCode::StageAlreadyLive,
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest
                 | SessionErrorKind::SkippedSharedResourceFailure

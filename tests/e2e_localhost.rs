@@ -4734,6 +4734,172 @@ fn watch_wallet_allocation_exhausted_while_waiting_stops_safely() {
     );
 }
 
+// ---------------------------------------------------------------------
+// True-final-release-gate item 8: dedicated STAGE_ALREADY_LIVE tests.
+//
+// 8A/8B (real, non-rehearsal `watch --auto-send` against an already-live
+// eligible stage must refuse with STAGE_ALREADY_LIVE, never sign or
+// broadcast) are already covered incidentally by
+// `watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_public_wait`
+// (OpenSea signed stage, real auto-send) -- this block adds a clean,
+// dedicated PUBLIC-engine case (8A) plus the exhaustion-must-not-
+// falsely-claim-STAGE_ALREADY_LIVE case (8C, wallet allocation). 8D
+// (supply exhaustion) exercises the identical `has_known_capacity()`
+// check as 8C with a different field and is intentionally not
+// duplicated as a second test. 8E (the rehearsal exception against an
+// active stage) is already covered by
+// `watch_opensea_signed_rehearsal_prepares_and_signs_but_never_broadcasts`
+// and `watch_public_rehearsal_prepares_and_signs_but_never_broadcasts`.
+// 8F (mint on an active stage is unaffected) is covered by every
+// existing `mint --send` test against an active public/OpenSea stage
+// (e.g. `mint_public_stage_signs_and_broadcasts_successfully`) -- none
+// of those routes through `watch`'s resolver at all, so item 8 cannot
+// regress them by construction.
+// ---------------------------------------------------------------------
+
+#[test]
+fn watch_auto_send_on_an_already_active_public_stage_refuses_with_stage_already_live() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    // Already active *at the moment watch resolves*, not merely
+    // "becomes active during the wait" -- this is 8A's literal scenario.
+    let stage_start = unix_now() - 60;
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "must never be called: stage is already live, watch must refuse".into(),
+            };
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in already-live scenario: {method}"),
+            },
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE"))
+        .stderr(predicates::str::contains("kairox mint"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an already-live stage must never be signed or broadcast by a real watch --auto-send run"
+    );
+}
+
+#[test]
+fn watch_auto_send_on_an_exhausted_active_public_stage_does_not_falsely_claim_already_live() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    // Active right now by timestamp alone -- but this wallet has already
+    // minted its full allocation (5 of 5). 8C: a naive "is *some* stage
+    // active" check would wrongly emit STAGE_ALREADY_LIVE here; the real
+    // resolver/eligibility pipeline must instead surface the genuine
+    // exhaustion outcome (ALLOCATION_EXCEEDED) -- never fabricate
+    // STAGE_ALREADY_LIVE from the timestamp alone, and never send.
+    let stage_start = unix_now() - 60;
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "must never be called: allocation exhausted".into(),
+            };
+        }
+        if method == "eth_call" {
+            let data = params
+                .get(0)
+                .and_then(|c| c.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or("0x");
+            let stats_hex = format!("0x{}", hex::encode(sd::getMintStatsCall::SELECTOR));
+            if data.starts_with(&stats_hex) {
+                return rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(sd::getMintStatsCall::abi_encode_returns(
+                        &sd::getMintStatsReturn {
+                            minterNumMinted: U256::from(5u64),
+                            currentTotalSupply: U256::from(10u64),
+                            maxSupply: U256::from(1_000u64),
+                        }
+                    ))
+                )));
+            }
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in exhausted-active scenario: {method}"),
+            },
+        )
+    });
+
+    let output = kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an exhausted stage must never succeed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("ALLOCATION_EXCEEDED") || stderr.contains("allocation exhausted"),
+        "expected the genuine exhaustion outcome (not a fabricated already-live claim), got: \
+         {stderr}"
+    );
+    assert!(
+        !stderr.contains("STAGE_ALREADY_LIVE"),
+        "an exhausted stage must never be reported as STAGE_ALREADY_LIVE just because its \
+         timestamp window is active -- got: {stderr}"
+    );
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an exhausted allocation must never be broadcast to, already-live or not"
+    );
+}
+
 #[test]
 fn watch_wrong_chain_detected_before_any_wait() {
     let signer = test_signer();
@@ -4955,7 +5121,10 @@ fn spawn_autodiscovery_server(
 // only reveals a genuine, already-active signed presale on the *second*
 // discovery request -- simulating a creator publishing a presale (or
 // OpenSea recovering from a transient outage) after `watch` already
-// started waiting on the native public stage.
+// started waiting on the native public stage. Also now doubles as a
+// STAGE_ALREADY_LIVE regression test (final release gate item 6/7): the
+// freshly-restarted attempt's very first resolution correctly refuses
+// rather than silently minting through the now-active presale.
 // ---------------------------------------------------------------------
 #[test]
 fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_public_wait() {
@@ -5019,10 +5188,19 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
             } else {
                 // Every request from here on (the periodic re-resolution
                 // check, and the fresh attempt it triggers): a real,
-                // already-active signed presale -- sold out, so the
-                // restarted attempt terminates quickly and deterministically
-                // once it reaches OpenSea, without needing the full signed
-                // -mint/EIP-712 machinery this test isn't exercising.
+                // already-active signed presale. Its total_supply/
+                // max_supply claim it's sold out, but that OpenSea-
+                // reported metadata is deliberately never trusted for
+                // eligibility (see `is_candidate`/`EligibilityState`) --
+                // so the resolver correctly treats it as
+                // eligible-or-unknown and already live, and the fresh
+                // attempt's very first resolution now hits
+                // STAGE_ALREADY_LIVE (a real --auto-send run refuses to
+                // "watch" something already active) before ever reaching
+                // OpenSea's own probe-time sold-out check, terminating
+                // even earlier/more safely than before, still without
+                // needing the full signed-mint/EIP-712 machinery this
+                // test isn't exercising.
                 (
                     path.to_string(),
                     rpc_ok_status(serde_json::json!({
@@ -5087,7 +5265,7 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
             "restarting the attempt against the fresh resolution",
         ))
         .stderr(predicates::str::contains("resolved_engine: OpenSea"))
-        .stderr(predicates::str::contains("sold out"));
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE"));
 
     let received = server.received.lock().unwrap();
     assert!(
@@ -5929,7 +6107,19 @@ fn watch_rejecting_one_opensea_stage_uuid_does_not_exclude_a_second_stage_sharin
             &format!("{NFT:#x}"),
             "--wallet",
             &format!("{wallet:#x}"),
-            "--auto-send",
+            // Real wall-clock time elapses between stage A's rejection
+            // and stage B's resolution (A's own poll/mint-request cycle),
+            // enough that stage B's fixed start_time has itself passed
+            // by the time it is resolved -- i.e. it is now genuinely
+            // `AlreadyLive` too. `--rehearsal` is used here specifically
+            // so that outcome is exercised safely (final release gate
+            // item 8E: rehearsal may continue through an already-live
+            // stage because it never broadcasts) rather than correctly
+            // refusing with STAGE_ALREADY_LIVE the way a real
+            // `--auto-send` run now does -- this test's actual point
+            // (stage A's rejection never wrongly excludes the distinctly
+            // -identified stage B) is unaffected either way.
+            "--rehearsal",
             "--poll-interval-secs",
             "1",
             "--max-mint-value-wei",
@@ -5944,7 +6134,8 @@ fn watch_rejecting_one_opensea_stage_uuid_does_not_exclude_a_second_stage_sharin
         .success()
         .stderr(predicates::str::contains("\"stage-a\""))
         .stderr(predicates::str::contains("re-resolving"))
-        .stdout(predicates::str::contains("BROADCAST RESULT"));
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"));
 
     let received = server.received.lock().unwrap();
     let mint_attempts = received
@@ -5955,14 +6146,9 @@ fn watch_rejecting_one_opensea_stage_uuid_does_not_exclude_a_second_stage_sharin
         mint_attempts, 2,
         "expected exactly two mint attempts (stage A rejected, stage B succeeds), got {mint_attempts}"
     );
-    let sends: Vec<_> = received
-        .iter()
-        .filter(|(m, _)| m == "eth_sendRawTransaction")
-        .collect();
-    assert_eq!(
-        sends.len(),
-        1,
-        "exactly one broadcast, via stage B, must happen -- stage A's rejection must never \
-         produce a send, got {sends:?}"
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never broadcast, even after re-resolving past stage A's \
+         rejection to stage B"
     );
 }

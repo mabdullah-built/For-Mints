@@ -270,7 +270,7 @@ async fn discover_opensea_stages(
         .collect())
 }
 
-fn stage_to_detection(stage: &NormalizedStage) -> Detection {
+pub(crate) fn stage_to_detection(stage: &NormalizedStage) -> Detection {
     let (engine, adapter) = match &stage.execution {
         StageExecutionRef::PublicSeaDrop => (ResolvedEngine::Public, "SeaDropAdapter"),
         StageExecutionRef::OpenSea { slug } => {
@@ -391,6 +391,36 @@ impl MintAdapter for NormalizedStageAdapter<'_> {
 
         Ok(winner.as_ref().map(stage_to_detection))
     }
+}
+
+/// True-final-release-gate item 6/7: `watch --engine auto`'s equivalent
+/// of [`NormalizedStageAdapter::detect`], but returns the full
+/// [`WatchStageDecision`] instead of collapsing
+/// `AlreadyLive`/`WaitFor` into the same `Some(stage)` the way
+/// `detect()` does for the generic [`MintAdapter`] trait it implements.
+/// `select_for_watch`'s own doc comment already specified the intended
+/// caller behavior ("report `STAGE_ALREADY_LIVE`, point the operator at
+/// `mint`") -- this is what makes that distinction reach the caller at
+/// all, since `detect()` alone cannot carry it through the shared
+/// `Detection` type every other adapter/engine also produces.
+///
+/// Never used for an operator-provided `--slug` (that path is a direct,
+/// unambiguous fact -- see `NormalizedStageAdapter::detect`'s identical
+/// handling -- and remains routed through `detect()` unchanged); only
+/// for `--engine auto`'s discovery-driven decision.
+pub(crate) async fn resolve_watch_stage_decision(
+    plan_args: &PlanArgs,
+    config_path: Option<&Path>,
+    opensea: Option<&crate::opensea::client::OpenSeaClient>,
+    excluded_stage_ids: &[StageId],
+) -> Result<WatchStageDecision, KairoxError> {
+    let mut stages = Vec::new();
+    stages.extend(discover_public_stage(plan_args, config_path).await?);
+    stages.extend(discover_opensea_stages(plan_args, config_path, opensea, true).await?);
+    stages.retain(|s| !excluded_stage_ids.contains(&s.id));
+
+    let now = OffsetDateTime::now_utc();
+    Ok(select_for_watch(&stages, now))
 }
 
 /// Detects the generic verified ERC-721/ERC-1155 route, in order:
