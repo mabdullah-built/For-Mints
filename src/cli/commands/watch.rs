@@ -438,7 +438,7 @@ fn is_clear_ineligibility_rejection(err: &KairoxError) -> bool {
     )
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedWatchEngine {
     Public,
     OpenSea {
@@ -1245,5 +1245,56 @@ mod ineligibility_classification_tests {
                 "no healthy, chain-verified read-capable RPC endpoint available",
             )
         )));
+    }
+}
+
+#[cfg(test)]
+mod reresolution_change_detection_tests {
+    use super::*;
+
+    /// Round 6 item 10.C: `wait_for_stage_with_reresolution` detects a
+    /// "material change" purely via `ResolvedWatchEngine`'s `PartialEq` --
+    /// this pins the exact equality semantics that mechanism depends on,
+    /// independent of the slower e2e re-resolution scenario covering
+    /// item 10.A.
+    #[test]
+    fn a_changed_opensea_stage_uuid_for_the_same_slug_is_a_material_change() {
+        let original = ResolvedWatchEngine::OpenSea {
+            slug: "same-collection".to_string(),
+            stage_uuid: Some("uuid-original".to_string()),
+        };
+        let replaced = ResolvedWatchEngine::OpenSea {
+            slug: "same-collection".to_string(),
+            stage_uuid: Some("uuid-replaced".to_string()),
+        };
+        assert_ne!(
+            original, replaced,
+            "a different stage UUID for the same collection slug must be detected as a \
+             material change, even though the slug itself did not change"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_resolution_is_not_a_material_change() {
+        let a = ResolvedWatchEngine::OpenSea {
+            slug: "same-collection".to_string(),
+            stage_uuid: Some("uuid-stable".to_string()),
+        };
+        let b = ResolvedWatchEngine::OpenSea {
+            slug: "same-collection".to_string(),
+            stage_uuid: Some("uuid-stable".to_string()),
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn public_and_opensea_are_always_a_material_change_from_each_other() {
+        assert_ne!(
+            ResolvedWatchEngine::Public,
+            ResolvedWatchEngine::OpenSea {
+                slug: "whatever".to_string(),
+                stage_uuid: None,
+            }
+        );
     }
 }

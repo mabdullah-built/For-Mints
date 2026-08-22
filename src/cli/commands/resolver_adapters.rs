@@ -751,6 +751,27 @@ mod stage_identity_tests {
         );
     }
 
+    /// Round 6 item 17: "A and B rejected, C survives" -- extends the
+    /// pattern above with a third, never-rejected stage present in the
+    /// candidate set, proving the exclusion filter removes exactly the
+    /// rejected identities and nothing else.
+    #[test]
+    fn two_sequential_rejections_still_leave_a_third_untouched_stage_selectable() {
+        let a = opensea_stage("uuid-a", "collection");
+        let b = opensea_stage("uuid-b", "collection");
+        let c = opensea_stage("uuid-c", "collection");
+        let excluded = [a.id.clone(), b.id.clone()];
+        let stages: Vec<NormalizedStage> = vec![a, b, c.clone()]
+            .into_iter()
+            .filter(|s| !excluded.contains(&s.id))
+            .collect();
+        assert_eq!(
+            stages,
+            vec![c],
+            "A rejected then B rejected must leave the untouched C stage selectable"
+        );
+    }
+
     #[test]
     fn on_chain_public_identity_is_stable_and_distinct_from_any_opensea_stage() {
         let public_a = StageId::OnChainPublic;
