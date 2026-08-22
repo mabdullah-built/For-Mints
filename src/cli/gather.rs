@@ -77,6 +77,23 @@ pub async fn fetch_thirdweb_claim_condition_by_id(
     Ok(thirdweb::decode_get_claim_condition_by_id(&result)?)
 }
 
+/// Fetch `getSupplyClaimedByWallet(conditionId, claimer)` from a thirdweb
+/// Drop contract -- the counter is keyed per claim-condition id (see
+/// `protocol::thirdweb::encode_get_supply_claimed_by_wallet`'s doc
+/// comment), so `condition_id` must be the *current* active condition id
+/// for this to mean "how much has this wallet already claimed in the
+/// phase it is about to claim in".
+pub async fn fetch_thirdweb_supply_claimed_by_wallet(
+    client: &RpcClient,
+    drop_contract: Address,
+    condition_id: U256,
+    claimer: Address,
+) -> Result<U256, KairoxError> {
+    let calldata = thirdweb::encode_get_supply_claimed_by_wallet(condition_id, claimer);
+    let result = client.eth_call(drop_contract, &calldata).await?;
+    Ok(thirdweb::decode_get_supply_claimed_by_wallet(&result)?)
+}
+
 /// Base fee plus block context, and (best-effort) a suggested priority fee.
 pub struct FeeHint {
     pub base_fee_per_gas: u128,

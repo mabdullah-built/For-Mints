@@ -40,6 +40,7 @@ sol! {
 
     function getActiveClaimConditionId() external view returns (uint256);
     function getClaimConditionById(uint256 conditionId) external view returns (ClaimConditionAbi memory);
+    function getSupplyClaimedByWallet(uint256 conditionId, address claimer) external view returns (uint256);
 
     // Identical signature shared by the multi-phase (`Drop`) and
     // single-phase (`DropSinglePhase`) extensions, and by both the
@@ -129,19 +130,18 @@ impl ClaimCondition {
         self.currency == NATIVE_TOKEN
     }
 
-    /// `maxClaimableSupply == 0` is thirdweb's own documented sentinel for
-    /// "unlimited supply for this phase" (distinct from a genuine
-    /// exhausted-supply `0` after claims, which instead shows as
-    /// `supplyClaimed >= maxClaimableSupply` for a nonzero cap).
-    pub fn supply_remaining(&self) -> Option<U256> {
-        if self.max_claimable_supply.is_zero() {
-            None
-        } else {
-            Some(
-                self.max_claimable_supply
-                    .saturating_sub(self.supply_claimed),
-            )
-        }
+    /// `maxClaimableSupply - supplyClaimed`, exactly as `Drop.sol`'s own
+    /// `verifyClaim` enforces it (`supplyClaimed + quantity >
+    /// maxClaimableSupply` reverts) -- verified directly against source:
+    /// there is **no** "`maxClaimableSupply == 0` means unlimited"
+    /// special case in the real contract (an earlier draft of this
+    /// module assumed one, sourced only from a secondary summary, and
+    /// was corrected after reading `Drop.sol` itself). A `0` cap
+    /// genuinely means nobody can claim under this phase, exactly like
+    /// any other exhausted-supply state.
+    pub fn supply_remaining(&self) -> U256 {
+        self.max_claimable_supply
+            .saturating_sub(self.supply_claimed)
     }
 }
 
@@ -171,6 +171,28 @@ pub fn decode_get_claim_condition_by_id(data: &[u8]) -> Result<ClaimCondition, T
     let decoded = getClaimConditionByIdCall::abi_decode_returns(data)
         .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))?;
     ClaimCondition::from_abi(decoded)
+}
+
+/// Build the calldata for `getSupplyClaimedByWallet(uint256, address)`.
+/// Verified directly against the real `Drop.sol` source (not merely its
+/// summarized documentation, which omitted the leading `conditionId`
+/// parameter): the counter is keyed per claim-condition id, so a
+/// wallet's allocation genuinely resets at each new phase -- never a
+/// lifetime-cumulative counter.
+pub fn encode_get_supply_claimed_by_wallet(condition_id: U256, claimer: Address) -> Bytes {
+    Bytes::from(
+        getSupplyClaimedByWalletCall {
+            conditionId: condition_id,
+            claimer,
+        }
+        .abi_encode(),
+    )
+}
+
+/// Decode the return data of `getSupplyClaimedByWallet(uint256, address)`.
+pub fn decode_get_supply_claimed_by_wallet(data: &[u8]) -> Result<U256, ThirdwebError> {
+    getSupplyClaimedByWalletCall::abi_decode_returns(data)
+        .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))
 }
 
 /// Build the calldata for the ERC-721 `claim(...)` call.
@@ -285,11 +307,33 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_supply_sentinel_reports_no_known_remaining() {
+    fn decode_supply_claimed_by_wallet_round_trips() {
+        let encoded = getSupplyClaimedByWalletCall::abi_encode_returns(&U256::from(2u64));
+        let claimed = decode_get_supply_claimed_by_wallet(&encoded).unwrap();
+        assert_eq!(claimed, U256::from(2u64));
+    }
+
+    #[test]
+    fn encode_get_supply_claimed_by_wallet_is_keyed_by_condition_id_and_claimer() {
+        let claimer = address!("5555555555555555555555555555555555555555");
+        let a = encode_get_supply_claimed_by_wallet(U256::from(0u64), claimer);
+        let b = encode_get_supply_claimed_by_wallet(U256::from(1u64), claimer);
+        assert_ne!(
+            a, b,
+            "the same wallet's claimed count must be looked up per claim-condition id, not a \
+             single lifetime-cumulative counter"
+        );
+    }
+
+    #[test]
+    fn zero_max_claimable_supply_means_literally_zero_remaining_never_unlimited() {
+        // Verified directly against Drop.sol's verifyClaim: there is no
+        // "0 means unlimited" special case in the real contract.
         let mut abi = sample_condition_abi();
         abi.maxClaimableSupply = U256::ZERO;
+        abi.supplyClaimed = U256::ZERO;
         let condition = ClaimCondition::from_abi(abi).unwrap();
-        assert_eq!(condition.supply_remaining(), None);
+        assert_eq!(condition.supply_remaining(), U256::ZERO);
     }
 
     #[test]
@@ -298,7 +342,7 @@ mod tests {
         abi.maxClaimableSupply = U256::from(10u64);
         abi.supplyClaimed = U256::from(10u64);
         let condition = ClaimCondition::from_abi(abi).unwrap();
-        assert_eq!(condition.supply_remaining(), Some(U256::ZERO));
+        assert_eq!(condition.supply_remaining(), U256::ZERO);
     }
 
     #[test]
