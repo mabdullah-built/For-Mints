@@ -186,8 +186,24 @@ mod tests {
     }
 
     fn base(id: &str, protocol: StageProtocol) -> NormalizedStage {
+        let (stage_id, execution) = if protocol == StageProtocol::Public {
+            (
+                crate::domain::stage::StageId::OnChainPublic,
+                crate::domain::stage::StageExecutionRef::PublicSeaDrop,
+            )
+        } else {
+            (
+                crate::domain::stage::StageId::OpenSea {
+                    stage_uuid: id.to_string(),
+                },
+                crate::domain::stage::StageExecutionRef::OpenSea {
+                    slug: format!("{id}-collection"),
+                },
+            )
+        };
         NormalizedStage {
-            id: id.to_string(),
+            id: stage_id,
+            execution,
             protocol,
             label: None,
             window: active_window(),

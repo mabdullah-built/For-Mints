@@ -50,12 +50,49 @@ pub enum EligibilityState {
     Unsupported { reason: String },
 }
 
+/// Uniquely identifies one stage, for exclusion/re-resolution purposes --
+/// deliberately distinct from [`StageExecutionRef`], which carries
+/// whatever is needed to actually *act* on a stage once selected. An
+/// OpenSea collection slug identifies the whole drop, never one exact
+/// stage within it (a drop can have several stages -- signed presale,
+/// then public -- sharing the same slug); conflating the two let
+/// rejecting one OpenSea stage incorrectly exclude every stage of that
+/// drop. See [`StageExecutionRef::OpenSea`]'s doc comment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StageId {
+    /// The collection's single on-chain `PublicDrop` config -- there is
+    /// only ever one per collection, so no further identity is needed.
+    OnChainPublic,
+    /// OpenSea's own per-stage `uuid` -- the one field in a
+    /// `DropStageResponse` that actually identifies *this* stage, not
+    /// the drop it belongs to.
+    OpenSea { stage_uuid: String },
+}
+
+/// What's needed to actually execute against a selected stage. Carries
+/// exactly the routing information the execution engines need -- never
+/// stage identity (see [`StageId`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageExecutionRef {
+    PublicSeaDrop,
+    /// `slug` is the OpenSea *drop/collection* identifier -- the
+    /// `POST /api/v2/drops/{slug}/mint` request target. It is never a
+    /// per-stage identifier; that's [`StageId::OpenSea`]'s job.
+    OpenSea {
+        slug: String,
+    },
+}
+
 /// One normalized mint opportunity, however it was discovered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedStage {
-    /// Stable within one resolution -- not necessarily meaningful across
-    /// separate discovery calls.
-    pub id: String,
+    /// This exact stage's unique identity -- see [`StageId`]'s doc
+    /// comment for why this is a typed enum, not a raw string reused
+    /// from whatever discovery happened to have on hand.
+    pub id: StageId,
+    /// What's needed to actually execute against this stage once
+    /// selected -- see [`StageExecutionRef`].
+    pub execution: StageExecutionRef,
     pub protocol: StageProtocol,
     /// Display-only. Never consulted for protocol/eligibility decisions.
     pub label: Option<String>,
@@ -118,7 +155,12 @@ mod tests {
 
     fn stage() -> NormalizedStage {
         NormalizedStage {
-            id: "s1".to_string(),
+            id: StageId::OpenSea {
+                stage_uuid: "s1".to_string(),
+            },
+            execution: StageExecutionRef::OpenSea {
+                slug: "test-collection".to_string(),
+            },
             protocol: StageProtocol::Fcfa,
             label: None,
             window: window(),

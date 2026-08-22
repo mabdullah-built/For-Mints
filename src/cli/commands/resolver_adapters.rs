@@ -32,7 +32,9 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::cli::args::PlanArgs;
 use crate::cli::context::{connect_read_client, resolve_chain_and_runtime};
-use crate::domain::stage::{EligibilityState, NormalizedStage, StageProtocol};
+use crate::domain::stage::{
+    EligibilityState, NormalizedStage, StageExecutionRef, StageId, StageProtocol,
+};
 use crate::domain::timing::PhaseWindow;
 use crate::execution::errors::KairoxError;
 use crate::execution::generic_schema::GenericMintSchema;
@@ -81,7 +83,8 @@ async fn discover_public_stage(
     };
 
     Ok(Some(NormalizedStage {
-        id: "on-chain-public".to_string(),
+        id: StageId::OnChainPublic,
+        execution: StageExecutionRef::PublicSeaDrop,
         protocol: StageProtocol::Public,
         label: None,
         window: PhaseWindow {
@@ -105,6 +108,25 @@ async fn discover_public_stage(
     }))
 }
 
+/// Price provenance is not established for a raw OpenSea `stage.price`
+/// string: the Drops API schema documents it only as "mint cost per
+/// token" with no independently-confirmed unit (wei vs a decimal
+/// display value vs the payment token's own smallest unit). Guessing
+/// "wei" and using it for spend authorization would be exactly the kind
+/// of unit-guessing this trust model forbids -- see
+/// `crate::execution::opensea_validate`, which is the one place a
+/// signed mint's actual `value` is ever authoritatively established
+/// (from the official mint-builder response's own locally-validated
+/// `value` field, never from a `stages[]` display string). This
+/// deliberately returns `None` -- opaque/unavailable -- rather than a
+/// parsed number, so a caller can never mistake it for spend-grade
+/// evidence.
+fn opensea_display_price_provenance_unavailable(
+    _price: &Option<String>,
+) -> Option<alloy_primitives::U256> {
+    None
+}
+
 /// Discovers every OpenSea-hosted non-public stage worth considering (the
 /// currently-active one, and -- when `allow_not_yet_started` -- the
 /// upcoming one) as [`NormalizedStage`] entries. A plain public OpenSea
@@ -112,6 +134,21 @@ async fn discover_public_stage(
 /// route covers that case when one exists, and
 /// [`crate::opensea::models::map_stage_type`] never even maps a
 /// `"public"`-shaped wire value (see its doc comment).
+///
+/// A genuinely transient discovery failure (transport/5xx/rate-limit) is
+/// distinct from a genuine "no drop for this collection" (404) result:
+/// `watch` (`allow_not_yet_started`) retries transient failures a
+/// bounded number of times with a short delay before giving up, so a
+/// brief OpenSea blip during a long wait never silently and permanently
+/// locks the session onto a later native public stage for its entire
+/// duration. `mint` (immediate, no time budget to retry) makes exactly
+/// one attempt, matching its existing best-effort philosophy. Either
+/// way, exhausting attempts still degrades to "no OpenSea stages found"
+/// rather than a hard error -- a collection with a working native public
+/// stage must never be blocked by OpenSea's availability -- but a
+/// diagnostic is printed so an operator can tell "OpenSea genuinely has
+/// no drop here" apart from "OpenSea was unreachable" (previously
+/// indistinguishable).
 async fn discover_opensea_stages(
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
@@ -130,21 +167,41 @@ async fn discover_opensea_stages(
         return Ok(Vec::new());
     };
 
-    // Auto-discovery is a best-effort enhancement, never a hard
-    // requirement: any error here (OpenSea down, rate-limited,
-    // misconfigured key) is deliberately treated the same as "no drop
-    // discovered", never propagated -- a collection with a working
-    // native on-chain public stage must not be blocked by OpenSea's
-    // availability.
-    let details = match crate::opensea::discovery::resolve_drop(
-        opensea,
-        chain_identifier,
-        plan_args.collection,
-    )
-    .await
-    {
-        Ok(Some(details)) => details,
-        Ok(None) | Err(_) => return Ok(Vec::new()),
+    let max_attempts: u32 = if allow_not_yet_started { 3 } else { 1 };
+    let mut details = None;
+    let mut last_transient_err = None;
+    for attempt in 0..max_attempts {
+        match crate::opensea::discovery::resolve_drop(
+            opensea,
+            chain_identifier,
+            plan_args.collection,
+        )
+        .await
+        {
+            Ok(Some(d)) => {
+                details = Some(d);
+                break;
+            }
+            // A genuine 404 (or an unmatched candidate) is authoritative,
+            // not transient -- retrying it would never change the answer.
+            Ok(None) => break,
+            Err(e) => {
+                last_transient_err = Some(e);
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
+        }
+    }
+    let Some(details) = details else {
+        if let Some(e) = last_transient_err {
+            eprintln!(
+                "OpenSea auto-discovery unavailable after {max_attempts} attempt(s) ({e}); \
+                 proceeding as if no OpenSea drop was found for this collection -- this is NOT \
+                 proof no signed stage exists, only that it could not be checked"
+            );
+        }
+        return Ok(Vec::new());
     };
 
     let mut candidates = vec![details.active_stage.as_ref()];
@@ -160,14 +217,18 @@ async fn discover_opensea_stages(
             let start = OffsetDateTime::parse(&stage.start_time, &Rfc3339).ok()?;
             let end = OffsetDateTime::parse(&stage.end_time, &Rfc3339).ok()?;
             Some(NormalizedStage {
-                id: details.collection_slug.clone(),
+                id: StageId::OpenSea {
+                    stage_uuid: stage.uuid.clone(),
+                },
+                execution: StageExecutionRef::OpenSea {
+                    slug: details.collection_slug.clone(),
+                },
                 protocol,
                 label: stage.label.clone(),
                 window: PhaseWindow { start, end },
-                price_per_token_wei: stage
-                    .price
-                    .as_ref()
-                    .and_then(|p| p.parse::<alloy_primitives::U256>().ok()),
+                // See opensea_display_price_provenance_unavailable's doc
+                // comment -- never spend-authorization-grade.
+                price_per_token_wei: opensea_display_price_provenance_unavailable(&stage.price),
                 max_per_wallet: stage.max_per_wallet.parse::<u64>().ok(),
                 // Genuinely unknown until a real, fresh, wallet-specific
                 // OpenSea authorization is requested -- never assumed
@@ -177,8 +238,8 @@ async fn discover_opensea_stages(
                 supply_remaining: None,
                 eligibility: EligibilityState::UnknownUntilActive,
                 evidence: format!(
-                    "auto-discovered OpenSea drop {:?}: stage {:?} (recognized as {protocol:?})",
-                    details.collection_slug, stage.stage_type
+                    "auto-discovered OpenSea drop {:?} stage {:?} (uuid {:?}, recognized as {protocol:?})",
+                    details.collection_slug, stage.stage_type, stage.uuid
                 ),
             })
         })
@@ -186,14 +247,21 @@ async fn discover_opensea_stages(
 }
 
 fn stage_to_detection(stage: &NormalizedStage) -> Detection {
-    let (engine, adapter) = match stage.protocol {
-        StageProtocol::Public => (ResolvedEngine::Public, "SeaDropAdapter"),
-        _ => (
-            ResolvedEngine::OpenSea {
-                slug: stage.id.clone(),
-            },
-            "OpenSeaDropsAdapter",
-        ),
+    let (engine, adapter) = match &stage.execution {
+        StageExecutionRef::PublicSeaDrop => (ResolvedEngine::Public, "SeaDropAdapter"),
+        StageExecutionRef::OpenSea { slug } => {
+            let stage_uuid = match &stage.id {
+                StageId::OpenSea { stage_uuid } => Some(stage_uuid.clone()),
+                StageId::OnChainPublic => None,
+            };
+            (
+                ResolvedEngine::OpenSea {
+                    slug: slug.clone(),
+                    stage_uuid,
+                },
+                "OpenSeaDropsAdapter",
+            )
+        }
     };
     Detection {
         engine,
@@ -221,15 +289,18 @@ pub struct NormalizedStageAdapter<'a> {
     /// considers a not-yet-started stage (that's exactly what it waits
     /// through) -- see [`select_for_live_mint`] vs [`select_for_watch`].
     pub allow_not_yet_started: bool,
-    /// A stage id (`NormalizedStage::id` -- an OpenSea slug for an
-    /// off-chain stage) to exclude from selection entirely, as if it had
-    /// never been discovered. Set by `watch`'s re-resolution loop after a
-    /// fresh, semantically clear OpenSea eligibility rejection at T0 for
-    /// that exact stage -- so the same known-ineligible stage is never
-    /// selected again, and a later legitimately-supported stage (e.g. an
-    /// on-chain public stage) gets a real chance. `None` (the normal
-    /// case, and always the case for `mint`) excludes nothing.
-    pub excluded_stage_id: Option<&'a str>,
+    /// Stage identities (see [`StageId`]) to exclude from selection
+    /// entirely, as if never discovered. Set by `watch`'s re-resolution
+    /// loop after a fresh, semantically clear OpenSea eligibility
+    /// rejection at T0 for that exact stage -- so the same
+    /// known-ineligible stage is never selected again, and a later
+    /// legitimately-supported stage (e.g. an on-chain public stage, or a
+    /// second distinct OpenSea stage) gets a real chance. A bounded list
+    /// (not just the single most-recent exclusion), since a watch
+    /// session can legitimately reject more than one stage in sequence
+    /// before finding a workable one. Empty (the normal case, and always
+    /// the case for `mint`) excludes nothing.
+    pub excluded_stage_ids: &'a [StageId],
 }
 
 #[async_trait::async_trait]
@@ -251,6 +322,10 @@ impl MintAdapter for NormalizedStageAdapter<'_> {
             return Ok(Some(Detection {
                 engine: ResolvedEngine::OpenSea {
                     slug: slug.to_string(),
+                    // An operator-provided slug identifies the drop, not
+                    // one exact stage within it -- there is no stage
+                    // identity here to carry.
+                    stage_uuid: None,
                 },
                 evidence: ProtocolEvidence {
                     source: format!("operator-provided OpenSea collection slug {slug:?}"),
@@ -273,9 +348,7 @@ impl MintAdapter for NormalizedStageAdapter<'_> {
             )
             .await?,
         );
-        if let Some(excluded) = self.excluded_stage_id {
-            stages.retain(|s| s.id != excluded);
-        }
+        stages.retain(|s| !self.excluded_stage_ids.contains(&s.id));
 
         let now = OffsetDateTime::now_utc();
         let winner = if self.allow_not_yet_started {
@@ -579,5 +652,117 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
                 matched_selectors: vec![],
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod stage_identity_tests {
+    use super::*;
+    use time::macros::datetime;
+
+    fn window() -> PhaseWindow {
+        PhaseWindow {
+            start: datetime!(2020-01-01 00:00:00 UTC),
+            end: datetime!(2999-01-01 00:00:00 UTC),
+        }
+    }
+
+    fn opensea_stage(uuid: &str, slug: &str) -> NormalizedStage {
+        NormalizedStage {
+            id: StageId::OpenSea {
+                stage_uuid: uuid.to_string(),
+            },
+            execution: StageExecutionRef::OpenSea {
+                slug: slug.to_string(),
+            },
+            protocol: StageProtocol::SignedPresale,
+            label: None,
+            window: window(),
+            price_per_token_wei: None,
+            max_per_wallet: Some(10),
+            wallet_minted: None,
+            supply_remaining: None,
+            eligibility: EligibilityState::UnknownUntilActive,
+            evidence: "test fixture".to_string(),
+        }
+    }
+
+    #[test]
+    fn same_slug_two_uuids_rejecting_first_excludes_only_first() {
+        let a = opensea_stage("uuid-a", "collection");
+        let b = opensea_stage("uuid-b", "collection");
+        let excluded = [a.id.clone()];
+        let stages: Vec<NormalizedStage> = vec![a, b.clone()]
+            .into_iter()
+            .filter(|s| !excluded.contains(&s.id))
+            .collect();
+        assert_eq!(
+            stages.len(),
+            1,
+            "excluding uuid-a must leave uuid-b selectable"
+        );
+        assert_eq!(stages[0].id, b.id);
+    }
+
+    #[test]
+    fn stage_to_detection_uses_execution_slug_never_the_stage_uuid_as_slug() {
+        // Regression test for the exact bug reported: an earlier version
+        // used NormalizedStage::id (which held the collection slug) as
+        // the exclusion key AND as the POST /mint slug, collapsing every
+        // OpenSea stage of one drop into a single identity. id is now the
+        // stage's own unique identity; execution::OpenSea::slug is the
+        // separate drop-level routing value.
+        let stage = opensea_stage("uuid-a", "the-real-collection-slug");
+        let detection = stage_to_detection(&stage);
+        match detection.engine {
+            ResolvedEngine::OpenSea { slug, stage_uuid } => {
+                assert_eq!(slug, "the-real-collection-slug");
+                assert_eq!(stage_uuid.as_deref(), Some("uuid-a"));
+            }
+            other => panic!("expected ResolvedEngine::OpenSea, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_stages_with_same_label_but_different_uuid_remain_distinct_identities() {
+        let mut a = opensea_stage("uuid-a", "collection");
+        a.label = Some("Presale".to_string());
+        let mut b = opensea_stage("uuid-b", "collection");
+        b.label = Some("Presale".to_string());
+        assert_ne!(
+            a.id, b.id,
+            "identical display labels must never imply identical stage identity"
+        );
+    }
+
+    #[test]
+    fn sequential_rejection_of_two_stages_leaves_neither_reselectable() {
+        let a = opensea_stage("uuid-a", "collection");
+        let b = opensea_stage("uuid-b", "collection");
+        let excluded = [a.id.clone(), b.id.clone()];
+        let stages: Vec<NormalizedStage> = vec![a, b]
+            .into_iter()
+            .filter(|s| !excluded.contains(&s.id))
+            .collect();
+        assert!(
+            stages.is_empty(),
+            "A rejected then B rejected must leave neither selectable -- A must never bounce \
+             back into consideration"
+        );
+    }
+
+    #[test]
+    fn on_chain_public_identity_is_stable_and_distinct_from_any_opensea_stage() {
+        let public_a = StageId::OnChainPublic;
+        let public_b = StageId::OnChainPublic;
+        assert_eq!(public_a, public_b);
+        assert_ne!(
+            public_a,
+            StageId::OpenSea {
+                stage_uuid: "on-chain-public".to_string()
+            },
+            "an OpenSea stage coincidentally uuid'd the same as the old sentinel string must \
+             never collide with the on-chain public stage's identity"
+        );
     }
 }

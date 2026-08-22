@@ -290,25 +290,24 @@ async fn run_single_target(
 
     // Bounded re-resolution: a fresh, semantically clear OpenSea
     // eligibility rejection for the exact stage just attempted at T0
-    // excludes that stage and re-resolves once more (never on a
-    // transport/rate-limit/ambiguous error -- see
-    // `is_clear_ineligibility_rejection`'s doc comment), so a later
-    // legitimately-supported stage (e.g. an on-chain public stage opening
-    // after a presale) still gets a real chance instead of the whole
-    // session aborting. Bounded (not unbounded) so a pathological
-    // resolver loop can never spin forever.
+    // excludes that stage (by its own unique StageId -- never by the
+    // OpenSea collection slug, which identifies the whole drop and could
+    // span several distinct stages) and re-resolves, so a later
+    // legitimately-supported stage (e.g. a second signed stage, or an
+    // on-chain public stage opening after a presale) still gets a real
+    // chance instead of the whole session aborting. The exclusion list
+    // only ever grows across attempts (never cleared), so a stage
+    // already conclusively rejected this session can never be reselected
+    // -- A rejected -> B rejected -> A reselected is structurally
+    // impossible. Bounded (not unbounded) so a pathological resolver
+    // loop can never spin forever.
     const MAX_RESOLUTION_ATTEMPTS: u32 = 4;
-    let mut excluded_stage_id: Option<String> = None;
+    let mut excluded_stage_ids: Vec<crate::domain::stage::StageId> = Vec::new();
     let mut last_err = None;
     for attempt in 0..MAX_RESOLUTION_ATTEMPTS {
         let plan_args = target.to_plan_args();
-        let engine = resolve_watch_engine(
-            &target,
-            &plan_args,
-            config_path,
-            excluded_stage_id.as_deref(),
-        )
-        .await?;
+        let engine =
+            resolve_watch_engine(&target, &plan_args, config_path, &excluded_stage_ids).await?;
 
         let result = match &engine {
             ResolvedWatchEngine::Public => {
@@ -325,7 +324,7 @@ async fn run_single_target(
                 )
                 .await
             }
-            ResolvedWatchEngine::OpenSea { slug } => {
+            ResolvedWatchEngine::OpenSea { slug, .. } => {
                 run_opensea_watch(
                     target.clone(),
                     slug.clone(),
@@ -345,8 +344,20 @@ async fn run_single_target(
             Ok(()) => return Ok(()),
             Err(e) => {
                 let stage_id = match &engine {
-                    ResolvedWatchEngine::OpenSea { slug } => Some(slug.clone()),
-                    ResolvedWatchEngine::Public => None,
+                    ResolvedWatchEngine::OpenSea {
+                        stage_uuid: Some(uuid),
+                        ..
+                    } => Some(crate::domain::stage::StageId::OpenSea {
+                        stage_uuid: uuid.clone(),
+                    }),
+                    // An operator-provided --slug (no discovered stage
+                    // identity) or the native public engine -- neither
+                    // has a single specific stage to exclude, so a
+                    // rejection here is never retried; it propagates.
+                    ResolvedWatchEngine::OpenSea {
+                        stage_uuid: None, ..
+                    }
+                    | ResolvedWatchEngine::Public => None,
                 };
                 if let (Some(stage_id), true) = (stage_id, is_clear_ineligibility_rejection(&e)) {
                     eprintln!(
@@ -354,7 +365,7 @@ async fn run_single_target(
                          (attempt {}/{MAX_RESOLUTION_ATTEMPTS}) -- re-resolving, excluding it: {e}",
                         attempt + 1
                     );
-                    excluded_stage_id = Some(stage_id);
+                    excluded_stage_ids.push(stage_id);
                     last_err = Some(e);
                     continue;
                 }
@@ -389,7 +400,12 @@ fn is_clear_ineligibility_rejection(err: &KairoxError) -> bool {
 
 enum ResolvedWatchEngine {
     Public,
-    OpenSea { slug: String },
+    OpenSea {
+        slug: String,
+        /// The exact discovered stage identity, when one exists -- see
+        /// `execution::resolver::ResolvedEngine::OpenSea`'s doc comment.
+        stage_uuid: Option<String>,
+    },
 }
 
 /// Delegates to the shared `execution::resolver::AdapterRegistry`
@@ -404,7 +420,7 @@ async fn resolve_watch_engine(
     target: &WatchTarget,
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
-    excluded_stage_id: Option<&str>,
+    excluded_stage_ids: &[crate::domain::stage::StageId],
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
         EngineSelection::Public => Ok(ResolvedWatchEngine::Public),
@@ -412,14 +428,17 @@ async fn resolve_watch_engine(
             let slug = target.slug.clone().ok_or(KairoxError::OpenSea(
                 crate::opensea::errors::OpenSeaError::SlugRequired,
             ))?;
-            Ok(ResolvedWatchEngine::OpenSea { slug })
+            Ok(ResolvedWatchEngine::OpenSea {
+                slug,
+                stage_uuid: None,
+            })
         }
         EngineSelection::Auto => {
             let detection = crate::cli::commands::mint::resolve_auto_engine(
                 plan_args,
                 config_path,
                 true,
-                excluded_stage_id,
+                excluded_stage_ids,
             )
             .await?;
             crate::cli::commands::mint::print_resolution_evidence(&detection);
@@ -427,8 +446,8 @@ async fn resolve_watch_engine(
                 crate::execution::resolver::ResolvedEngine::Public => {
                     Ok(ResolvedWatchEngine::Public)
                 }
-                crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
-                    Ok(ResolvedWatchEngine::OpenSea { slug })
+                crate::execution::resolver::ResolvedEngine::OpenSea { slug, stage_uuid } => {
+                    Ok(ResolvedWatchEngine::OpenSea { slug, stage_uuid })
                 }
                 crate::execution::resolver::ResolvedEngine::Generic { .. } => {
                     // Not wired into watch this pass: the generic engine

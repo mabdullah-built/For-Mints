@@ -69,11 +69,11 @@ async fn select_engine(
             Ok(SelectedEngine::OpenSea { slug })
         }
         EngineSelection::Auto => {
-            let detection = resolve_auto_engine(&args.plan_args, config_path, false, None).await?;
+            let detection = resolve_auto_engine(&args.plan_args, config_path, false, &[]).await?;
             print_resolution_evidence(&detection);
             Ok(match detection.engine {
                 crate::execution::resolver::ResolvedEngine::Public => SelectedEngine::Public,
-                crate::execution::resolver::ResolvedEngine::OpenSea { slug } => {
+                crate::execution::resolver::ResolvedEngine::OpenSea { slug, .. } => {
                     SelectedEngine::OpenSea { slug }
                 }
                 crate::execution::resolver::ResolvedEngine::Generic { target } => {
@@ -89,13 +89,13 @@ async fn select_engine(
 /// (`mint`, false) from "I'm willing to wait for this stage" (`watch`,
 /// true) -- see
 /// [`crate::cli::commands::resolver_adapters::NormalizedStageAdapter`].
-/// `excluded_stage_id` lets `watch`'s re-resolution loop exclude a stage
-/// it just proved ineligible at T0 -- always `None` for `mint`.
+/// `excluded_stage_ids` lets `watch`'s re-resolution loop exclude stages
+/// it has already proved ineligible at T0 -- always `&[]` for `mint`.
 pub(crate) async fn resolve_auto_engine(
     plan_args: &crate::cli::args::PlanArgs,
     config_path: Option<&std::path::Path>,
     allow_not_yet_started: bool,
-    excluded_stage_id: Option<&str>,
+    excluded_stage_ids: &[crate::domain::stage::StageId],
 ) -> Result<crate::execution::resolver::Detection, KairoxError> {
     use crate::cli::commands::resolver_adapters::{
         GenericVerifiedContractAdapter, NormalizedStageAdapter,
@@ -140,7 +140,7 @@ pub(crate) async fn resolve_auto_engine(
             slug: plan_args.slug.as_deref(),
             opensea: opensea.as_ref(),
             allow_not_yet_started,
-            excluded_stage_id,
+            excluded_stage_ids,
         }) as Box<dyn MintAdapter>,
         Box::new(GenericVerifiedContractAdapter {
             plan_args,

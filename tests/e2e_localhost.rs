@@ -4800,3 +4800,216 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
          transaction via the public stage, got {sends:?}"
     );
 }
+
+#[test]
+fn watch_rejecting_one_opensea_stage_uuid_does_not_exclude_a_second_stage_sharing_the_same_slug() {
+    // Regression test for the exact reported bug: NormalizedStage identity
+    // used to be the OpenSea collection slug, so rejecting one stage
+    // excluded every stage of that drop. Two stages here share one slug
+    // but have distinct uuids -- stage A (rejected at T0) must not
+    // exclude stage B (a genuinely different stage that later becomes
+    // discoverable, e.g. OpenSea's own drop metadata advancing) from
+    // being selected and successfully minted through.
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-multi-uuid";
+
+    let stage_a_start = unix_now() + 2;
+    let stage_b_start = unix_now() + 2; // discovered only after A is rejected
+    let a_start_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_a_start as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let a_end_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_a_start as i64 + 3600)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let b_start_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_b_start as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let b_end_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_b_start as i64 + 3600)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
+    let mint_rejected_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mint_rejected_once_for_server = mint_rejected_once.clone();
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" => echo_tx_hash_behavior(&params),
+                "eth_getTransactionReceipt" => {
+                    let queried_hash = params
+                        .get(0)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    rpc_ok(serde_json::json!({
+                        "transactionHash": queried_hash,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [transfer_log_for(wallet, 13)],
+                    }))
+                }
+                // Far future -- native public must never win over the
+                // OpenSea stages in this scenario.
+                _ => read_response_with_stage_window(
+                    &method,
+                    &params,
+                    unix_now() + 3600,
+                    unix_now() + 7200,
+                )
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!("unexpected RPC method in multi-uuid scenario: {method}"),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            let already_rejected =
+                mint_rejected_once_for_server.load(std::sync::atomic::Ordering::SeqCst);
+            let next_stage = if already_rejected {
+                serde_json::json!({
+                    "uuid": "stage-b",
+                    "stage_type": "signed_presale",
+                    "label": null,
+                    "price": "0",
+                    "price_currency_address": "0x0000000000000000000000000000000000000000",
+                    "start_time": b_start_rfc3339,
+                    "end_time": b_end_rfc3339,
+                    "max_per_wallet": "10",
+                })
+            } else {
+                serde_json::json!({
+                    "uuid": "stage-a",
+                    "stage_type": "signed_presale",
+                    "label": null,
+                    "price": "0",
+                    "price_currency_address": "0x0000000000000000000000000000000000000000",
+                    "start_time": a_start_rfc3339,
+                    "end_time": a_end_rfc3339,
+                    "max_per_wallet": "10",
+                })
+            };
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "collection_slug": SLUG,
+                    "collection_name": "Test Collection",
+                    "chain": "ethereum",
+                    "contract_address": format!("{NFT:#x}"),
+                    "drop_type": "signed_presale",
+                    "is_minting": true,
+                    "active_stage": null,
+                    "next_stage": next_stage,
+                    "stages": [],
+                    "total_supply": null,
+                    "max_supply": null,
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            let already_rejected =
+                mint_rejected_once_for_server.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if !already_rejected {
+                // Stage A: reject exactly once.
+                (
+                    path.to_string(),
+                    Behavior::HttpStatus(
+                        422,
+                        serde_json::json!({"errors": ["wallet is not eligible for this stage"]}),
+                    ),
+                )
+            } else {
+                // Stage B: a genuine valid signed mint response.
+                let calldata = sd::encode_mint_public(
+                    NFT,
+                    address!("0000000000000000000000000000000000fee000"),
+                    Address::ZERO,
+                    1,
+                )
+                .unwrap();
+                (
+                    path.to_string(),
+                    rpc_ok_status(serde_json::json!({
+                        "to": format!("{:#x}", address!("00005EA00Ac477B1030CE78506496e8C2dE24bf5")),
+                        "data": format!("0x{}", hex::encode(&calldata)),
+                        "value": "0x0",
+                        "chain": "ethereum",
+                    })),
+                )
+            }
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("\"stage-a\""))
+        .stderr(predicates::str::contains("re-resolving"))
+        .stdout(predicates::str::contains("BROADCAST RESULT"));
+
+    let received = server.received.lock().unwrap();
+    let mint_attempts = received
+        .iter()
+        .filter(|(p, _)| p.ends_with("/mint"))
+        .count();
+    assert_eq!(
+        mint_attempts, 2,
+        "expected exactly two mint attempts (stage A rejected, stage B succeeds), got {mint_attempts}"
+    );
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(
+        sends.len(),
+        1,
+        "exactly one broadcast, via stage B, must happen -- stage A's rejection must never \
+         produce a send, got {sends:?}"
+    );
+}

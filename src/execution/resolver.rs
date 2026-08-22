@@ -59,6 +59,14 @@ pub enum ResolvedEngine {
     Public,
     OpenSea {
         slug: String,
+        /// The exact OpenSea stage this resolution matched, when one was
+        /// auto-discovered (`None` for an operator-provided `--slug`,
+        /// which identifies the drop, never one exact stage within it).
+        /// Carried through so `watch`'s re-resolution loop can exclude
+        /// exactly this stage after a T0 ineligibility rejection --
+        /// never every stage sharing the same drop slug. See
+        /// [`crate::domain::stage::StageId`].
+        stage_uuid: Option<String>,
     },
     /// A generic verified ERC-721/ERC-1155 mint -- only ever produced when
     /// the target's implementation bytecode exactly matched a
@@ -273,6 +281,7 @@ mod tests {
                 result: Some(Detection {
                     engine: ResolvedEngine::OpenSea {
                         slug: "x".to_string(),
+                        stage_uuid: None,
                     },
                     evidence: evidence("AdapterB", Confidence::High),
                 }),
@@ -303,6 +312,7 @@ mod tests {
                 result: Some(Detection {
                     engine: ResolvedEngine::OpenSea {
                         slug: "x".to_string(),
+                        stage_uuid: None,
                     },
                     evidence: evidence("OpenSeaDropsAdapter", Confidence::High),
                 }),
