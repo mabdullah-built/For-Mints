@@ -401,6 +401,99 @@ fn supply_error_to_kairox(e: SupplyError) -> KairoxError {
     KairoxError::Supply(e)
 }
 
+/// The outcome of a full [`run_thirdweb_mint`] attempt -- mirrors
+/// [`super::live::LiveMintOutcome`]'s shape (minus fields this engine
+/// doesn't yet have a concept of, like prewarm scheduling).
+#[derive(Debug)]
+pub struct ThirdwebMintOutcome {
+    pub prepared: PreparedTransaction,
+    pub broadcast_results: Vec<crate::execution::broadcast::EndpointBroadcastResult>,
+    pub broadcast_summary: crate::execution::broadcast::BroadcastSummary,
+    pub receipt_state: Option<crate::execution::receipt::ReceiptState>,
+}
+
+/// Prepare, sign, and (unless `rehearsal`) broadcast a thirdweb claim,
+/// then poll for its receipt. `pool` must already be connected (and
+/// ideally warmed) by the caller -- this function does no benchmarking
+/// or rewarming of its own, matching this module's documented "no
+/// elaborate scheduler yet" scope.
+pub async fn run_thirdweb_mint(
+    pool: &crate::chain::pool::RpcPool,
+    signer: &dyn Signer,
+    request: &ThirdwebMintRequest,
+    health: &crate::chain::benchmark::HealthPolicy,
+    receipt_poll_interval: std::time::Duration,
+    receipt_timeout: std::time::Duration,
+    rehearsal: bool,
+) -> Result<ThirdwebMintOutcome, KairoxError> {
+    let read_client = pool.preferred_read().ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available; cannot safely \
+             prepare a thirdweb claim transaction"
+                .to_string(),
+        ))
+    })?;
+    let send_clients = pool.select_send_endpoints(health);
+    if send_clients.is_empty() {
+        return Err(KairoxError::Session(SessionError::new(
+            "no healthy send-capable RPC endpoint available; refusing to prepare a transaction \
+             with nowhere to broadcast it"
+                .to_string(),
+        )));
+    }
+
+    let prepared = prepare_thirdweb_transaction(read_client, signer, request).await?;
+
+    // REHEARSAL: everything above (fresh state, validation, real local
+    // signing/serialization) already happened exactly as it would for a
+    // real send. Stop here -- `eth_sendRawTransaction` is never called.
+    if rehearsal {
+        return Ok(ThirdwebMintOutcome {
+            prepared,
+            broadcast_results: Vec::new(),
+            broadcast_summary: crate::execution::broadcast::BroadcastSummary::NotSent,
+            receipt_state: None,
+        });
+    }
+
+    let broadcast_results =
+        crate::execution::broadcast::broadcast_to_all(&send_clients, &prepared.broadcast).await;
+    let summary = crate::execution::broadcast::summarize_broadcast(&broadcast_results);
+
+    let receipt_state = match &summary {
+        crate::execution::broadcast::BroadcastSummary::Confirmed { .. } => Some(
+            crate::execution::receipt::poll_receipt(
+                read_client,
+                prepared.tx_hash,
+                request.drop_contract,
+                request.wallet,
+                request.quantity,
+                receipt_poll_interval,
+                receipt_timeout,
+                || {},
+            )
+            .await,
+        ),
+        crate::execution::broadcast::BroadcastSummary::AllRejected => None,
+        crate::execution::broadcast::BroadcastSummary::Uncertain => {
+            return Err(crate::execution::broadcast::uncertain_outcome_error(
+                &broadcast_results,
+            ));
+        }
+        // Unreachable in practice -- see live.rs's identical comment on
+        // its own exhaustive match of the same enum.
+        crate::execution::broadcast::BroadcastSummary::NotSent => None,
+    };
+
+    Ok(ThirdwebMintOutcome {
+        prepared,
+        broadcast_results,
+        broadcast_summary: summary,
+        receipt_state,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,13 +655,13 @@ mod tests {
         use alloy_sol_types::SolCall;
         use serde_json::json;
 
-        const DROP: Address = address!("00000000000000000000000000000000000c0DE0");
+        pub(super) const DROP: Address = address!("00000000000000000000000000000000000c0DE0");
 
-        fn signer() -> LocalSigner {
+        pub(super) fn signer() -> LocalSigner {
             LocalSigner::from_bytes(keccak256(b"kairox-thirdweb-engine-test-key").0).unwrap()
         }
 
-        struct MockOpts {
+        pub(super) struct MockOpts {
             condition_id: u64,
             max_claimable_supply: u64,
             supply_claimed: u64,
@@ -600,7 +693,13 @@ mod tests {
             }
         }
 
-        fn build_transport(opts: MockOpts) -> MockTransport {
+        pub(super) fn build_transport(opts: MockOpts) -> MockTransport {
+            build_transport_builder(opts).build()
+        }
+
+        pub(super) fn build_transport_builder(
+            opts: MockOpts,
+        ) -> crate::chain::mock::MockTransportBuilder {
             let condition_id_hex = format!(
                 "0x{}",
                 hex::encode(thirdweb::getActiveClaimConditionIdCall::abi_encode_returns(
@@ -630,7 +729,7 @@ mod tests {
                 ))
             );
 
-            let mut builder = MockTransport::builder()
+            let builder = MockTransport::builder()
                 .respond("eth_chainId", json!("0x1"))
                 .respond_eth_call_selector(
                     thirdweb::getActiveClaimConditionIdCall::SELECTOR,
@@ -652,12 +751,10 @@ mod tests {
                 .respond("eth_getTransactionCount", json!(opts.nonce_hex))
                 .respond("eth_getBalance", json!(opts.balance_hex));
 
-            builder = match opts.estimate_gas {
+            match opts.estimate_gas {
                 Ok(hex_value) => builder.respond("eth_estimateGas", json!(hex_value)),
                 Err((code, message)) => builder.error("eth_estimateGas", code, message),
-            };
-
-            builder.build()
+            }
         }
 
         async fn connect(opts: MockOpts) -> RpcClient {
@@ -667,7 +764,7 @@ mod tests {
                 .unwrap()
         }
 
-        fn request(wallet: Address) -> ThirdwebMintRequest {
+        pub(super) fn request(wallet: Address) -> ThirdwebMintRequest {
             ThirdwebMintRequest {
                 chain: ChainRegistry::builtin().by_id(1).unwrap().clone(),
                 drop_contract: DROP,
@@ -792,6 +889,110 @@ mod tests {
                 message.contains("no active claim condition"),
                 "expected a clear no-active-condition message, got: {message}"
             );
+        }
+    }
+
+    mod run_mint_integration {
+        use super::prepare_integration::*;
+        use super::*;
+        use crate::chain::benchmark::HealthPolicy;
+        use crate::chain::endpoint::EndpointRole;
+        use crate::chain::mock::MockTransport;
+        use crate::chain::pool::RpcPool;
+        use serde_json::{Value, json};
+
+        fn tx_hash_topic(addr: Address) -> [u8; 32] {
+            let mut t = [0u8; 32];
+            t[12..32].copy_from_slice(addr.as_slice());
+            t
+        }
+
+        async fn pool_with_transport(transport: MockTransport) -> RpcPool {
+            let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+                .await
+                .unwrap();
+            RpcPool::from_clients(1, vec![client])
+        }
+
+        fn transport_with_broadcast(wallet: Address, quantity: u64) -> MockTransport {
+            build_transport_builder(MockOpts::default())
+                .echo_raw_transaction_hash()
+                .respond_dynamic("eth_getTransactionReceipt", move |params| {
+                    let queried_hash = params
+                        .get(0)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    json!({
+                        "transactionHash": queried_hash,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [{
+                            "address": DROP.to_string(),
+                            "topics": [
+                                format!(
+                                    "0x{}",
+                                    hex::encode(keccak256(b"Transfer(address,address,uint256)"))
+                                ),
+                                format!("0x{}", hex::encode([0u8; 32])),
+                                format!("0x{}", hex::encode(tx_hash_topic(wallet))),
+                                format!(
+                                    "0x{}",
+                                    hex::encode(U256::from(quantity).to_be_bytes::<32>())
+                                ),
+                            ],
+                            "data": "0x"
+                        }]
+                    })
+                })
+                .build()
+        }
+
+        #[tokio::test]
+        async fn rehearsal_prepares_and_signs_but_never_broadcasts() {
+            let s = signer();
+            let wallet = s.address();
+            let pool = pool_with_transport(build_transport(MockOpts::default())).await;
+            let outcome = run_thirdweb_mint(
+                &pool,
+                &s,
+                &request(wallet),
+                &HealthPolicy::default(),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_secs(1),
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome.broadcast_summary,
+                crate::execution::broadcast::BroadcastSummary::NotSent
+            );
+            assert!(outcome.receipt_state.is_none());
+            assert!(outcome.broadcast_results.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_real_send_broadcasts_exactly_once_and_confirms_the_receipt() {
+            let s = signer();
+            let wallet = s.address();
+            let pool = pool_with_transport(transport_with_broadcast(wallet, 1)).await;
+            let outcome = run_thirdweb_mint(
+                &pool,
+                &s,
+                &request(wallet),
+                &HealthPolicy::default(),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_secs(2),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.broadcast_results.len(), 1);
+            assert!(matches!(
+                outcome.receipt_state,
+                Some(crate::execution::receipt::ReceiptState::ConfirmedSuccess { .. })
+            ));
         }
     }
 }
