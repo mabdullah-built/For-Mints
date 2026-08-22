@@ -43,15 +43,26 @@ impl BenchmarkConfig {
     /// establish reachability/role-correctness (which
     /// [`super::pool::RpcPool::benchmark_all`] always still checks in
     /// full), without the multi-sample ranking pass's added latency. Used
-    /// on the already-live single-wallet critical path
-    /// ([`crate::execution::live::run_live_mint`],
-    /// [`crate::execution::opensea_engine::run_opensea_mint`]) instead of
+    /// unconditionally by both
+    /// [`crate::execution::live::run_live_mint`] and
+    /// [`crate::execution::opensea_engine::run_opensea_mint`] instead of
     /// a full [`Self::default`]-shaped config: an already-active mint has
     /// no time budget to hide a multi-second ranking benchmark in, and a
     /// single sample still proves every read-capable endpoint is reachable
-    /// and chain-verified before selection. `watch` still gets full
-    /// multi-sample ranking, performed well before T0 -- see
-    /// `cli::commands::watch`'s early-benchmark step.
+    /// and chain-verified before selection.
+    ///
+    /// **`watch` does *not* currently get a separate full multi-sample
+    /// ranking pass ahead of this.** An earlier version of this comment
+    /// claimed it did (pointing at a `cli::commands::watch` early
+    /// -benchmark step that was never actually implemented) -- that was
+    /// wrong, and has been corrected here rather than left to describe
+    /// aspirational behavior. `watch`'s `RpcPool` is only connected
+    /// *after* `wait_for_stage` returns in the current code, so `watch`
+    /// gets exactly the same one-sample check `mint` does, at
+    /// (functionally) T0, with no separate earlier ranking step. Giving
+    /// `watch` a genuine pre-T0 full ranking pass would require
+    /// restructuring when its pool is connected relative to the wait --
+    /// a real, tracked, deliberately-deferred improvement, not yet done.
     pub const fn minimal() -> Self {
         Self {
             sample_count: 1,

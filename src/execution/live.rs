@@ -32,13 +32,16 @@ pub struct LiveMintConfig {
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
     /// Reserved for a caller-side full benchmark performed *before*
-    /// calling [`run_live_mint`] (e.g. `watch`'s early, well-before-T0
-    /// ranking pass). `run_live_mint` itself always benchmarks with
-    /// [`BenchmarkConfig::minimal`] internally, regardless of this field --
-    /// see that constructor's doc comment for why. Kept on this struct so
-    /// a caller building a full profile-derived config doesn't need a
-    /// second, parallel settings type merely to carry this value through
-    /// to its own separate early-benchmark call.
+    /// calling [`run_live_mint`]. No caller does this yet -- `watch` does
+    /// not currently have an early, well-before-T0 ranking pass (see
+    /// [`BenchmarkConfig::minimal`]'s doc comment for why, and for the
+    /// fact that this was previously mis-documented as already existing).
+    /// `run_live_mint` itself always benchmarks with
+    /// [`BenchmarkConfig::minimal`] internally, regardless of this
+    /// field's value. Kept on this struct (rather than removed) so a
+    /// future caller building a full profile-derived config for its own
+    /// separate early-benchmark call doesn't need a second, parallel
+    /// settings type merely to carry this value through.
     pub benchmark: BenchmarkConfig,
     /// Exclusion thresholds applied when selecting read/send endpoints
     /// from benchmark data.
