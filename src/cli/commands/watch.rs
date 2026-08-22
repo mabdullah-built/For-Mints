@@ -279,11 +279,8 @@ async fn run_single_target(
     }
 
     print_state(&WatchState::Verify);
-    let plan_args = target.to_plan_args();
     let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
     let poll_config = watch_poll_config(&profile, poll_interval);
-
-    let engine = resolve_watch_engine(&target, &plan_args, config_path).await?;
 
     let safety_caps = SafetyCaps {
         max_mint_value: parse_wei("--max-mint-value-wei", &target.max_mint_value_wei)?,
@@ -291,36 +288,103 @@ async fn run_single_target(
         max_total_spend: parse_wei("--max-total-spend-wei", &target.max_total_spend_wei)?,
     };
 
-    match engine {
-        ResolvedWatchEngine::Public => {
-            run_public_watch(
-                target,
-                plan_args,
-                config_path,
-                &poll_config,
-                &resolved,
-                &profile,
-                &signer,
-                safety_caps,
-                json,
-            )
-            .await
-        }
-        ResolvedWatchEngine::OpenSea { slug } => {
-            run_opensea_watch(
-                target,
-                slug,
-                config_path,
-                &poll_config,
-                &resolved,
-                &profile,
-                &signer,
-                safety_caps,
-                json,
-            )
-            .await
+    // Bounded re-resolution: a fresh, semantically clear OpenSea
+    // eligibility rejection for the exact stage just attempted at T0
+    // excludes that stage and re-resolves once more (never on a
+    // transport/rate-limit/ambiguous error -- see
+    // `is_clear_ineligibility_rejection`'s doc comment), so a later
+    // legitimately-supported stage (e.g. an on-chain public stage opening
+    // after a presale) still gets a real chance instead of the whole
+    // session aborting. Bounded (not unbounded) so a pathological
+    // resolver loop can never spin forever.
+    const MAX_RESOLUTION_ATTEMPTS: u32 = 4;
+    let mut excluded_stage_id: Option<String> = None;
+    let mut last_err = None;
+    for attempt in 0..MAX_RESOLUTION_ATTEMPTS {
+        let plan_args = target.to_plan_args();
+        let engine = resolve_watch_engine(
+            &target,
+            &plan_args,
+            config_path,
+            excluded_stage_id.as_deref(),
+        )
+        .await?;
+
+        let result = match &engine {
+            ResolvedWatchEngine::Public => {
+                run_public_watch(
+                    target.clone(),
+                    plan_args,
+                    config_path,
+                    &poll_config,
+                    &resolved,
+                    &profile,
+                    &signer,
+                    safety_caps,
+                    json,
+                )
+                .await
+            }
+            ResolvedWatchEngine::OpenSea { slug } => {
+                run_opensea_watch(
+                    target.clone(),
+                    slug.clone(),
+                    config_path,
+                    &poll_config,
+                    &resolved,
+                    &profile,
+                    &signer,
+                    safety_caps,
+                    json,
+                )
+                .await
+            }
+        };
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let stage_id = match &engine {
+                    ResolvedWatchEngine::OpenSea { slug } => Some(slug.clone()),
+                    ResolvedWatchEngine::Public => None,
+                };
+                if let (Some(stage_id), true) = (stage_id, is_clear_ineligibility_rejection(&e)) {
+                    eprintln!(
+                        "watch: stage {stage_id:?} rejected as ineligible for this wallet \
+                         (attempt {}/{MAX_RESOLUTION_ATTEMPTS}) -- re-resolving, excluding it: {e}",
+                        attempt + 1
+                    );
+                    excluded_stage_id = Some(stage_id);
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
+    Err(last_err.unwrap_or_else(|| {
+        KairoxError::Session(SessionError::new(
+            "exhausted re-resolution attempts after repeated stage ineligibility",
+        ))
+    }))
+}
+
+/// `true` only for a fresh, semantically unambiguous OpenSea
+/// wallet-ineligibility rejection (`422` classified as
+/// `EligibilityRejected` -- see `opensea::client::classify_precondition_failure`).
+/// Deliberately narrow: a transport error, rate limit, timeout, server
+/// error, or any other outcome must never be treated as proof the wallet
+/// is ineligible -- only an explicit rejection from OpenSea's own backend
+/// does. `AllocationExceeded`/`SupplyExhausted` (also 422s, but
+/// keyword-classified as distinct outcomes) are deliberately excluded
+/// too: those mean *this stage* is exhausted, not that the wallet was
+/// rejected as ineligible for it, and re-resolving past them is not
+/// (yet) part of this pass's scope.
+fn is_clear_ineligibility_rejection(err: &KairoxError) -> bool {
+    matches!(
+        err,
+        KairoxError::OpenSea(crate::opensea::errors::OpenSeaError::EligibilityRejected { .. })
+    )
 }
 
 enum ResolvedWatchEngine {
@@ -340,6 +404,7 @@ async fn resolve_watch_engine(
     target: &WatchTarget,
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
+    excluded_stage_id: Option<&str>,
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
         EngineSelection::Public => Ok(ResolvedWatchEngine::Public),
@@ -350,9 +415,13 @@ async fn resolve_watch_engine(
             Ok(ResolvedWatchEngine::OpenSea { slug })
         }
         EngineSelection::Auto => {
-            let detection =
-                crate::cli::commands::mint::resolve_auto_engine(plan_args, config_path, true)
-                    .await?;
+            let detection = crate::cli::commands::mint::resolve_auto_engine(
+                plan_args,
+                config_path,
+                true,
+                excluded_stage_id,
+            )
+            .await?;
             crate::cli::commands::mint::print_resolution_evidence(&detection);
             match detection.engine {
                 crate::execution::resolver::ResolvedEngine::Public => {
@@ -782,4 +851,68 @@ fn load_manifest(path: &Path) -> Result<Vec<WatchTarget>, KairoxError> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod ineligibility_classification_tests {
+    use super::*;
+    use crate::chain::rpc::{RpcError, TransportError};
+    use crate::opensea::errors::OpenSeaError;
+
+    #[test]
+    fn eligibility_rejected_is_the_only_clear_ineligibility_signal() {
+        assert!(is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::EligibilityRejected {
+                detail: "wallet not in allowlist".to_string()
+            }
+        )));
+    }
+
+    #[test]
+    fn allocation_exceeded_and_supply_exhausted_are_not_ineligibility() {
+        // Distinct outcomes -- the stage itself is exhausted, not proof
+        // the wallet was rejected as ineligible for it. Re-resolving past
+        // these is deliberately out of scope this pass -- see
+        // is_clear_ineligibility_rejection's doc comment.
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::AllocationExceeded {
+                detail: "limit exceeded".to_string()
+            }
+        )));
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::SupplyExhausted {
+                detail: "sold out".to_string()
+            }
+        )));
+    }
+
+    #[test]
+    fn transient_transport_errors_are_never_treated_as_ineligibility() {
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::ApiTimeout
+        )));
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::ApiUnavailable {
+                detail: "connection reset".to_string()
+            }
+        )));
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::RateLimited
+        )));
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::OpenSea(
+            OpenSeaError::ServerError {
+                detail: "internal error".to_string()
+            }
+        )));
+    }
+
+    #[test]
+    fn rpc_and_session_errors_are_never_treated_as_ineligibility() {
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::Rpc(
+            RpcError::Transport(TransportError::Timeout(StdDuration::from_secs(1)))
+        )));
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::Session(
+            SessionError::new("some other session failure")
+        )));
+    }
 }

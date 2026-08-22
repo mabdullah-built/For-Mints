@@ -221,6 +221,15 @@ pub struct NormalizedStageAdapter<'a> {
     /// considers a not-yet-started stage (that's exactly what it waits
     /// through) -- see [`select_for_live_mint`] vs [`select_for_watch`].
     pub allow_not_yet_started: bool,
+    /// A stage id (`NormalizedStage::id` -- an OpenSea slug for an
+    /// off-chain stage) to exclude from selection entirely, as if it had
+    /// never been discovered. Set by `watch`'s re-resolution loop after a
+    /// fresh, semantically clear OpenSea eligibility rejection at T0 for
+    /// that exact stage -- so the same known-ineligible stage is never
+    /// selected again, and a later legitimately-supported stage (e.g. an
+    /// on-chain public stage) gets a real chance. `None` (the normal
+    /// case, and always the case for `mint`) excludes nothing.
+    pub excluded_stage_id: Option<&'a str>,
 }
 
 #[async_trait::async_trait]
@@ -264,6 +273,9 @@ impl MintAdapter for NormalizedStageAdapter<'_> {
             )
             .await?,
         );
+        if let Some(excluded) = self.excluded_stage_id {
+            stages.retain(|s| s.id != excluded);
+        }
 
         let now = OffsetDateTime::now_utc();
         let winner = if self.allow_not_yet_started {

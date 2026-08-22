@@ -4630,16 +4630,20 @@ fn auto_engine_explicit_slug_still_wins_outright_without_auto_discovery() {
 #[test]
 fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_active_public() {
     // Realistic launch sequencing: the on-chain PublicDrop has not opened
-    // yet either (far future window) -- both stages are genuinely
-    // NotStarted, so the correct pick is the *earlier* one, the signed
-    // presale. (An earlier version of this test made the on-chain public
-    // stage already Active, which -- correctly, once the normalized
-    // stage resolver actually weighs both candidates instead of an
-    // ad-hoc adapter-priority chain -- makes AlreadyLive(Public) the
-    // right answer, not WaitFor: a stage that is genuinely live right
-    // now must never be waited past. This version tests the real
-    // "auto-discover and wait for the earlier upcoming non-public stage"
-    // case instead.)
+    // yet either (future window, opening shortly after the presale) --
+    // both stages are genuinely NotStarted, so the correct pick is the
+    // *earlier* one, the signed presale. (An earlier version of this test
+    // made the on-chain public stage already Active, which -- correctly,
+    // once the normalized stage resolver actually weighs both candidates
+    // instead of an ad-hoc adapter-priority chain -- makes
+    // AlreadyLive(Public) the right answer, not WaitFor: a stage that is
+    // genuinely live right now must never be waited past.)
+    //
+    // This test also covers item THIRD (watch re-resolution): the presale
+    // rejects this wallet as ineligible at its own T0, and watch must
+    // re-resolve rather than aborting -- discovering and waiting for the
+    // now-open-enough on-chain public stage, and completing a real send
+    // through it.
     let signer = test_signer();
     let wallet = signer.address();
     let key_hex = signing_key_hex(&signer);
@@ -4653,7 +4657,12 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
         .unwrap()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
-    let public_start = unix_now() + 3600;
+    // Opens shortly after the presale's own T0 (realistic sequencing:
+    // presale first, public second) -- by the time re-resolution runs
+    // (after the presale's ~2s wait plus one rejected mint request),
+    // this is already active, so the test completes quickly and
+    // deterministically rather than waiting a long real duration.
+    let public_start = unix_now() + 4;
     let public_end = public_start + 3600;
 
     let server = LocalHttpServer::spawn_raw(move |path, body| {
@@ -4664,14 +4673,29 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
                 .unwrap_or_default()
                 .to_string();
             let params = body.get("params").cloned().unwrap_or(Value::Null);
-            let behavior =
-                read_response_with_stage_window(&method, &params, public_start, public_end)
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" => echo_tx_hash_behavior(&params),
+                "eth_getTransactionReceipt" => {
+                    let queried_hash = params
+                        .get(0)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    rpc_ok(serde_json::json!({
+                        "transactionHash": queried_hash,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [transfer_log_for(wallet, 11)],
+                    }))
+                }
+                _ => read_response_with_stage_window(&method, &params, public_start, public_end)
                     .unwrap_or(Behavior::JsonRpcError {
                         code: -32601,
                         message: format!(
                             "unexpected RPC method in watch-auto-discovery scenario: {method}"
                         ),
-                    });
+                    }),
+            };
             (method, behavior)
         } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
             (
@@ -4711,11 +4735,10 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
                 })),
             )
         } else if path == format!("/api/v2/drops/{SLUG}/mint") {
-            // A terminal ineligibility rejection -- this test only needs
-            // to prove resolution+waiting genuinely routed through
-            // OpenSea and reached T0, not the full signed-mint happy
-            // path (already covered by
-            // opensea_server_signed_mint_verifies_real_eip712_signature_and_completes_end_to_end).
+            // A terminal, semantically clear ineligibility rejection --
+            // proves watch::run_single_target's re-resolution loop
+            // (item THIRD): a rejection this specific must exclude this
+            // stage and re-resolve, never simply abort the session.
             (
                 path.to_string(),
                 Behavior::HttpStatus(
@@ -4753,18 +4776,27 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
-        .failure()
+        .success()
         .stderr(predicates::str::contains("resolved_engine: OpenSea"))
         .stderr(predicates::str::contains("signed_presale"))
-        .stderr(predicates::str::contains("not eligible"));
+        .stderr(predicates::str::contains("re-resolving"))
+        .stderr(predicates::str::contains("resolved_engine: Public"))
+        .stdout(predicates::str::contains("BROADCAST RESULT"))
+        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
 
     let received = server.received.lock().unwrap();
     assert!(
         received.iter().any(|(p, _)| p.ends_with("/mint")),
-        "watch should have waited for the upcoming stage and then requested a fresh mint authorization at T0"
+        "watch should have waited for the presale and requested a fresh mint authorization at T0"
     );
-    assert!(
-        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
-        "an ineligibility-rejected signed stage must never broadcast"
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(
+        sends.len(),
+        1,
+        "after re-resolving past the ineligible presale, watch must broadcast exactly one \
+         transaction via the public stage, got {sends:?}"
     );
 }

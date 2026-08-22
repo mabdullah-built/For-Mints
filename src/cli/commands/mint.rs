@@ -69,7 +69,7 @@ async fn select_engine(
             Ok(SelectedEngine::OpenSea { slug })
         }
         EngineSelection::Auto => {
-            let detection = resolve_auto_engine(&args.plan_args, config_path, false).await?;
+            let detection = resolve_auto_engine(&args.plan_args, config_path, false, None).await?;
             print_resolution_evidence(&detection);
             Ok(match detection.engine {
                 crate::execution::resolver::ResolvedEngine::Public => SelectedEngine::Public,
@@ -87,11 +87,15 @@ async fn select_engine(
 /// Shared by `mint --engine auto` and `watch --engine auto`.
 /// `allow_not_yet_started` distinguishes "I want to send right now"
 /// (`mint`, false) from "I'm willing to wait for this stage" (`watch`,
-/// true) -- see [`crate::cli::commands::resolver_adapters::SeaDropAdapter`].
+/// true) -- see
+/// [`crate::cli::commands::resolver_adapters::NormalizedStageAdapter`].
+/// `excluded_stage_id` lets `watch`'s re-resolution loop exclude a stage
+/// it just proved ineligible at T0 -- always `None` for `mint`.
 pub(crate) async fn resolve_auto_engine(
     plan_args: &crate::cli::args::PlanArgs,
     config_path: Option<&std::path::Path>,
     allow_not_yet_started: bool,
+    excluded_stage_id: Option<&str>,
 ) -> Result<crate::execution::resolver::Detection, KairoxError> {
     use crate::cli::commands::resolver_adapters::{
         GenericVerifiedContractAdapter, NormalizedStageAdapter,
@@ -136,6 +140,7 @@ pub(crate) async fn resolve_auto_engine(
             slug: plan_args.slug.as_deref(),
             opensea: opensea.as_ref(),
             allow_not_yet_started,
+            excluded_stage_id,
         }) as Box<dyn MintAdapter>,
         Box::new(GenericVerifiedContractAdapter {
             plan_args,
