@@ -51,18 +51,20 @@ impl BenchmarkConfig {
     /// single sample still proves every read-capable endpoint is reachable
     /// and chain-verified before selection.
     ///
-    /// **`watch` does *not* currently get a separate full multi-sample
-    /// ranking pass ahead of this.** An earlier version of this comment
-    /// claimed it did (pointing at a `cli::commands::watch` early
-    /// -benchmark step that was never actually implemented) -- that was
-    /// wrong, and has been corrected here rather than left to describe
-    /// aspirational behavior. `watch`'s `RpcPool` is only connected
-    /// *after* `wait_for_stage` returns in the current code, so `watch`
-    /// gets exactly the same one-sample check `mint` does, at
-    /// (functionally) T0, with no separate earlier ranking step. Giving
-    /// `watch` a genuine pre-T0 full ranking pass would require
-    /// restructuring when its pool is connected relative to the wait --
-    /// a real, tracked, deliberately-deferred improvement, not yet done.
+    /// `watch` (`cli::commands::watch::run_public_watch` /
+    /// `run_opensea_watch`) *does* get a separate full multi-sample
+    /// ranking pass: its `RpcPool` is connected and run through
+    /// [`super::pool::RpcPool::benchmark_all`] with the profile's full
+    /// [`Self::default`]-shaped policy *before* `wait_for_stage` is ever
+    /// called, and that same pool (never reconnected) stays alive across
+    /// the wait. `watch` then passes `skip_benchmark: true` into
+    /// `run_live_mint`/`run_opensea_mint` so this minimal, one-sample
+    /// config is never run a second time on top of that ranking data --
+    /// the near-T0 freshness check watch still gets comes from
+    /// `RpcPool::rewarm_all` alone, which never touches ranking data.
+    /// Direct (non-watch) `mint --send` has no earlier ranking pass to
+    /// protect, so it always uses this minimal config here, at
+    /// (functionally) T0.
     pub const fn minimal() -> Self {
         Self {
             sample_count: 1,

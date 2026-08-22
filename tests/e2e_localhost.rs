@@ -3902,6 +3902,162 @@ fn watch_public_future_stage_waits_then_executes_at_t0() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Round 6 items 1 + 3(A/B/C): the watch RpcPool must run its full,
+// multi-sample benchmark entirely *before* the stage wait begins (not
+// after), that full benchmark must never repeat once the wait is over,
+// and no full benchmark/telemetry work may land after dispatch --
+// telemetry summary printing is off the dispatch-critical path, and the
+// only latency check remaining near T0 is the always-unconditional
+// single-sample `rewarm_all` liveness probe.
+// ---------------------------------------------------------------------
+#[test]
+fn watch_public_runs_the_full_benchmark_before_the_wait_never_repeats_it_and_touches_no_endpoint_after_dispatch()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let stage_start = unix_now() + 2;
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        match method {
+            "eth_sendRawTransaction" => return echo_tx_hash_behavior(params),
+            "eth_getTransactionReceipt" => {
+                let queried_hash = params
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .unwrap_or("0x")
+                    .to_string();
+                return rpc_ok(serde_json::json!({
+                    "transactionHash": queried_hash,
+                    "status": "0x1",
+                    "blockNumber": "0x1",
+                    "logs": [transfer_log_for(wallet, 9)],
+                }));
+            }
+            _ => {}
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!(
+                    "unexpected method in watch benchmark-ordering scenario: {method}"
+                ),
+            },
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success();
+
+    let received = server.received.lock().unwrap();
+    let methods: Vec<&str> = received.iter().map(|(m, _)| m.as_str()).collect();
+
+    // `eth_blockNumber` is used for exactly two purposes anywhere in this
+    // codebase: `RpcPool::benchmark_all` (one sample per configured
+    // sample_count) and `RpcPool::rewarm_all` (exactly one sample). No
+    // other read ever calls it, so its call pattern alone is enough to
+    // prove the ordering these items require, independent of the
+    // unrelated `eth_call`/fee/nonce clusters that `resolve_watch_engine`
+    // and each `wait_for_stage` poll cycle also produce on their own,
+    // separate connections.
+    //
+    // No chain-id override was given, so the reported "0x1" chain id
+    // resolves to the Ethereum execution profile, whose benchmark policy
+    // is 6 samples -- see `execution::profile::ethereum`.
+    const FULL_BENCHMARK_SAMPLES: usize = 6;
+
+    let send_idx = methods
+        .iter()
+        .position(|m| *m == "eth_sendRawTransaction")
+        .expect("watch must broadcast exactly one transaction");
+
+    // Group eth_blockNumber indices into maximal consecutive runs.
+    let mut runs: Vec<(usize, usize)> = Vec::new(); // (start_idx, len)
+    let mut i = 0;
+    while i < methods.len() {
+        if methods[i] == "eth_blockNumber" {
+            let start = i;
+            while i < methods.len() && methods[i] == "eth_blockNumber" {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        } else {
+            i += 1;
+        }
+    }
+
+    // Item A / item 3's "benchmark count == 1 before the stage wait":
+    // exactly one run is long enough to be the full multi-sample
+    // benchmark (it will actually measure sample_count + 1, since the
+    // immediately-following `rewarm_all` call fuses onto the same run).
+    let full_runs: Vec<&(usize, usize)> = runs
+        .iter()
+        .filter(|(_, len)| *len >= FULL_BENCHMARK_SAMPLES)
+        .collect();
+    assert_eq!(
+        full_runs.len(),
+        1,
+        "expected exactly one full multi-sample benchmark burst (>= {FULL_BENCHMARK_SAMPLES} \
+         consecutive eth_blockNumber calls), got runs {runs:?} in {methods:?}"
+    );
+    let (full_run_start, full_run_len) = *full_runs[0];
+    let full_run_end = full_run_start + full_run_len;
+
+    // Item B / item C: every other eth_blockNumber call, taken together,
+    // is exactly one single sample -- the always-unconditional near-T0
+    // `rewarm_all` inside run_live_mint -- and it happens strictly after
+    // the full benchmark, strictly before dispatch. No second full
+    // benchmark, and nothing benchmark-shaped after the send.
+    let other_block_number_indices: Vec<usize> = methods
+        .iter()
+        .enumerate()
+        .filter(|(idx, m)| {
+            **m == "eth_blockNumber" && !(*idx >= full_run_start && *idx < full_run_end)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(
+        other_block_number_indices,
+        vec![
+            *other_block_number_indices
+                .first()
+                .expect("expected exactly one near-T0 rewarm sample outside the full benchmark")
+        ],
+        "expected exactly one eth_blockNumber call outside the full benchmark burst (the \
+         near-T0 rewarm), never a second full benchmark and never one after dispatch, got \
+         {other_block_number_indices:?} in {methods:?}"
+    );
+    let near_t0_rewarm_idx = other_block_number_indices[0];
+    assert!(
+        full_run_end <= near_t0_rewarm_idx,
+        "the full benchmark burst must complete strictly before the near-T0 rewarm sample"
+    );
+    assert!(
+        near_t0_rewarm_idx < send_idx,
+        "the near-T0 rewarm must happen strictly before dispatch, never after"
+    );
+}
+
 #[test]
 fn watch_without_auto_send_refuses_to_run_and_touches_no_endpoint() {
     let wallet = test_signer().address();

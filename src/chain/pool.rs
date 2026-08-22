@@ -568,6 +568,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn benchmark_all_never_probes_a_send_only_endpoint_with_a_read_call() {
+        // A send-only (sequencer) transport that has no `eth_blockNumber`
+        // responder configured at all -- if `benchmark_all` ever issued a
+        // read probe against it despite the missing responder, the sample
+        // would still land as `Some(LatencyStats)` (recorded as a
+        // failure/timeout, never silently dropped), so `read_latency`
+        // staying `None` below is proof the probe was never attempted at
+        // all, not just that it failed.
+        let send_only_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .build();
+        let send_only = RpcClient::connect(
+            Box::new(send_only_transport),
+            1,
+            EndpointRole::SendOnly,
+            Some("sequencer".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![send_only]);
+        pool.benchmark_all(&super::super::benchmark::BenchmarkConfig {
+            sample_count: 3,
+            sample_delay: Duration::ZERO,
+        })
+        .await;
+
+        assert!(
+            pool.benchmarks()[0].read_latency.is_none(),
+            "a send-only endpoint must never receive a read-latency sample"
+        );
+    }
+
+    #[tokio::test]
     async fn preferred_read_fails_closed_when_benchmarked_and_all_unhealthy() {
         use super::super::benchmark::BenchmarkConfig;
 

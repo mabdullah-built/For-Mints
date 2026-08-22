@@ -503,9 +503,11 @@ impl StageProbe for TelemetryProbe<'_> {
 
 /// Prints one advisory-only summary line per endpoint/probe observed
 /// during the wait -- purely informational, never consulted by any
-/// downstream decision. `eprintln!`'d once, right after `wait_for_stage`
-/// returns (i.e. once, well before T0's own critical path -- this is
-/// not on it).
+/// downstream decision. `eprintln!`'d once, only *after*
+/// `run_live_mint`/`run_opensea_mint` has already returned and
+/// `WatchState::Success` has already printed -- i.e. strictly after
+/// dispatch and receipt confirmation, never between stage-open
+/// detection and broadcast.
 fn print_telemetry_summary(store: &std::sync::Mutex<crate::chain::telemetry::TelemetryStore>) {
     let Ok(store) = store.lock() else {
         return;
