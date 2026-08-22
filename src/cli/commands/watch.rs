@@ -569,6 +569,11 @@ async fn resolve_watch_engine(
     allow_already_live: bool,
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
+        EngineSelection::Thirdweb => Err(KairoxError::Session(SessionError::new(
+            "--engine thirdweb is not yet supported by watch; use kairox mint --engine thirdweb \
+             --send directly against an already-live phase (v0.8 Phase B scope)"
+                .to_string(),
+        ))),
         EngineSelection::Public => {
             // Explicit-engine modes obey the exact same WATCH-vs-LIVE
             // contract as `--engine auto` -- item 6 of the true-final

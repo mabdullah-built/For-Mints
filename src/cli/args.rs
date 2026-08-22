@@ -144,6 +144,11 @@ pub enum EngineSelection {
     Public,
     /// Official OpenSea Drops API engine only (requires --slug).
     Opensea,
+    /// thirdweb Drop (`ClaimCondition`) engine only. `--collection` is the
+    /// thirdweb Drop contract itself (it is both the NFT and the claim
+    /// logic in one deployment). Explicit-only for now -- not yet part of
+    /// `--engine auto`'s resolution.
+    Thirdweb,
 }
 
 #[derive(Args, Debug)]

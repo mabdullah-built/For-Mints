@@ -43,6 +43,9 @@ enum SelectedEngine {
     Generic {
         target: crate::execution::generic_engine::ResolvedGenericTarget,
     },
+    /// thirdweb Drop -- `args.plan_args.collection` doubles as the Drop
+    /// contract address (see `EngineSelection::Thirdweb`'s doc comment).
+    Thirdweb,
 }
 
 /// Resolve `--engine`/`--slug` into exactly one concrete engine.
@@ -60,6 +63,7 @@ async fn select_engine(
 ) -> Result<SelectedEngine, KairoxError> {
     match args.plan_args.engine {
         EngineSelection::Public => Ok(SelectedEngine::Public),
+        EngineSelection::Thirdweb => Ok(SelectedEngine::Thirdweb),
         EngineSelection::Opensea => {
             let slug = args
                 .plan_args
@@ -311,6 +315,61 @@ async fn run_dry_run(
             )?;
             println!("calldata:       0x{}", hex::encode(&calldata));
         }
+        SelectedEngine::Thirdweb => {
+            if json || output.is_some() {
+                return Err(KairoxError::Session(SessionError::new(
+                    "--json/--output for a dry run is only supported for the PUBLIC engine today",
+                )));
+            }
+            let registry = ChainRegistry::builtin();
+            let (resolved, runtime) =
+                resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
+            let client = crate::cli::context::connect_read_client(
+                &resolved.info,
+                args.plan_args.chain_args.rpc_url.as_ref(),
+                runtime.config.as_ref(),
+            )
+            .await?;
+            let condition_id = crate::cli::gather::fetch_thirdweb_active_claim_condition_id(
+                &client,
+                args.plan_args.collection,
+            )
+            .await?;
+            let condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+                &client,
+                args.plan_args.collection,
+                condition_id,
+            )
+            .await?;
+            println!("selected engine: THIRDWEB (thirdweb Drop ClaimCondition)");
+            println!();
+            println!("drop contract:            {}", args.plan_args.collection);
+            println!("active claim condition:   {condition_id}");
+            println!(
+                "start:                    {} (unix {})",
+                format_unix(condition.start_timestamp),
+                condition.start_timestamp
+            );
+            println!(
+                "price/token:              {} wei",
+                condition.price_per_token
+            );
+            println!("currency:                 {}", condition.currency);
+            println!(
+                "native currency:          {}",
+                condition.is_native_currency()
+            );
+            println!("supply remaining:         {}", condition.supply_remaining());
+            println!(
+                "per-wallet limit:         {}",
+                condition.quantity_limit_per_wallet
+            );
+            println!(
+                "allowlist gated:          {}",
+                !condition.merkle_root.is_zero()
+            );
+            println!("--- (nothing above this line reflects wallet-specific eligibility) ---");
+        }
     }
 
     println!();
@@ -361,6 +420,7 @@ async fn run_send(
             }
             run_send_generic(args, target, config_path).await
         }
+        SelectedEngine::Thirdweb => run_send_thirdweb(args, config_path).await,
     }
 }
 
@@ -777,6 +837,143 @@ async fn run_send_public(
         &outcome.broadcast_summary,
         &outcome.receipt_state,
         &outcome.metrics,
+        args.rehearsal,
+    );
+
+    Ok(())
+}
+
+/// `kairox mint --engine thirdweb --send` -- public-phase (no allowlist
+/// gating) native-currency claims only, for now; see
+/// `execution::thirdweb_engine`'s module doc comment for the exact
+/// scope. An operator-supplied allowlist-proof CLI flag for gated phases
+/// is explicit follow-up work -- the engine itself already supports it
+/// (`ThirdwebMintRequest::allowlist_proof`), only the CLI plumbing to
+/// accept one does not exist yet.
+async fn run_send_thirdweb(
+    args: MintArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
+    let wallet = args.plan_args.wallet.ok_or_else(|| {
+        KairoxError::Session(SessionError::new(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)",
+        ))
+    })?;
+    let registry = ChainRegistry::builtin();
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
+
+    let pool = connect_send_pool(
+        &resolved,
+        args.plan_args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
+
+    // Preview read for the confirmation summary only -- purely
+    // informational here; the actual transaction that gets signed is
+    // built fresh, strictly, by `run_thirdweb_mint` below.
+    let preview_client = pool.preferred_read().ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available",
+        ))
+    })?;
+    let preview_condition_id = crate::cli::gather::fetch_thirdweb_active_claim_condition_id(
+        preview_client,
+        args.plan_args.collection,
+    )
+    .await?;
+    let preview_condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+        preview_client,
+        args.plan_args.collection,
+        preview_condition_id,
+    )
+    .await?;
+
+    eprintln!("selected engine: THIRDWEB (thirdweb Drop ClaimCondition)");
+    eprintln!("=================================================");
+    if args.rehearsal {
+        eprintln!(" REHEARSAL CONFIRMATION (no transaction will be broadcast)");
+    } else {
+        eprintln!(" LIVE SEND CONFIRMATION");
+    }
+    eprintln!("=================================================");
+    eprintln!(
+        "chain:                {} (chain id {})",
+        resolved.info.name, resolved.info.chain_id
+    );
+    eprintln!("wallet:                {}", wallet);
+    eprintln!("drop contract:         {}", args.plan_args.collection);
+    eprintln!("quantity:              {}", args.plan_args.quantity);
+    eprintln!(
+        "price/token:           {} wei",
+        preview_condition.price_per_token
+    );
+    eprintln!(
+        "allowlist gated:       {}",
+        !preview_condition.merkle_root.is_zero()
+    );
+    eprintln!("send-capable endpoints:{}", pool.send_capable().len());
+    eprintln!("=================================================");
+
+    if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
+        eprintln!(
+            "Aborted: confirmation not received. Nothing was signed, prepared, or broadcast."
+        );
+        return Ok(());
+    }
+
+    let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
+        KairoxError::Session(SessionError::new(format!(
+            "failed to load signing key: {e}"
+        )))
+    })?;
+    if signer.address() != wallet {
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer.address(),
+                wallet
+            ),
+        )));
+    }
+
+    let safety_caps = SafetyCaps {
+        max_mint_value: parse_wei("--max-mint-value-wei", &args.plan_args.max_mint_value_wei)?,
+        max_gas_cost: parse_wei("--max-gas-cost-wei", &args.plan_args.max_gas_cost_wei)?,
+        max_total_spend: parse_wei("--max-total-spend-wei", &args.plan_args.max_total_spend_wei)?,
+    };
+
+    let request = crate::execution::thirdweb_engine::ThirdwebMintRequest {
+        chain: resolved.info.clone(),
+        drop_contract: args.plan_args.collection,
+        wallet,
+        quantity: args.plan_args.quantity,
+        gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
+        safety_caps,
+        allowlist_proof: None,
+    };
+
+    let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
+    let outcome = crate::execution::thirdweb_engine::run_thirdweb_mint(
+        &pool,
+        &signer,
+        &request,
+        &profile.health_policy,
+        profile.receipt_poll_interval,
+        profile.receipt_timeout,
+        args.rehearsal,
+    )
+    .await?;
+
+    print_broadcast_result(
+        outcome.prepared.tx_hash,
+        &outcome.broadcast_results,
+        &outcome.broadcast_summary,
+        &outcome.receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
         args.rehearsal,
     );
 

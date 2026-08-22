@@ -52,6 +52,11 @@ pub async fn run_manifest(
                 "--engine auto is not supported with --wallet-manifest; pass --engine public or --engine opensea explicitly",
             )));
         }
+        EngineSelection::Thirdweb => {
+            return Err(KairoxError::Session(SessionError::new(
+                "--engine thirdweb is not yet supported with --wallet-manifest; use a single --wallet",
+            )));
+        }
     };
 
     if args.send {

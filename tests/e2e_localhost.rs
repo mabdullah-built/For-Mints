@@ -6893,3 +6893,229 @@ fn watch_rejecting_one_opensea_stage_uuid_does_not_exclude_a_second_stage_sharin
          rejection to stage B"
     );
 }
+
+// =======================================================================
+// v0.8 Phase B: thirdweb Drop (ClaimCondition) engine, real CLI binary
+// E2E. Exercises the actual protocol::thirdweb ABI encode/decode and
+// execution::thirdweb_engine pipeline through a real localhost JSON-RPC
+// server -- not just the engine's own mock-transport unit tests.
+// =======================================================================
+
+use kairox::protocol::thirdweb::{self as tw, ClaimConditionAbi};
+
+const THIRDWEB_DROP: Address = address!("00000000000000000000000000000000007d40D0");
+
+fn thirdweb_public_condition_response(price_wei: u128) -> Value {
+    let condition = ClaimConditionAbi {
+        startTimestamp: U256::from(1_700_000_000u64),
+        maxClaimableSupply: U256::from(1_000u64),
+        supplyClaimed: U256::from(10u64),
+        quantityLimitPerWallet: U256::from(5u64),
+        merkleRoot: B256::ZERO,
+        pricePerToken: U256::from(price_wei),
+        currency: tw::NATIVE_TOKEN,
+        metadata: String::new(),
+    };
+    serde_json::json!(format!(
+        "0x{}",
+        hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+            &condition
+        ))
+    ))
+}
+
+fn thirdweb_read_response(method: &str, params: &Value) -> Option<Behavior> {
+    match method {
+        "eth_chainId" => Some(rpc_ok(serde_json::json!("0x1"))),
+        "eth_call" => {
+            let data = params
+                .get(0)
+                .and_then(|c| c.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or("0x");
+            let active_id_sel = format!(
+                "0x{}",
+                hex::encode(tw::getActiveClaimConditionIdCall::SELECTOR)
+            );
+            let condition_sel =
+                format!("0x{}", hex::encode(tw::getClaimConditionByIdCall::SELECTOR));
+            let claimed_sel = format!(
+                "0x{}",
+                hex::encode(tw::getSupplyClaimedByWalletCall::SELECTOR)
+            );
+            if data.starts_with(&active_id_sel) {
+                return Some(rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &U256::ZERO
+                    ))
+                ))));
+            }
+            if data.starts_with(&condition_sel) {
+                return Some(rpc_ok(thirdweb_public_condition_response(
+                    10_000_000_000_000_000,
+                )));
+            }
+            if data.starts_with(&claimed_sel) {
+                return Some(rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &U256::ZERO
+                    ))
+                ))));
+            }
+            None
+        }
+        "eth_blockNumber" => Some(rpc_ok(serde_json::json!("0x1"))),
+        "eth_getBlockByNumber" => Some(rpc_ok(serde_json::json!({
+            "number": "0x1",
+            "timestamp": "0x1",
+            "baseFeePerGas": "0x3b9aca00"
+        }))),
+        "eth_maxPriorityFeePerGas" => Some(rpc_ok(serde_json::json!("0x3b9aca00"))),
+        "eth_getTransactionCount" => Some(rpc_ok(serde_json::json!("0x1"))),
+        "eth_getBalance" => Some(rpc_ok(serde_json::json!("0xde0b6b3a7640000"))),
+        "eth_estimateGas" => Some(rpc_ok(serde_json::json!("0x2bf20"))),
+        _ => None,
+    }
+}
+
+#[test]
+fn thirdweb_dry_run_prints_the_active_claim_condition_read_only() {
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in thirdweb dry-run scenario: {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{THIRDWEB_DROP:#x}"),
+            "--wallet",
+            &format!("{:#x}", test_signer().address()),
+            "--engine",
+            "thirdweb",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("selected engine: THIRDWEB"))
+        .stdout(predicates::str::contains("allowlist gated:          false"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a dry run must never broadcast"
+    );
+}
+
+#[test]
+fn thirdweb_public_phase_rehearsal_prepares_and_signs_but_never_broadcasts() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "must never be called: rehearsal never broadcasts".into(),
+        },
+        _ => thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in thirdweb rehearsal scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{THIRDWEB_DROP:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "thirdweb",
+            "--rehearsal",
+            "--yes",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains(
+            "REHEARSAL COMPLETE — signed and serialized",
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never broadcast"
+    );
+}
+
+#[test]
+fn thirdweb_real_send_broadcasts_exactly_once_and_confirms_the_receipt() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
+        "eth_getTransactionReceipt" => {
+            let queried_hash = params
+                .get(0)
+                .and_then(Value::as_str)
+                .unwrap_or("0x")
+                .to_string();
+            rpc_ok(serde_json::json!({
+                "transactionHash": queried_hash,
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "logs": [transfer_log_custom(THIRDWEB_DROP, Address::ZERO, wallet, 1)],
+            }))
+        }
+        _ => thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in thirdweb send scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{THIRDWEB_DROP:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "thirdweb",
+            "--send",
+            "--yes",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("BROADCAST RESULT"))
+        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+
+    let received = server.received.lock().unwrap();
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(sends.len(), 1, "expected exactly one broadcast: {sends:?}");
+}
