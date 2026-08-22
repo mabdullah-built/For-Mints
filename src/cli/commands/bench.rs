@@ -143,16 +143,27 @@ pub async fn run(
 
 /// Diagnostic-only network-locality report for the official OpenSea REST
 /// origin: real, read-only `GET /api/v2/chain/{chain}/contract/{address}`
-/// requests (the zero address -- expected to 404, which is a perfectly
-/// real round trip for latency purposes) against the address zero, timed
-/// individually so an operator can see the cold-connection cost
-/// separately from subsequent (TCP/TLS-reused) requests. Purely
+/// requests against the zero address, timed individually. Purely
 /// observational: never asserted against a threshold, never used to
 /// change any endpoint/infrastructure choice automatically -- an
 /// operator decides what (if anything) to do with this. Skipped
 /// entirely (with a clear reason) when no OpenSea API key is configured
 /// or the chain has no known OpenSea mapping -- never a hard failure of
 /// `bench` itself.
+///
+/// Round 6 item 7: deliberately never calls the first sample "cold" --
+/// this uses the same already-warm, already-reused `OpenSeaClient`
+/// `load_opensea_client` returns (the same client `watch`/`mint` use),
+/// so a prior request on this exact process may already have
+/// established the underlying connection. "first measured request" /
+/// "subsequent request" describe exactly what is actually known, never
+/// a claim about TCP/TLS connection state this code cannot observe.
+/// Each response is classified by the real HTTP-status-derived
+/// [`crate::opensea::errors::OpenSeaError`] variant `get_contract`
+/// already returns (200/404/401/403/429/5xx/timeout/transport failure
+/// are all independently distinguishable outcomes here; response bodies
+/// are never printed, so no secret-bearing content can leak through
+/// this diagnostic).
 async fn report_opensea_locality(chain_id: crate::chain::registry::ChainId) {
     println!();
     let Some(chain_identifier) = crate::opensea::models::opensea_chain_identifier(chain_id) else {
@@ -179,20 +190,44 @@ async fn report_opensea_locality(chain_id: crate::chain::registry::ChainId) {
             .get_contract(chain_identifier, alloy_primitives::Address::ZERO)
             .await;
         let elapsed_ms = started.elapsed().as_millis();
-        let phase = if i == 0 { "cold" } else { "warm" };
-        let status = match outcome {
-            Ok(_) => "ok",
-            Err(_) => "no-record-or-error (still a real round trip)",
+        let phase = if i == 0 {
+            "first measured request"
+        } else {
+            "subsequent request"
         };
-        println!("  request {} ({phase}): {elapsed_ms}ms ({status})", i + 1);
+        let status = match &outcome {
+            Ok(Some(_)) => "HTTP 200 (unexpectedly found a contract record)".to_string(),
+            Ok(None) => "HTTP 404 (no record for the zero address, as expected)".to_string(),
+            Err(crate::opensea::errors::OpenSeaError::AuthenticationFailed) => {
+                "HTTP 401/403 (authentication failed)".to_string()
+            }
+            Err(crate::opensea::errors::OpenSeaError::RateLimited) => {
+                "HTTP 429 (rate limited)".to_string()
+            }
+            Err(crate::opensea::errors::OpenSeaError::ServerError { .. }) => {
+                "HTTP 5xx (server error)".to_string()
+            }
+            Err(crate::opensea::errors::OpenSeaError::ApiTimeout) => {
+                "timeout (no HTTP response received)".to_string()
+            }
+            Err(crate::opensea::errors::OpenSeaError::ApiUnavailable { .. }) => {
+                "transport failure (no HTTP response received)".to_string()
+            }
+            Err(crate::opensea::errors::OpenSeaError::MalformedApiResponse { detail }) => {
+                format!("unexpected response ({detail})")
+            }
+            Err(other) => format!("unexpected error ({other})"),
+        };
+        println!("  request {} ({phase}): {elapsed_ms}ms -- {status}", i + 1);
         latencies_ms.push(elapsed_ms);
     }
     if latencies_ms.len() > 1 {
-        let cold = latencies_ms[0];
-        let warm_mean = latencies_ms[1..].iter().sum::<u128>() / (latencies_ms.len() - 1) as u128;
+        let first = latencies_ms[0];
+        let subsequent_mean =
+            latencies_ms[1..].iter().sum::<u128>() / (latencies_ms.len() - 1) as u128;
         println!(
-            "  cold request: {cold}ms; mean of {} subsequent (connection-reused) request(s): \
-             {warm_mean}ms",
+            "  first measured request: {first}ms; mean of {} subsequent request(s): \
+             {subsequent_mean}ms",
             latencies_ms.len() - 1
         );
     }

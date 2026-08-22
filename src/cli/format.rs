@@ -204,8 +204,17 @@ pub fn format_benchmark_report(
     }
 
     let broadcast_latency = match bench.broadcast_latency {
-        BroadcastLatency::NotApplicable => "N/A",
-        BroadcastLatency::UnknownUntilRealAttempt => "UNKNOWN_UNTIL_REAL_ATTEMPT",
+        BroadcastLatency::NotApplicable => "N/A".to_string(),
+        // Round 6 item 8/9: never a fabricated number, and never obtained
+        // by sending a dummy transaction -- this endpoint accepts
+        // eth_sendRawTransaction, so its real submission latency is
+        // genuinely unknown until a real mint attempt broadcasts through
+        // it.
+        BroadcastLatency::UnknownUntilRealAttempt => {
+            "UNKNOWN_UNTIL_REAL_ATTEMPT (submission-only capability; transaction-submission \
+             latency was not measured because doing so would require a real transaction)"
+                .to_string()
+        }
     };
     lines.push(format!("    broadcast_latency={broadcast_latency}"));
 
@@ -398,6 +407,12 @@ mod tests {
             format_benchmark_report("https://sequencer.example", 4663, &bench, false, true);
         assert!(report.contains("read_latency=N/A"));
         assert!(report.contains("broadcast_latency=UNKNOWN_UNTIL_REAL_ATTEMPT"));
+        // Round 6 item 8/9: the explicit sentence explaining why, never a
+        // fabricated latency number and never obtained via a dummy send.
+        assert!(report.contains(
+            "transaction-submission latency was not measured because doing so would require \
+             a real transaction"
+        ));
         assert!(report.contains("selected_read=no"));
         assert!(report.contains("selected_send=yes"));
         assert!(report.contains("chain_binding=configured:4663"));
