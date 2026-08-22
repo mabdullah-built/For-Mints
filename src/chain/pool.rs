@@ -881,4 +881,85 @@ mod tests {
             "a fresh prewarm failure must exclude the endpoint from send selection too"
         );
     }
+
+    /// Round 6 item 3G / the "T-30 fastest, T0 dead" scenario, on one
+    /// consistent pool/client (not a fresh reconnect): endpoint A answers
+    /// `eth_blockNumber` successfully for its early full-benchmark samples,
+    /// then starts failing every call from the near-T0 rewarm onward --
+    /// exactly what a real endpoint going down between an early benchmark
+    /// and T0 looks like. B stays healthy throughout, just slower.
+    /// Selection must not blindly trust A's now-stale fast ranking; it
+    /// must fail A closed and select B, the currently-healthy endpoint.
+    #[tokio::test]
+    async fn a_formerly_fastest_endpoint_that_dies_before_t0_loses_selection_to_a_healthy_endpoint()
+    {
+        use super::super::benchmark::BenchmarkConfig;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const FULL_BENCHMARK_SAMPLES: u32 = 3;
+        let a_call_count = std::sync::Arc::new(AtomicU32::new(0));
+        let a_call_count_for_closure = a_call_count.clone();
+        let a_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_dynamic_result("eth_blockNumber", move |_params| {
+                let n = a_call_count_for_closure.fetch_add(1, Ordering::SeqCst);
+                if n < FULL_BENCHMARK_SAMPLES {
+                    Ok(json!("0x1"))
+                } else {
+                    Err((-32000, "connection reset".to_string()))
+                }
+            })
+            .build();
+        let a = RpcClient::connect(
+            Box::new(a_transport),
+            1,
+            EndpointRole::ReadOnly,
+            Some("a-formerly-fastest".into()),
+        )
+        .await
+        .unwrap();
+
+        // B: slower at the early full benchmark (an added delay), but
+        // healthy throughout, including at rewarm time.
+        let b_transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond("eth_blockNumber", json!("0x1"))
+            .delay("eth_blockNumber", Duration::from_millis(20))
+            .build();
+        let b = RpcClient::connect(
+            Box::new(b_transport),
+            1,
+            EndpointRole::ReadOnly,
+            Some("b-formerly-slower".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut pool = RpcPool::from_clients(1, vec![a, b]);
+        pool.benchmark_all(&BenchmarkConfig {
+            sample_count: FULL_BENCHMARK_SAMPLES,
+            sample_delay: Duration::ZERO,
+        })
+        .await;
+
+        // Confirm the early ranking really did prefer A -- otherwise this
+        // test would trivially pass for the wrong reason.
+        assert_eq!(
+            pool.preferred_read().unwrap().label(),
+            Some("a-formerly-fastest"),
+            "sanity check: the early benchmark must have actually ranked A first"
+        );
+
+        // T0 approaches: the near-T0 rewarm is the only thing that runs
+        // again before dispatch, and A now fails every call.
+        pool.rewarm_all().await;
+
+        let selected = pool.preferred_read();
+        assert_eq!(
+            selected.map(|c| c.label()),
+            Some(Some("b-formerly-slower")),
+            "a dead endpoint must never be selected merely because it was ranked fastest \
+             at an earlier point in time; the currently-healthy endpoint must be chosen"
+        );
+    }
 }

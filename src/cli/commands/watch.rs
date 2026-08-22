@@ -301,6 +301,19 @@ async fn run_single_target(
     // -- A rejected -> B rejected -> A reselected is structurally
     // impossible. Bounded (not unbounded) so a pathological resolver
     // loop can never spin forever.
+    //
+    // Pool lifecycle across a re-resolution: each loop iteration below is
+    // a genuinely distinct execution attempt (a different stage was just
+    // conclusively rejected), so `run_public_watch`/`run_opensea_watch`
+    // each connect and fully benchmark exactly one *new* `RpcPool` for
+    // that attempt -- this is intentional, not a mid-wait reconnect. The
+    // "one pool stays alive across the wait" guarantee is scoped to a
+    // single attempt (a single call to `run_public_watch` or
+    // `run_opensea_watch`): within that call the pool is connected once,
+    // benchmarked once, and never reconnected before dispatch. It is
+    // never reused *across* attempts, since a new attempt targets a
+    // different stage and has no reason to trust the previous attempt's
+    // now-irrelevant ranking data.
     const MAX_RESOLUTION_ATTEMPTS: u32 = 4;
     let mut excluded_stage_ids: Vec<crate::domain::stage::StageId> = Vec::new();
     let mut last_err = None;
@@ -1028,6 +1041,24 @@ mod ineligibility_classification_tests {
         )));
         assert!(!is_clear_ineligibility_rejection(&KairoxError::Session(
             SessionError::new("some other session failure")
+        )));
+    }
+
+    /// Round 6 item 3E: a benchmark/rewarm-driven infrastructure failure
+    /// (every read-capable endpoint unhealthy -- exactly what
+    /// `run_live_mint` returns as `NoVerifiedReadRpc` when
+    /// `pool.preferred_read()` comes back `None`) must never be treated
+    /// as wallet ineligibility. If it were, a transient run of dead RPC
+    /// endpoints would permanently exclude a perfectly eligible stage --
+    /// endpoint health and protocol/wallet eligibility are deliberately
+    /// unrelated error classes.
+    #[test]
+    fn a_no_healthy_read_endpoint_infrastructure_failure_is_never_treated_as_ineligibility() {
+        assert!(!is_clear_ineligibility_rejection(&KairoxError::Session(
+            SessionError::with_kind(
+                SessionErrorKind::NoVerifiedReadRpc,
+                "no healthy, chain-verified read-capable RPC endpoint available",
+            )
         )));
     }
 }
