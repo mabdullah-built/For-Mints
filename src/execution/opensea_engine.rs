@@ -71,6 +71,10 @@ pub struct OpenSeaMintRequest {
     pub skip_benchmark: bool,
     pub health: crate::chain::benchmark::HealthPolicy,
     pub prewarm_lead: StdDuration,
+    /// See [`super::live::LiveMintConfig::rehearsal`] -- identical
+    /// rationale and effect. Threaded straight through to
+    /// [`finalize_and_broadcast_opensea_wallet`]'s own short-circuit.
+    pub rehearsal: bool,
 }
 
 /// Progress events emitted during [`run_opensea_mint`]. Mirrors
@@ -226,6 +230,7 @@ pub async fn run_opensea_mint(
         expected_price_per_token,
         receipt_poll_interval: request.receipt_poll_interval,
         receipt_timeout: request.receipt_timeout,
+        rehearsal: request.rehearsal,
     };
     let wallet_outcome =
         run_opensea_mint_for_wallet(opensea, read_client, &send_clients, signer, &params, |p| {
@@ -274,6 +279,11 @@ pub struct OpenSeaWalletMintParams<'a> {
     pub expected_price_per_token: Option<U256>,
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
+    /// See [`super::live::LiveMintConfig::rehearsal`] -- identical
+    /// rationale and effect: everything up to and including local
+    /// signing/serialization runs exactly as it would for a real send;
+    /// only the final `eth_sendRawTransaction` dispatch is skipped.
+    pub rehearsal: bool,
 }
 
 /// The outcome of one wallet's independent OpenSea critical path — the
@@ -537,6 +547,7 @@ pub struct BroadcastTargets<'a> {
     pub limiter: Option<&'a super::broadcast::BroadcastLimiter>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn finalize_and_broadcast_opensea_wallet(
     signer: &dyn Signer,
     targets: BroadcastTargets<'_>,
@@ -544,6 +555,7 @@ pub async fn finalize_and_broadcast_opensea_wallet(
     plan: PreparedOpenSeaUnsignedWallet,
     receipt_poll: ReceiptPollConfig,
     api_to_dispatch_sw: &Stopwatch,
+    rehearsal: bool,
     mut on_progress: impl FnMut(OpenSeaProgress),
 ) -> Result<OpenSeaWalletMintOutcome, KairoxError> {
     let mut metrics = plan.metrics;
@@ -590,6 +602,23 @@ pub async fn finalize_and_broadcast_opensea_wallet(
         broadcast_prepare_ms,
         prepared_at: OffsetDateTime::now_utc(),
     };
+
+    // REHEARSAL: everything above this line -- benchmarking, drop-details
+    // polling/prewarm, the real OpenSea authorization request, its full
+    // local validation, on-chain simulation, and real local
+    // signing/serialization -- already happened exactly as it would for a
+    // real send. Stop here, before touching a single network send
+    // endpoint. `eth_sendRawTransaction` is never called on this path.
+    // Mirrors `execution::live::run_live_mint`'s identical short-circuit.
+    if rehearsal {
+        return Ok(OpenSeaWalletMintOutcome {
+            prepared,
+            broadcast_results: Vec::new(),
+            broadcast_summary: BroadcastSummary::NotSent,
+            receipt_state: None,
+            metrics,
+        });
+    }
 
     // DISPATCH — this wallet's identical raw bytes fanned out to every
     // selected send-capable endpoint. Different wallets naturally have
@@ -690,6 +719,7 @@ pub async fn run_opensea_mint_for_wallet(
             timeout: params.receipt_timeout,
         },
         &api_to_dispatch_sw,
+        params.rehearsal,
         &mut on_progress,
     )
     .await
@@ -858,6 +888,7 @@ mod tests {
             skip_benchmark: false,
             health: crate::chain::benchmark::HealthPolicy::default(),
             prewarm_lead: StdDuration::ZERO,
+            rehearsal: false,
         }
     }
 
@@ -967,6 +998,7 @@ mod tests {
             expected_price_per_token: None,
             receipt_poll_interval: StdDuration::from_millis(5),
             receipt_timeout: StdDuration::from_millis(200),
+            rehearsal: false,
         };
 
         let started = std::time::Instant::now();

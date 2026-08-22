@@ -352,14 +352,7 @@ async fn run_send(
 ) -> Result<(), KairoxError> {
     match select_engine(&args, config_path).await? {
         SelectedEngine::Public => run_send_public(args, config_path).await,
-        SelectedEngine::OpenSea { slug } => {
-            if args.rehearsal {
-                return Err(KairoxError::Session(SessionError::new(
-                    "--rehearsal is only supported with the PUBLIC engine today; pass --engine public",
-                )));
-            }
-            run_send_opensea(args, slug, config_path).await
-        }
+        SelectedEngine::OpenSea { slug } => run_send_opensea(args, slug, config_path).await,
         SelectedEngine::Generic { target } => {
             if args.rehearsal {
                 return Err(KairoxError::Session(SessionError::new(
@@ -829,7 +822,11 @@ async fn run_send_opensea(
     eprintln!("selected engine: OPENSEA (official OpenSea Drops API)");
     eprintln!("session_id: {session_id}");
     eprintln!("=================================================");
-    eprintln!(" LIVE SEND CONFIRMATION");
+    if args.rehearsal {
+        eprintln!(" REHEARSAL CONFIRMATION (no transaction will be broadcast)");
+    } else {
+        eprintln!(" LIVE SEND CONFIRMATION");
+    }
     eprintln!("=================================================");
     eprintln!(
         "chain:                {} (chain id {})",
@@ -848,7 +845,14 @@ async fn run_send_opensea(
     eprintln!("=================================================");
 
     if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
-        eprintln!("Aborted: live-send confirmation not received. Nothing was broadcast.");
+        eprintln!(
+            "Aborted: {} confirmation not received. Nothing was broadcast.",
+            if args.rehearsal {
+                "rehearsal"
+            } else {
+                "live-send"
+            }
+        );
         if json || output.is_some() {
             let report = crate::cli::report::build_session_report(
                 session_id,
@@ -925,6 +929,7 @@ async fn run_send_opensea(
         skip_benchmark: false,
         health: profile.health_policy,
         prewarm_lead: std_duration_from_time(profile.prewarm_lead),
+        rehearsal: args.rehearsal,
     };
 
     let outcome = run_opensea_mint(&opensea, &mut pool, &signer, &request, |progress| {

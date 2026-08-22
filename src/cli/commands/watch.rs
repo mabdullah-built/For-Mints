@@ -967,6 +967,9 @@ async fn run_opensea_watch(
         skip_benchmark: true,
         health: profile.health_policy,
         prewarm_lead: profile.prewarm_lead.try_into().unwrap_or(StdDuration::ZERO),
+        // `watch` has no rehearsal mode of its own -- it is always a real,
+        // unattended --auto-send flow.
+        rehearsal: false,
     };
 
     let outcome = run_opensea_mint(&opensea, &mut pool, signer, &request, |progress| {

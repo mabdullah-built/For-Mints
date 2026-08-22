@@ -557,6 +557,99 @@ fn public_single_wallet_rehearsal_prepares_and_signs_but_never_broadcasts() {
     assert!(received.iter().any(|(m, _)| m == "eth_estimateGas"));
 }
 
+// ---------------------------------------------------------------------
+// Round 6 item 14: the OpenSea engine's own local no-broadcast rehearsal
+// (mirrors the PUBLIC engine's --rehearsal above, which already existed).
+// Real drop-details polling, real EIP-712 signed-mint validation, real
+// on-chain simulation, and real local signing/serialization all run
+// exactly as they would for a real send; only eth_sendRawTransaction
+// (and the receipt poll that would follow it) never happens.
+// ---------------------------------------------------------------------
+#[test]
+fn opensea_signed_mint_rehearsal_prepares_and_signs_but_never_broadcasts() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-opensea-rehearsal";
+    const SIGNER_SEED: &str = "kairox-e2e-rehearsal-authorized-signer";
+
+    let server = spawn_combined_rpc_and_opensea_server(
+        move |method, params| match method {
+            "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+                code: -32000,
+                message: format!(
+                    "unexpected method in rehearsal scenario (must never broadcast or poll a \
+                     receipt): {method}"
+                ),
+            },
+            _ => opensea_read_response(
+                method,
+                params,
+                None,
+                Some(permissive_signed_mint_validation_params()),
+                Some(true),
+            )
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected RPC method in opensea rehearsal scenario: {method}"),
+            }),
+        },
+        move || {
+            rpc_ok_status(signed_mint_response_json(
+                wallet,
+                sample_mint_params_abi(true),
+                SIGNER_SEED,
+                U256::from(1u64),
+            ))
+        },
+        SLUG,
+    );
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--rehearsal",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"))
+        .stdout(predicates::str::contains("tx hash: 0x"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "rehearsal must never call eth_sendRawTransaction"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|(m, _)| m == "eth_getTransactionReceipt"),
+        "rehearsal must never poll for a receipt -- nothing was broadcast to have one"
+    );
+    // The real pipeline (OpenSea drop details, the real signed-mint
+    // authorization request, on-chain simulation) genuinely ran -- proves
+    // this is not a stub.
+    assert!(
+        received
+            .iter()
+            .any(|(m, _)| *m == format!("/api/v2/drops/{SLUG}/mint"))
+    );
+    assert!(received.iter().any(|(m, _)| m == "eth_estimateGas"));
+}
+
 #[test]
 fn public_single_wallet_rehearsal_and_send_are_mutually_exclusive_cli_flags() {
     kairox_bin()

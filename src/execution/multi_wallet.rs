@@ -931,6 +931,9 @@ pub async fn run_multi_wallet_opensea_mint(
                 expected_price_per_token,
                 receipt_poll_interval: config.receipt_poll_interval,
                 receipt_timeout: config.receipt_timeout,
+                // Multi-wallet sessions have no rehearsal mode of their
+                // own this pass -- always a real send.
+                rehearsal: false,
             };
             let outcome = prepare_opensea_wallet_unsigned(
                 opensea,
@@ -1022,6 +1025,9 @@ pub async fn run_multi_wallet_opensea_mint(
                             timeout: config.receipt_timeout,
                         },
                         &api_to_dispatch_sw,
+                        // Multi-wallet sessions have no rehearsal mode of
+                        // their own this pass -- always a real send here.
+                        false,
                         |p| on_progress_noop_opensea(request.address, p),
                     )
                     .await;
