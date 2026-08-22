@@ -1,9 +1,22 @@
 //! Independent, on-chain-only contract fingerprinting: ERC-165
-//! `supportsInterface`, and EIP-1967 proxy implementation resolution.
-//! Deliberately does not depend on any external explorer/ABI API -- see
-//! `docs/generic-engine.md` for why that integration is out of scope this
-//! pass. Every fact here is read directly from the chain and independently
-//! checkable; nothing is inferred from a function *name*.
+//! `supportsInterface`, EIP-1967 storage-slot proxy implementation
+//! resolution, and EIP-1167 minimal-proxy ("clone") implementation
+//! resolution. Deliberately does not depend on any external explorer/ABI
+//! API -- see `docs/generic-engine.md` for why that integration is out of
+//! scope this pass. Every fact here is read directly from the chain and
+//! independently checkable; nothing is inferred from a function *name*.
+//!
+//! **Why both proxy patterns matter**: EIP-1967 (a storage slot holding
+//! the implementation address) and EIP-1167 (a fixed ~45-byte runtime
+//! bytecode template with the implementation address embedded *in the
+//! bytecode itself*, not storage) are genuinely different mechanisms --
+//! resolving only one silently misses contracts using the other. This is
+//! not a hypothetical: thirdweb's own factory-clone deployment pattern
+//! (`TWFactory`) uses EIP-1167 clones specifically, not EIP-1967 -- an
+//! earlier version of `execution::thirdweb_engine`'s provenance check
+//! assumed the existing (EIP-1967-only) generic-engine resolver would be
+//! sufficient and was corrected after verifying thirdweb's actual
+//! deployment mechanism.
 
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::{SolCall, sol};
@@ -89,6 +102,33 @@ pub async fn eip1967_implementation(
     }
 }
 
+/// EIP-1167 minimal-proxy ("clone") runtime bytecode is a fixed,
+/// standardized 45-byte template with the implementation address
+/// embedded directly in the bytecode (not storage):
+/// `363d3d373d3d3d363d73<20-byte-address>5af43d82803e903d91602b57fd5bf3`.
+/// Pure and local -- given a contract's already-fetched runtime bytecode,
+/// returns the embedded implementation address if (and only if) it
+/// matches this exact template byte-for-byte outside the address itself.
+/// A contract using a different/nonstandard proxy pattern, or no proxy
+/// at all, returns `None` -- never an error, matching
+/// [`eip1967_implementation`]'s identical philosophy.
+pub fn eip1167_clone_implementation(runtime_bytecode: &[u8]) -> Option<Address> {
+    const PREFIX: [u8; 10] = [0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73];
+    const SUFFIX: [u8; 15] = [
+        0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2b, 0x57, 0xfd, 0x5b, 0xf3,
+    ];
+    if runtime_bytecode.len() != 45 {
+        return None;
+    }
+    if runtime_bytecode[..10] != PREFIX {
+        return None;
+    }
+    if runtime_bytecode[30..45] != SUFFIX {
+        return None;
+    }
+    Some(Address::from_slice(&runtime_bytecode[10..30]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +138,57 @@ mod tests {
         let calldata = encode_supports_interface(ERC721_INTERFACE_ID);
         assert_eq!(&calldata[0..4], supportsInterfaceCall::SELECTOR);
         assert_eq!(&calldata[4..8], &ERC721_INTERFACE_ID);
+    }
+
+    fn eip1167_bytecode_for(implementation: Address) -> Vec<u8> {
+        let mut bytecode = vec![0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73];
+        bytecode.extend_from_slice(implementation.as_slice());
+        bytecode.extend_from_slice(&[
+            0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2b, 0x57, 0xfd, 0x5b,
+            0xf3,
+        ]);
+        bytecode
+    }
+
+    #[test]
+    fn eip1167_clone_implementation_extracts_the_embedded_address() {
+        let implementation = Address::from_slice(&[0x11; 20]);
+        let bytecode = eip1167_bytecode_for(implementation);
+        assert_eq!(bytecode.len(), 45);
+        assert_eq!(
+            eip1167_clone_implementation(&bytecode),
+            Some(implementation)
+        );
+    }
+
+    #[test]
+    fn eip1167_clone_implementation_rejects_wrong_length() {
+        let mut bytecode = eip1167_bytecode_for(Address::from_slice(&[0x22; 20]));
+        bytecode.push(0x00);
+        assert_eq!(eip1167_clone_implementation(&bytecode), None);
+    }
+
+    #[test]
+    fn eip1167_clone_implementation_rejects_wrong_prefix() {
+        let mut bytecode = eip1167_bytecode_for(Address::from_slice(&[0x33; 20]));
+        bytecode[0] = 0xFF;
+        assert_eq!(eip1167_clone_implementation(&bytecode), None);
+    }
+
+    #[test]
+    fn eip1167_clone_implementation_rejects_wrong_suffix() {
+        let mut bytecode = eip1167_bytecode_for(Address::from_slice(&[0x44; 20]));
+        let last = bytecode.len() - 1;
+        bytecode[last] = 0x00;
+        assert_eq!(eip1167_clone_implementation(&bytecode), None);
+    }
+
+    #[test]
+    fn eip1167_clone_implementation_rejects_arbitrary_non_proxy_bytecode() {
+        // A real (if trivial) contract body, not a clone -- must never be
+        // mistaken for one merely by having the right length.
+        let bytecode = vec![0x60; 45];
+        assert_eq!(eip1167_clone_implementation(&bytecode), None);
     }
 
     #[test]

@@ -39,6 +39,157 @@ use crate::signing::transaction::UnsignedEip1559Tx;
 
 use super::errors::{KairoxError, SessionError, SessionErrorKind};
 use super::prepared::PreparedTransaction;
+use super::thirdweb_registry::{ThirdwebFlavor, ThirdwebTrustedFingerprint, find_fingerprint};
+
+/// Resolves the address whose runtime bytecode is the real target of
+/// trust: an EIP-1167 minimal-proxy ("clone") implementation if the
+/// target's own bytecode matches that exact template (thirdweb's actual
+/// factory-clone deployment pattern -- see
+/// `protocol::erc_standards`'s module doc comment for why this is
+/// checked, not just EIP-1967), otherwise an EIP-1967 storage-slot proxy
+/// implementation (defensive, in case of a future/nonstandard
+/// upgradeable deployment), otherwise the target's own address (not a
+/// recognized proxy pattern at all). Returns the resolved address and
+/// `keccak256` of its runtime bytecode.
+async fn resolve_thirdweb_implementation_and_code_hash(
+    client: &RpcClient,
+    target: Address,
+) -> Result<(Address, B256), KairoxError> {
+    let code = client.get_code(target).await?;
+    if let Some(implementation) =
+        crate::protocol::erc_standards::eip1167_clone_implementation(&code)
+    {
+        let implementation_code = client.get_code(implementation).await?;
+        return Ok((implementation, keccak256(&implementation_code)));
+    }
+    if let Some(implementation) =
+        crate::protocol::erc_standards::eip1967_implementation(client, target).await?
+    {
+        let implementation_code = client.get_code(implementation).await?;
+        return Ok((implementation, keccak256(&implementation_code)));
+    }
+    Ok((target, keccak256(&code)))
+}
+
+/// The **only** route to authorizing a real (non-dry-run) thirdweb live
+/// send -- see `execution::thirdweb_registry`'s module doc comment for
+/// the full rationale. Selector compatibility and a successful
+/// `eth_call` are never sufficient: a custom contract can inherit a
+/// thirdweb Drop base extension and override its execution-affecting
+/// hooks (`_beforeClaim`, `_afterClaim`, `_collectPriceOnClaim`,
+/// `_transferTokensOnClaim`, `_dropMsgSender`), and Kairox cannot
+/// independently verify those overrides do nothing unexpected. Resolves
+/// the real implementation (proxy-aware), hashes its runtime bytecode,
+/// and requires an exact match against `registry` -- with the registry
+/// entry itself declaring which ABI flavor that verified bytecode
+/// implements (never inferred separately by selector-probing for the
+/// live-send path). No match -- including the default, empty
+/// `thirdweb_registry::BUILTIN_REGISTRY` -- means no live send is
+/// authorized, full stop; this function returns an error, not a guess.
+pub async fn establish_provenance(
+    client: &RpcClient,
+    chain_id: crate::chain::registry::ChainId,
+    drop_contract: Address,
+    registry: &[ThirdwebTrustedFingerprint],
+) -> Result<ThirdwebTrustedFingerprint, KairoxError> {
+    let (_implementation, bytecode_hash) =
+        resolve_thirdweb_implementation_and_code_hash(client, drop_contract).await?;
+    find_fingerprint(registry, chain_id, bytecode_hash).ok_or_else(|| {
+        KairoxError::Session(SessionError::new(format!(
+            "no trusted implementation fingerprint found for this contract on chain {chain_id} \
+             (resolved implementation bytecode hash {bytecode_hash:#x}); refusing to authorize a \
+             live send against unverified thirdweb execution semantics. Selector compatibility \
+             and a successful read are not proof this contract's claim logic is unmodified \
+             vanilla thirdweb code -- see execution::thirdweb_registry."
+        )))
+    })
+}
+
+/// Best-effort flavor detection by selector-probing -- used **only** for
+/// read-only dry-run reporting, never to authorize a live send (see
+/// [`establish_provenance`] for that). Tries the multi-phase ERC-721
+/// getter first, then the single-phase getter; a genuine decode failure
+/// or revert from either is treated as "not this flavor" (mirroring
+/// `resolver_adapters::discover_public_stage`'s identical philosophy for
+/// SeaDrop), not propagated as an error, so an unrelated or unsupported
+/// (e.g. ERC-1155) contract cleanly falls through to `None` rather than
+/// aborting.
+pub async fn probe_flavor(
+    client: &RpcClient,
+    drop_contract: Address,
+) -> Option<(ThirdwebFlavor, ClaimCondition)> {
+    if let Ok(condition_id) =
+        crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, drop_contract).await
+        && let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+            client,
+            drop_contract,
+            condition_id,
+        )
+        .await
+    {
+        return Some((ThirdwebFlavor::DropMultiPhase721, condition));
+    }
+    if let Ok(condition) =
+        crate::cli::gather::fetch_thirdweb_claim_condition_single_phase(client, drop_contract).await
+    {
+        return Some((ThirdwebFlavor::DropSinglePhase721, condition));
+    }
+    None
+}
+
+/// Flavor-aware read of the active claim condition and this wallet's
+/// already-claimed count, dispatching to the correct pair of getters for
+/// `flavor` -- never assumes one flavor's getter shape works for the
+/// other (see `protocol::thirdweb`'s module doc comment).
+async fn fetch_condition_and_wallet_claimed(
+    client: &RpcClient,
+    drop_contract: Address,
+    wallet: Address,
+    flavor: ThirdwebFlavor,
+) -> Result<(ClaimCondition, U256), KairoxError> {
+    match flavor {
+        ThirdwebFlavor::DropMultiPhase721 => {
+            let condition_id =
+                crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, drop_contract)
+                    .await
+                    .map_err(|_| {
+                        KairoxError::Session(SessionError::new(
+                    "thirdweb Drop contract reports no active claim condition; nothing to mint \
+                     right now"
+                        .to_string(),
+                ))
+                    })?;
+            let (condition, wallet_claimed) = tokio::try_join!(
+                crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+                    client,
+                    drop_contract,
+                    condition_id
+                ),
+                crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet(
+                    client,
+                    drop_contract,
+                    condition_id,
+                    wallet,
+                ),
+            )?;
+            Ok((condition, wallet_claimed))
+        }
+        ThirdwebFlavor::DropSinglePhase721 => {
+            let (condition, wallet_claimed) = tokio::try_join!(
+                crate::cli::gather::fetch_thirdweb_claim_condition_single_phase(
+                    client,
+                    drop_contract
+                ),
+                crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet_single_phase(
+                    client,
+                    drop_contract,
+                    wallet,
+                ),
+            )?;
+            Ok((condition, wallet_claimed))
+        }
+    }
+}
 
 /// The sentinel the real contract itself uses to mean "do not override
 /// the claim condition's own price/currency" -- verified directly
@@ -211,10 +362,17 @@ fn exact_u64(v: U256) -> Result<u64, KairoxError> {
 /// required input. Mirrors [`super::prepared::prepare_live_transaction`]'s
 /// contract exactly (same required-fresh-reads philosophy), specialized
 /// to the thirdweb Drop interface.
+///
+/// `registry` is the trusted-fingerprint registry [`establish_provenance`]
+/// is checked against -- callers pass `thirdweb_registry::BUILTIN_REGISTRY`
+/// in production (empty by design; see that module's doc comment) and an
+/// injected test registry in tests, exactly mirroring
+/// `GenericVerifiedContractAdapter`'s identical pattern.
 pub async fn prepare_thirdweb_transaction(
     client: &RpcClient,
     signer: &dyn Signer,
     request: &ThirdwebMintRequest,
+    registry: &[ThirdwebTrustedFingerprint],
 ) -> Result<PreparedTransaction, KairoxError> {
     if signer.address() != request.wallet {
         return Err(KairoxError::Session(SessionError::with_kind(
@@ -227,37 +385,27 @@ pub async fn prepare_thirdweb_transaction(
         )));
     }
 
-    // The active claim-condition id is a genuine data dependency for
-    // every other read below (the condition itself, and this wallet's
-    // per-condition claimed count) -- fetched first, on its own. A
-    // revert here (Drop.sol's `DropNoActiveCondition`) means exactly
-    // what it says: nothing is claimable right now.
-    let condition_id =
-        crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, request.drop_contract)
-            .await
-            .map_err(|_| {
-                KairoxError::Session(SessionError::new(
-                    "thirdweb Drop contract reports no active claim condition; nothing to mint \
-                     right now"
-                        .to_string(),
-                ))
-            })?;
+    // PROVENANCE: the only route to authorizing a live send -- see
+    // `establish_provenance`'s doc comment. Determines the flavor
+    // authoritatively from the matched registry entry, never from
+    // separate selector-probing (which is best-effort and reserved for
+    // dry-run reporting only, see `probe_flavor`).
+    let fingerprint = establish_provenance(
+        client,
+        request.chain.chain_id,
+        request.drop_contract,
+        registry,
+    )
+    .await?;
+    let flavor = fingerprint.flavor;
 
-    // Independent reads with no data dependency on each other -- issued
-    // concurrently, same rationale as the SeaDrop/OpenSea engines' own
-    // identical optimization.
-    let (condition, wallet_claimed, block, max_priority_fee_per_gas, nonce, balance) = tokio::try_join!(
-        crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
-            client,
-            request.drop_contract,
-            condition_id
-        ),
-        crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet(
-            client,
-            request.drop_contract,
-            condition_id,
-            request.wallet,
-        ),
+    // Flavor-aware reads (the active claim condition and this wallet's
+    // already-claimed count) alongside every other independent read with
+    // no data dependency on the others -- issued concurrently, same
+    // rationale as the SeaDrop/OpenSea engines' own identical
+    // optimization.
+    let (condition_and_claimed, block, max_priority_fee_per_gas, nonce, balance) = tokio::try_join!(
+        fetch_condition_and_wallet_claimed(client, request.drop_contract, request.wallet, flavor),
         async { client.latest_block().await.map_err(KairoxError::from) },
         async {
             client
@@ -278,6 +426,7 @@ pub async fn prepare_thirdweb_transaction(
                 .map_err(KairoxError::from)
         },
     )?;
+    let (condition, wallet_claimed) = condition_and_claimed;
 
     let resolved =
         resolve_effective_claim(request.wallet, &condition, request.allowlist_proof.as_ref())?;
@@ -353,6 +502,28 @@ pub async fn prepare_thirdweb_transaction(
         )));
     }
 
+    // IMMEDIATELY-BEFORE-SIGNING RE-CHECK: everything above this point
+    // took real time (several RPC round trips) since provenance was
+    // established. A proxy that legitimately matched the trusted
+    // registry at that point may have since been upgraded to a different
+    // implementation -- signing against stale evidence would execute
+    // code nobody verified. Mirrors
+    // `generic_engine::prepare_generic_transaction`'s identical re-check,
+    // placed at the identical point (immediately before constructing the
+    // unsigned transaction).
+    let (_implementation, current_hash) =
+        resolve_thirdweb_implementation_and_code_hash(client, request.drop_contract).await?;
+    if current_hash != fingerprint.implementation_bytecode_hash {
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::ProxyImplementationChanged,
+            format!(
+                "implementation bytecode hash changed since provenance was established \
+                 (expected {}, now {current_hash}); refusing to sign against stale evidence",
+                fingerprint.implementation_bytecode_hash
+            ),
+        )));
+    }
+
     let unsigned = UnsignedEip1559Tx {
         chain_id: request.chain.chain_id,
         nonce,
@@ -417,10 +588,12 @@ pub struct ThirdwebMintOutcome {
 /// ideally warmed) by the caller -- this function does no benchmarking
 /// or rewarming of its own, matching this module's documented "no
 /// elaborate scheduler yet" scope.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_thirdweb_mint(
     pool: &crate::chain::pool::RpcPool,
     signer: &dyn Signer,
     request: &ThirdwebMintRequest,
+    registry: &[ThirdwebTrustedFingerprint],
     health: &crate::chain::benchmark::HealthPolicy,
     receipt_poll_interval: std::time::Duration,
     receipt_timeout: std::time::Duration,
@@ -443,7 +616,7 @@ pub async fn run_thirdweb_mint(
         )));
     }
 
-    let prepared = prepare_thirdweb_transaction(read_client, signer, request).await?;
+    let prepared = prepare_thirdweb_transaction(read_client, signer, request, registry).await?;
 
     // REHEARSAL: everything above (fresh state, validation, real local
     // signing/serialization) already happened exactly as it would for a
@@ -749,12 +922,61 @@ mod tests {
                 )
                 .respond("eth_maxPriorityFeePerGas", json!(opts.priority_fee_hex))
                 .respond("eth_getTransactionCount", json!(opts.nonce_hex))
-                .respond("eth_getBalance", json!(opts.balance_hex));
+                .respond("eth_getBalance", json!(opts.balance_hex))
+                // Provenance: not an EIP-1167 clone (bytecode is not 45
+                // bytes / not the exact template) and not an EIP-1967
+                // proxy (storage slot reads back all-zero) -- so
+                // `resolve_thirdweb_implementation_and_code_hash` falls
+                // through to hashing `DROP`'s own mocked bytecode
+                // directly, exactly as it would for a non-proxy
+                // deployment.
+                .respond(
+                    "eth_getCode",
+                    json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+                )
+                .respond(
+                    "eth_getStorageAt",
+                    json!(format!("0x{}", hex::encode([0u8; 32]))),
+                );
 
             match opts.estimate_gas {
                 Ok(hex_value) => builder.respond("eth_estimateGas", json!(hex_value)),
                 Err((code, message)) => builder.error("eth_estimateGas", code, message),
             }
+        }
+
+        /// Deliberately not 45 bytes (so it can never accidentally match
+        /// the EIP-1167 clone template) and otherwise arbitrary --
+        /// `establish_provenance` hashes this directly (no proxy
+        /// detected) and `trusted_fingerprint()` below is the matching
+        /// registry entry for exactly this hash.
+        pub(super) fn mock_implementation_bytecode() -> Vec<u8> {
+            vec![
+                0x60, 0x80, 0x60, 0x40, 0x52, 0x34, 0x80, 0x15, 0x61, 0x00, 0x10,
+            ]
+        }
+
+        /// A trusted-fingerprint entry matching `mock_implementation_bytecode()`'s
+        /// hash on chain 1 -- injected by tests that need to get past
+        /// `establish_provenance` to exercise what happens afterward
+        /// (mirrors `GenericVerifiedContractAdapter`'s tests injecting
+        /// their own registry entries rather than needing
+        /// `BUILTIN_REGISTRY` to ship non-empty).
+        pub(super) fn trusted_fingerprint(
+            flavor: crate::execution::thirdweb_registry::ThirdwebFlavor,
+        ) -> ThirdwebTrustedFingerprint {
+            ThirdwebTrustedFingerprint {
+                name: "test-fixture",
+                chain_id: 1,
+                implementation_bytecode_hash: keccak256(mock_implementation_bytecode()),
+                flavor,
+            }
+        }
+
+        pub(super) fn test_registry() -> Vec<ThirdwebTrustedFingerprint> {
+            vec![trusted_fingerprint(
+                crate::execution::thirdweb_registry::ThirdwebFlavor::DropMultiPhase721,
+            )]
         }
 
         async fn connect(opts: MockOpts) -> RpcClient {
@@ -785,9 +1007,10 @@ mod tests {
             let s = signer();
             let wallet = s.address();
             let client = connect(MockOpts::default()).await;
-            let prepared = prepare_thirdweb_transaction(&client, &s, &request(wallet))
-                .await
-                .unwrap();
+            let prepared =
+                prepare_thirdweb_transaction(&client, &s, &request(wallet), &test_registry())
+                    .await
+                    .unwrap();
             assert_eq!(prepared.target, DROP);
             assert_eq!(
                 prepared.value,
@@ -801,7 +1024,11 @@ mod tests {
             let s = signer();
             let wrong_wallet = address!("9999999999999999999999999999999999999999");
             let client = connect(MockOpts::default()).await;
-            let err = prepare_thirdweb_transaction(&client, &s, &request(wrong_wallet))
+            // Empty registry deliberately -- the wallet-key check happens
+            // before provenance is ever established, so this must fail
+            // for the wallet-mismatch reason specifically, not because no
+            // fingerprint was found.
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wrong_wallet), &[])
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -823,7 +1050,7 @@ mod tests {
                 ..MockOpts::default()
             };
             let client = connect(opts).await;
-            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet))
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet), &test_registry())
                 .await
                 .unwrap_err();
             assert!(matches!(err, KairoxError::Supply(_)));
@@ -839,7 +1066,7 @@ mod tests {
                 ..MockOpts::default()
             };
             let client = connect(opts).await;
-            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet))
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet), &test_registry())
                 .await
                 .unwrap_err();
             assert!(matches!(err, KairoxError::Supply(_)));
@@ -854,7 +1081,7 @@ mod tests {
                 ..MockOpts::default()
             };
             let client = connect(opts).await;
-            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet))
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet), &test_registry())
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -872,6 +1099,18 @@ mod tests {
             let wallet = s.address();
             let transport = MockTransport::builder()
                 .respond("eth_chainId", json!("0x1"))
+                // Provenance is established first (falls through to
+                // hashing DROP's own mocked bytecode, matched by
+                // test_registry()) -- only *then* does the flavor-aware
+                // read hit the mocked eth_call failure.
+                .respond(
+                    "eth_getCode",
+                    json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+                )
+                .respond(
+                    "eth_getStorageAt",
+                    json!(format!("0x{}", hex::encode([0u8; 32]))),
+                )
                 .error(
                     "eth_call",
                     -32000,
@@ -881,7 +1120,7 @@ mod tests {
             let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
                 .await
                 .unwrap();
-            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet))
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet), &test_registry())
                 .await
                 .unwrap_err();
             let message = err.to_string();
@@ -889,6 +1128,175 @@ mod tests {
                 message.contains("no active claim condition"),
                 "expected a clear no-active-condition message, got: {message}"
             );
+        }
+
+        #[tokio::test]
+        async fn no_trusted_fingerprint_refuses_to_authorize_a_live_send() {
+            // The core regression this correction pass exists for:
+            // selector compatibility and a successful eth_call must never
+            // be enough to authorize signing. An empty registry (the
+            // real BUILTIN_REGISTRY's default state) must refuse, even
+            // though every read the mock provides would otherwise
+            // "succeed".
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet), &[])
+                .await
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("no trusted implementation fingerprint"),
+                "expected a clear provenance-not-established message, got: {message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn wrong_flavor_fingerprint_does_not_authorize_a_different_flavor() {
+            // A registry entry for the single-phase flavor must not
+            // authorize a contract that only responds to the multi-phase
+            // getters (or vice versa) -- the flavor comes from the
+            // matched fingerprint itself, never re-derived by probing.
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let wrong_flavor_registry = vec![trusted_fingerprint(
+                crate::execution::thirdweb_registry::ThirdwebFlavor::DropSinglePhase721,
+            )];
+            let err =
+                prepare_thirdweb_transaction(&client, &s, &request(wallet), &wrong_flavor_registry)
+                    .await
+                    .unwrap_err();
+            // The mock only serves multi-phase selectors; routed through
+            // the single-phase getters (claimCondition(), no args) it
+            // must fail rather than silently decode unrelated data.
+            assert!(!matches!(err, KairoxError::Supply(_)));
+        }
+
+        #[tokio::test]
+        async fn implementation_changing_after_provenance_is_established_is_rejected_before_signing()
+         {
+            // Simulates the exact race establish_provenance's re-check
+            // exists to close: the implementation matched the trusted
+            // registry when provenance was first established, but has
+            // since changed by the time signing is about to happen.
+            // eth_getCode is called twice for the same address
+            // (establish_provenance, then the immediately-before-signing
+            // re-check) -- the first call returns the trusted bytecode,
+            // every call after returns different bytecode.
+            let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let trusted_bytecode = mock_implementation_bytecode();
+            let changed_bytecode: Vec<u8> = vec![0x11, 0x22, 0x33];
+
+            let mut transport = build_transport_builder(MockOpts::default());
+            transport = transport.respond_dynamic("eth_getCode", move |_params| {
+                let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bytecode = if n == 0 {
+                    &trusted_bytecode
+                } else {
+                    &changed_bytecode
+                };
+                serde_json::json!(format!("0x{}", hex::encode(bytecode)))
+            });
+            let client = RpcClient::connect(
+                Box::new(transport.build()),
+                1,
+                EndpointRole::ReadWrite,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let s = signer();
+            let wallet = s.address();
+            let err = prepare_thirdweb_transaction(&client, &s, &request(wallet), &test_registry())
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                KairoxError::Session(SessionError {
+                    kind: SessionErrorKind::ProxyImplementationChanged,
+                    ..
+                })
+            ));
+        }
+
+        #[tokio::test]
+        async fn single_phase_flavor_native_mint_prepares_and_signs_successfully() {
+            // Proves the single-phase getters (claimCondition(), no
+            // args; getSupplyClaimedByWallet(address), one arg) are
+            // genuinely exercised end-to-end, not merely encoded --
+            // using a mock that only serves the single-phase selectors
+            // (the multi-phase getActiveClaimConditionId() is
+            // deliberately left unmocked, so this test would fail if
+            // resolve_effective_claim's flavor dispatch ever called the
+            // wrong getter for this flavor).
+            let opts = MockOpts::default();
+            let condition_abi = ClaimConditionAbi {
+                startTimestamp: U256::from(1_700_000_000u64),
+                maxClaimableSupply: U256::from(opts.max_claimable_supply),
+                supplyClaimed: U256::from(opts.supply_claimed),
+                quantityLimitPerWallet: U256::from(opts.quantity_limit_per_wallet),
+                merkleRoot: B256::ZERO,
+                pricePerToken: U256::from(opts.price_per_token_wei),
+                currency: NATIVE_TOKEN,
+                metadata: String::new(),
+            };
+            let condition_hex = format!(
+                "0x{}",
+                hex::encode(thirdweb::claimConditionCall::abi_encode_returns(
+                    &condition_abi
+                ))
+            );
+            let wallet_claimed_hex = format!(
+                "0x{}",
+                hex::encode(
+                    thirdweb::single_phase::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &U256::from(opts.wallet_claimed)
+                    )
+                )
+            );
+            let transport = MockTransport::builder()
+                .respond("eth_chainId", json!("0x1"))
+                .respond_eth_call_selector(
+                    thirdweb::claimConditionCall::SELECTOR,
+                    json!(condition_hex),
+                )
+                .respond_eth_call_selector(
+                    thirdweb::single_phase::getSupplyClaimedByWalletCall::SELECTOR,
+                    json!(wallet_claimed_hex),
+                )
+                .respond(
+                    "eth_getBlockByNumber",
+                    json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": opts.base_fee_hex}),
+                )
+                .respond("eth_maxPriorityFeePerGas", json!(opts.priority_fee_hex))
+                .respond("eth_getTransactionCount", json!(opts.nonce_hex))
+                .respond("eth_getBalance", json!(opts.balance_hex))
+                .respond("eth_estimateGas", json!("0x2bf20"))
+                .respond(
+                    "eth_getCode",
+                    json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+                )
+                .respond(
+                    "eth_getStorageAt",
+                    json!(format!("0x{}", hex::encode([0u8; 32]))),
+                )
+                .build();
+            let client = RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+                .await
+                .unwrap();
+
+            let s = signer();
+            let wallet = s.address();
+            let registry = vec![trusted_fingerprint(
+                crate::execution::thirdweb_registry::ThirdwebFlavor::DropSinglePhase721,
+            )];
+            let prepared = prepare_thirdweb_transaction(&client, &s, &request(wallet), &registry)
+                .await
+                .unwrap();
+            assert_eq!(prepared.target, DROP);
+            assert_eq!(prepared.value, U256::from(10_000_000_000_000_000u128));
         }
     }
 
@@ -957,6 +1365,7 @@ mod tests {
                 &pool,
                 &s,
                 &request(wallet),
+                &test_registry(),
                 &HealthPolicy::default(),
                 std::time::Duration::from_millis(10),
                 std::time::Duration::from_secs(1),
@@ -981,6 +1390,7 @@ mod tests {
                 &pool,
                 &s,
                 &request(wallet),
+                &test_registry(),
                 &HealthPolicy::default(),
                 std::time::Duration::from_millis(10),
                 std::time::Duration::from_secs(2),

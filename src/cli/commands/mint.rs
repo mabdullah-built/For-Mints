@@ -330,44 +330,93 @@ async fn run_dry_run(
                 runtime.config.as_ref(),
             )
             .await?;
-            let condition_id = crate::cli::gather::fetch_thirdweb_active_claim_condition_id(
-                &client,
-                args.plan_args.collection,
-            )
-            .await?;
-            let condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
-                &client,
-                args.plan_args.collection,
-                condition_id,
-            )
-            .await?;
             println!("selected engine: THIRDWEB (thirdweb Drop ClaimCondition)");
             println!();
             println!("drop contract:            {}", args.plan_args.collection);
-            println!("active claim condition:   {condition_id}");
             println!(
-                "start:                    {} (unix {})",
-                format_unix(condition.start_timestamp),
-                condition.start_timestamp
+                "SUPPORTED flavors:        multi-phase ERC-721 (Drop.sol), single-phase ERC-721 (DropSinglePhase.sol)"
             );
             println!(
-                "price/token:              {} wei",
-                condition.price_per_token
+                "NOT YET SUPPORTED:        ERC-1155 (either phase model) -- calldata encoders exist but no execution path is wired"
             );
-            println!("currency:                 {}", condition.currency);
-            println!(
-                "native currency:          {}",
-                condition.is_native_currency()
-            );
-            println!("supply remaining:         {}", condition.supply_remaining());
-            println!(
-                "per-wallet limit:         {}",
-                condition.quantity_limit_per_wallet
-            );
-            println!(
-                "allowlist gated:          {}",
-                !condition.merkle_root.is_zero()
-            );
+
+            // Best-effort selector-probing -- read-only reporting ONLY,
+            // never authorizes a live send (see
+            // `execution::thirdweb_engine::probe_flavor`'s doc comment;
+            // that authorization comes exclusively from
+            // `establish_provenance`'s trusted-fingerprint match, checked
+            // separately below).
+            match crate::execution::thirdweb_engine::probe_flavor(
+                &client,
+                args.plan_args.collection,
+            )
+            .await
+            {
+                Some((flavor, condition)) => {
+                    let flavor_name = match flavor {
+                        crate::execution::thirdweb_registry::ThirdwebFlavor::DropMultiPhase721 => {
+                            "multi-phase ERC-721 (Drop.sol)"
+                        }
+                        crate::execution::thirdweb_registry::ThirdwebFlavor::DropSinglePhase721 => {
+                            "single-phase ERC-721 (DropSinglePhase.sol)"
+                        }
+                    };
+                    println!("detected flavor:          {flavor_name}");
+                    println!(
+                        "start:                    {} (unix {})",
+                        format_unix(condition.start_timestamp),
+                        condition.start_timestamp
+                    );
+                    println!(
+                        "price/token:              {} wei",
+                        condition.price_per_token
+                    );
+                    println!("currency:                 {}", condition.currency);
+                    println!(
+                        "native currency:          {}",
+                        condition.is_native_currency()
+                    );
+                    println!("supply remaining:         {}", condition.supply_remaining());
+                    println!(
+                        "per-wallet limit:         {}",
+                        condition.quantity_limit_per_wallet
+                    );
+                    println!(
+                        "allowlist gated:          {}",
+                        !condition.merkle_root.is_zero()
+                    );
+                }
+                None => {
+                    println!(
+                        "detected flavor:          none of the supported flavors responded \
+                         (this may be an ERC-1155 Drop, an unrelated contract, or a genuinely \
+                         custom deployment -- see execution::thirdweb_engine for the exact \
+                         selectors tried)"
+                    );
+                }
+            }
+
+            // Provenance -- whether --send/--rehearsal would actually be
+            // authorized right now. Reported for operator visibility
+            // only; a dry run never signs regardless of this outcome.
+            match crate::execution::thirdweb_engine::establish_provenance(
+                &client,
+                resolved.info.chain_id,
+                args.plan_args.collection,
+                crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+            )
+            .await
+            {
+                Ok(fingerprint) => println!(
+                    "live-send provenance:     VERIFIED ({}) -- --send/--rehearsal authorized",
+                    fingerprint.name
+                ),
+                Err(_) => println!(
+                    "live-send provenance:     NOT ESTABLISHED -- --send/--rehearsal will refuse \
+                     to sign until this implementation is manually reviewed and added to the \
+                     trusted registry"
+                ),
+            }
             println!("--- (nothing above this line reflects wallet-specific eligibility) ---");
         }
     }
@@ -879,17 +928,15 @@ async fn run_send_thirdweb(
             "no healthy, chain-verified read-capable RPC endpoint available",
         ))
     })?;
-    let preview_condition_id = crate::cli::gather::fetch_thirdweb_active_claim_condition_id(
-        preview_client,
-        args.plan_args.collection,
-    )
-    .await?;
-    let preview_condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
-        preview_client,
-        args.plan_args.collection,
-        preview_condition_id,
-    )
-    .await?;
+    // Best-effort, informational only -- see
+    // `execution::thirdweb_engine::probe_flavor`'s doc comment. The real
+    // actionability gate (`establish_provenance`'s trusted-fingerprint
+    // match) is enforced inside `run_thirdweb_mint` below regardless of
+    // what this preview shows.
+    let preview_condition =
+        crate::execution::thirdweb_engine::probe_flavor(preview_client, args.plan_args.collection)
+            .await
+            .map(|(_, condition)| condition);
 
     eprintln!("selected engine: THIRDWEB (thirdweb Drop ClaimCondition)");
     eprintln!("=================================================");
@@ -906,14 +953,20 @@ async fn run_send_thirdweb(
     eprintln!("wallet:                {}", wallet);
     eprintln!("drop contract:         {}", args.plan_args.collection);
     eprintln!("quantity:              {}", args.plan_args.quantity);
-    eprintln!(
-        "price/token:           {} wei",
-        preview_condition.price_per_token
-    );
-    eprintln!(
-        "allowlist gated:       {}",
-        !preview_condition.merkle_root.is_zero()
-    );
+    match &preview_condition {
+        Some(condition) => {
+            eprintln!("price/token:           {} wei", condition.price_per_token);
+            eprintln!(
+                "allowlist gated:       {}",
+                !condition.merkle_root.is_zero()
+            );
+        }
+        None => eprintln!(
+            "claim condition:       could not be detected via either supported flavor's getters \
+             (this may still succeed if provenance/flavor resolves differently inside the real \
+             prepare pipeline)"
+        ),
+    }
     eprintln!("send-capable endpoints:{}", pool.send_capable().len());
     eprintln!("=================================================");
 
@@ -961,6 +1014,7 @@ async fn run_send_thirdweb(
         &pool,
         &signer,
         &request,
+        crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
         &profile.health_policy,
         profile.receipt_poll_interval,
         profile.receipt_timeout,

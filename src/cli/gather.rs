@@ -94,6 +94,38 @@ pub async fn fetch_thirdweb_supply_claimed_by_wallet(
     Ok(thirdweb::decode_get_supply_claimed_by_wallet(&result)?)
 }
 
+/// Fetch `claimCondition()` from a **single-phase** thirdweb Drop
+/// contract (`DropSinglePhase.sol`) -- a no-argument public
+/// state-variable getter, genuinely different from
+/// `getClaimConditionById` (see `protocol::thirdweb`'s module doc
+/// comment for the full flavor distinction). Never call this against a
+/// multi-phase `Drop` contract and assume the result is meaningful --
+/// the selector is different, so it would simply fail to decode/revert
+/// against one.
+pub async fn fetch_thirdweb_claim_condition_single_phase(
+    client: &RpcClient,
+    drop_contract: Address,
+) -> Result<ClaimCondition, KairoxError> {
+    let calldata = thirdweb::encode_claim_condition_single_phase();
+    let result = client.eth_call(drop_contract, &calldata).await?;
+    Ok(thirdweb::decode_claim_condition_single_phase(&result)?)
+}
+
+/// Fetch the single-phase flavor's `getSupplyClaimedByWallet(address)`
+/// (one argument -- there is no claim-condition id in this flavor at
+/// all).
+pub async fn fetch_thirdweb_supply_claimed_by_wallet_single_phase(
+    client: &RpcClient,
+    drop_contract: Address,
+    claimer: Address,
+) -> Result<U256, KairoxError> {
+    let calldata = thirdweb::encode_get_supply_claimed_by_wallet_single_phase(claimer);
+    let result = client.eth_call(drop_contract, &calldata).await?;
+    Ok(thirdweb::decode_get_supply_claimed_by_wallet_single_phase(
+        &result,
+    )?)
+}
+
 /// Base fee plus block context, and (best-effort) a suggested priority fee.
 pub struct FeeHint {
     pub base_fee_per_gas: u128,

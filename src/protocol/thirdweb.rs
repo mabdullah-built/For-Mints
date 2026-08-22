@@ -1,11 +1,47 @@
-//! Independent local encoding/decoding of the thirdweb `Drop`/`DropSinglePhase`
-//! claim ABI (`ERC721ClaimPhases`/`ERC721ClaimCustom`/`DropERC721`/`DropERC1155`
-//! and their 1155 counterparts share the identical `claim`/`ClaimCondition`/
-//! `AllowlistProof` interface). Verified directly against the official
-//! `thirdweb-dev/contracts` repository (`contracts/extension/Drop.sol`,
-//! `contracts/extension/interface/IDropSinglePhase.sol`) -- Kairox never asks
-//! any third-party API for this calldata or for merkle-proof verification;
-//! the interface is fixed, well-known, and encoded/verified here directly.
+//! Independent local encoding/decoding of thirdweb's Drop claim ABIs.
+//!
+//! **CORRECTION (Phase B correctness gate)**: an earlier version of this
+//! module claimed `Drop`, `DropSinglePhase`, and their ERC-1155
+//! counterparts "share the identical claim/ClaimCondition/AllowlistProof
+//! interface". That was wrong, and was corrected after re-reading the
+//! actual official source (not a search-result summary) rather than
+//! assuming one thirdweb flavor's ABI generalizes to the others. Four
+//! distinct, source-verified shapes exist -- see [`ThirdwebFlavor`]:
+//!
+//! - **Multi-phase ERC-721** (`contracts/extension/Drop.sol`,
+//!   `IClaimConditionMultiPhase`): `getActiveClaimConditionId() -> uint256`,
+//!   `getClaimConditionById(uint256 conditionId) -> ClaimCondition`,
+//!   `getSupplyClaimedByWallet(uint256 conditionId, address claimer) -> uint256`
+//!   (the wallet counter is keyed *by condition id*).
+//! - **Single-phase ERC-721** (`contracts/extension/DropSinglePhase.sol`):
+//!   a single public state variable `ClaimCondition public claimCondition;`
+//!   (auto-generated no-argument getter -- **not** `getClaimConditionById`),
+//!   and `getSupplyClaimedByWallet(address claimer) -> uint256` (**one**
+//!   argument -- no `conditionId` exists in this flavor's ABI at all; an
+//!   earlier version of this module called the two-argument multi-phase
+//!   selector unconditionally, which would target the wrong function
+//!   entirely against a real `DropSinglePhase` deployment). The `claim()`
+//!   calldata shape is identical to the multi-phase ERC-721 flavor.
+//! - **Single-phase ERC-1155** (`contracts/extension/DropSinglePhase1155.sol`):
+//!   `mapping(uint256 => ClaimCondition) public claimCondition;` (takes
+//!   `tokenId`), `getSupplyClaimedByWallet(uint256 tokenId, address claimer) -> uint256`.
+//!   `claim()` takes an extra leading `tokenId`. **Not yet wired into any
+//!   execution path** -- see [`ThirdwebFlavor`]'s doc comment.
+//! - **Multi-phase ERC-1155** (`contracts/extension/Drop1155.sol`):
+//!   `getActiveClaimConditionId(uint256 tokenId) -> uint256`,
+//!   `getClaimConditionById(uint256 tokenId, uint256 conditionId) -> ClaimCondition`,
+//!   `getSupplyClaimedByWallet(uint256 tokenId, uint256 conditionId, address claimer) -> uint256`.
+//!   **Not yet wired into any execution path.**
+//!
+//! Every signature above was verified directly against the official
+//! `thirdweb-dev/contracts` repository source files named. Kairox never
+//! asks any third-party API for this calldata or for merkle-proof
+//! verification; the interface is fixed, well-known, and encoded/decoded
+//! here directly -- but *which* interface a given deployed contract
+//! actually implements is never assumed from one flavor onto another.
+//! See [`ThirdwebFlavor::detect`] (`execution::thirdweb_engine`) for how
+//! Kairox determines which flavor a specific address implements before
+//! calling any flavor-specific getter.
 //!
 //! Scope of this module (v0.8 Phase B): native-currency claims only.
 //! `currency` fields other than [`NATIVE_TOKEN`] are surfaced but never
@@ -40,9 +76,16 @@ sol! {
         address currency;
     }
 
+    // --- Multi-phase ERC-721 (Drop.sol / IClaimConditionMultiPhase) ---
     function getActiveClaimConditionId() external view returns (uint256);
     function getClaimConditionById(uint256 conditionId) external view returns (ClaimConditionAbi memory);
     function getSupplyClaimedByWallet(uint256 conditionId, address claimer) external view returns (uint256);
+
+    // --- Single-phase ERC-721 (DropSinglePhase.sol) ---
+    // `claimCondition` is a public state variable of type `ClaimCondition`
+    // (not a mapping) -- Solidity auto-generates a no-argument getter for
+    // it, with the exact same selector `claimCondition()` always has.
+    function claimCondition() external view returns (ClaimConditionAbi memory);
 
     // Identical signature shared by the multi-phase (`Drop`) and
     // single-phase (`DropSinglePhase`) extensions, and by both the
@@ -69,6 +112,24 @@ sol! {
         AllowlistProofAbi calldata allowlistProof,
         bytes memory data
     ) external payable;
+}
+
+// Isolated scope: `DropSinglePhase.sol`'s `getSupplyClaimedByWallet(address)`
+// has the SAME on-chain function name as the multi-phase two-argument
+// getter above, but a genuinely different selector (Solidity selectors
+// are computed from the full signature, including argument types) --
+// `alloy_sol_types::sol!` would otherwise generate a colliding Rust type
+// name (`getSupplyClaimedByWalletCall`) for both. Scoping this one in its
+// own module (mirroring `generic_engine::encode_calldata`'s identical
+// technique for the same underlying reason) keeps the on-chain function
+// name and selector exactly correct while giving Rust a distinct type
+// (`single_phase::getSupplyClaimedByWalletCall`).
+pub mod single_phase {
+    use alloy_sol_types::sol;
+
+    sol! {
+        function getSupplyClaimedByWallet(address claimer) external view returns (uint256);
+    }
 }
 
 /// The sentinel address thirdweb (and most EVM protocols) use to mean
@@ -194,6 +255,36 @@ pub fn encode_get_supply_claimed_by_wallet(condition_id: U256, claimer: Address)
 /// Decode the return data of `getSupplyClaimedByWallet(uint256, address)`.
 pub fn decode_get_supply_claimed_by_wallet(data: &[u8]) -> Result<U256, ThirdwebError> {
     getSupplyClaimedByWalletCall::abi_decode_returns(data)
+        .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))
+}
+
+/// Build the calldata for `claimCondition()` -- `DropSinglePhase.sol`'s
+/// public state-variable getter (single-phase ERC-721 flavor only).
+pub fn encode_claim_condition_single_phase() -> Bytes {
+    Bytes::from(claimConditionCall {}.abi_encode())
+}
+
+/// Decode the return data of `claimCondition()`.
+pub fn decode_claim_condition_single_phase(data: &[u8]) -> Result<ClaimCondition, ThirdwebError> {
+    let decoded = claimConditionCall::abi_decode_returns(data)
+        .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))?;
+    ClaimCondition::from_abi(decoded)
+}
+
+/// Build the calldata for `getSupplyClaimedByWallet(address)` -- the
+/// single-phase ERC-721 flavor's one-argument overload. NEVER call this
+/// against a multi-phase `Drop` contract expecting the two-argument
+/// getter to be interchangeable -- the selectors are different and
+/// `Drop.sol` has no single-argument overload of this function at all.
+pub fn encode_get_supply_claimed_by_wallet_single_phase(claimer: Address) -> Bytes {
+    Bytes::from(single_phase::getSupplyClaimedByWalletCall { claimer }.abi_encode())
+}
+
+/// Decode the return data of the single-phase `getSupplyClaimedByWallet(address)`.
+pub fn decode_get_supply_claimed_by_wallet_single_phase(
+    data: &[u8],
+) -> Result<U256, ThirdwebError> {
+    single_phase::getSupplyClaimedByWalletCall::abi_decode_returns(data)
         .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))
 }
 
@@ -325,6 +416,65 @@ mod tests {
             "the same wallet's claimed count must be looked up per claim-condition id, not a \
              single lifetime-cumulative counter"
         );
+    }
+
+    #[test]
+    fn claim_condition_single_phase_selector_differs_from_get_claim_condition_by_id() {
+        // The single-phase getter (claimCondition(), no args) and the
+        // multi-phase getter (getClaimConditionById(uint256)) are
+        // different on-chain functions with different selectors -- if
+        // these ever collided, calling one against the wrong flavor's
+        // contract could silently decode successfully against an
+        // unrelated function's return data.
+        assert_ne!(
+            claimConditionCall::SELECTOR,
+            getClaimConditionByIdCall::SELECTOR
+        );
+    }
+
+    #[test]
+    fn get_supply_claimed_by_wallet_single_phase_selector_differs_from_multi_phase() {
+        // The critical regression this correction exists for: an earlier
+        // version of this module assumed the single-phase flavor's
+        // getSupplyClaimedByWallet(address) shared a selector with (or
+        // could be called via) the multi-phase
+        // getSupplyClaimedByWallet(uint256,address) overload. Solidity
+        // computes selectors from the full signature including argument
+        // types, so these are genuinely different 4-byte values, and
+        // calling the wrong one against a real single-phase deployment
+        // would target a nonexistent function.
+        assert_ne!(
+            single_phase::getSupplyClaimedByWalletCall::SELECTOR,
+            getSupplyClaimedByWalletCall::SELECTOR
+        );
+    }
+
+    #[test]
+    fn decode_claim_condition_single_phase_round_trips() {
+        let abi = sample_condition_abi();
+        let encoded = claimConditionCall::abi_encode_returns(&abi);
+        let decoded = decode_claim_condition_single_phase(&encoded).unwrap();
+        assert_eq!(decoded.start_timestamp, 1_700_000_000);
+        assert_eq!(
+            decoded.price_per_token,
+            U256::from(10_000_000_000_000_000u64)
+        );
+    }
+
+    #[test]
+    fn decode_supply_claimed_by_wallet_single_phase_round_trips() {
+        let encoded =
+            single_phase::getSupplyClaimedByWalletCall::abi_encode_returns(&U256::from(4u64));
+        let claimed = decode_get_supply_claimed_by_wallet_single_phase(&encoded).unwrap();
+        assert_eq!(claimed, U256::from(4u64));
+    }
+
+    #[test]
+    fn encode_claim_condition_single_phase_has_no_arguments() {
+        // A no-argument call is exactly 4 bytes (the selector alone).
+        let calldata = encode_claim_condition_single_phase();
+        assert_eq!(calldata.len(), 4);
+        assert_eq!(&calldata[..], claimConditionCall::SELECTOR.as_slice());
     }
 
     #[test]

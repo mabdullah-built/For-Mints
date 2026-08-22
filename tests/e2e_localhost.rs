@@ -6976,6 +6976,18 @@ fn thirdweb_read_response(method: &str, params: &Value) -> Option<Behavior> {
         "eth_getTransactionCount" => Some(rpc_ok(serde_json::json!("0x1"))),
         "eth_getBalance" => Some(rpc_ok(serde_json::json!("0xde0b6b3a7640000"))),
         "eth_estimateGas" => Some(rpc_ok(serde_json::json!("0x2bf20"))),
+        // Provenance reads (execution::thirdweb_engine::establish_provenance):
+        // arbitrary, non-EIP-1167-shaped bytecode and an all-zero
+        // EIP-1967 slot -- not a proxy Kairox recognizes, so provenance
+        // resolves to hashing this bytecode directly. The real
+        // BUILTIN_REGISTRY ships empty, so no hash can ever match it;
+        // this only proves the read plumbing itself, never authorizes a
+        // live send.
+        "eth_getCode" => Some(rpc_ok(serde_json::json!("0x600160026003"))),
+        "eth_getStorageAt" => Some(rpc_ok(serde_json::json!(format!(
+            "0x{}",
+            hex::encode([0u8; 32])
+        )))),
         _ => None,
     }
 }
@@ -7011,8 +7023,20 @@ fn thirdweb_dry_run_prints_the_active_claim_condition_read_only() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Phase B correctness gate: `--engine thirdweb --send`/`--rehearsal`
+// must refuse to authorize a live send against any contract whose
+// implementation is not a manually-reviewed entry in
+// `execution::thirdweb_registry`'s trusted-fingerprint registry --
+// selector compatibility and a successful read are never sufficient
+// (see that module's doc comment). The real production CLI uses
+// `BUILTIN_REGISTRY`, which ships empty by design, so both scenarios
+// below refuse through the *actual compiled binary* -- proving the gate
+// is real, not merely unit-tested at the engine layer.
+// ---------------------------------------------------------------------
+
 #[test]
-fn thirdweb_public_phase_rehearsal_prepares_and_signs_but_never_broadcasts() {
+fn thirdweb_rehearsal_refuses_without_an_established_trusted_fingerprint() {
     let signer = test_signer();
     let wallet = signer.address();
     let key_hex = signing_key_hex(&signer);
@@ -7020,7 +7044,8 @@ fn thirdweb_public_phase_rehearsal_prepares_and_signs_but_never_broadcasts() {
     let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
         "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
             code: -32000,
-            message: "must never be called: rehearsal never broadcasts".into(),
+            message: "must never be called: provenance is never established for this fixture"
+                .into(),
         },
         _ => thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
             code: -32601,
@@ -7048,40 +7073,30 @@ fn thirdweb_public_phase_rehearsal_prepares_and_signs_but_never_broadcasts() {
             "2000000000000000000",
         ])
         .assert()
-        .success()
-        .stdout(predicates::str::contains("REHEARSAL RESULT"))
-        .stdout(predicates::str::contains(
-            "REHEARSAL COMPLETE — signed and serialized",
+        .failure()
+        .stderr(predicates::str::contains(
+            "no trusted implementation fingerprint",
         ));
 
     let received = server.received.lock().unwrap();
     assert!(
         !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
-        "watch --rehearsal must never broadcast"
+        "an unverified implementation must never be signed or broadcast, rehearsal or not"
     );
 }
 
 #[test]
-fn thirdweb_real_send_broadcasts_exactly_once_and_confirms_the_receipt() {
+fn thirdweb_real_send_refuses_without_an_established_trusted_fingerprint() {
     let signer = test_signer();
     let wallet = signer.address();
     let key_hex = signing_key_hex(&signer);
 
     let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
-        "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
-        "eth_getTransactionReceipt" => {
-            let queried_hash = params
-                .get(0)
-                .and_then(Value::as_str)
-                .unwrap_or("0x")
-                .to_string();
-            rpc_ok(serde_json::json!({
-                "transactionHash": queried_hash,
-                "status": "0x1",
-                "blockNumber": "0x1",
-                "logs": [transfer_log_custom(THIRDWEB_DROP, Address::ZERO, wallet, 1)],
-            }))
-        }
+        "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "must never be called: provenance is never established for this fixture"
+                .into(),
+        },
         _ => thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
             code: -32601,
             message: format!("unexpected method in thirdweb send scenario: {method}"),
@@ -7108,14 +7123,14 @@ fn thirdweb_real_send_broadcasts_exactly_once_and_confirms_the_receipt() {
             "2000000000000000000",
         ])
         .assert()
-        .success()
-        .stdout(predicates::str::contains("BROADCAST RESULT"))
-        .stdout(predicates::str::contains("receipt: CONFIRMED_SUCCESS"));
+        .failure()
+        .stderr(predicates::str::contains(
+            "no trusted implementation fingerprint",
+        ));
 
     let received = server.received.lock().unwrap();
-    let sends: Vec<_> = received
-        .iter()
-        .filter(|(m, _)| m == "eth_sendRawTransaction")
-        .collect();
-    assert_eq!(sends.len(), 1, "expected exactly one broadcast: {sends:?}");
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an unverified implementation must never be signed or broadcast against a real --send"
+    );
 }
