@@ -4737,13 +4737,21 @@ fn watch_wallet_allocation_exhausted_while_waiting_stops_safely() {
 // ---------------------------------------------------------------------
 // True-final-release-gate item 8: dedicated STAGE_ALREADY_LIVE tests.
 //
-// 8A/8B (real, non-rehearsal `watch --auto-send` against an already-live
-// eligible stage must refuse with STAGE_ALREADY_LIVE, never sign or
-// broadcast) are already covered incidentally by
-// `watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_public_wait`
-// (OpenSea signed stage, real auto-send) -- this block adds a clean,
-// dedicated PUBLIC-engine case (8A) plus the exhaustion-must-not-
-// falsely-claim-STAGE_ALREADY_LIVE case (8C, wallet allocation). 8D
+// 8A (real, non-rehearsal `watch --auto-send` against an already-live
+// eligible PUBLIC stage must refuse with STAGE_ALREADY_LIVE, never sign
+// or broadcast) is covered here as a clean, dedicated case. 8B (the
+// OpenSea-signed equivalent) requires the real, wallet-specific
+// mint-builder preflight to positively verify actionability -- see the
+// FINAL SEMANTIC CORRECTION block further below
+// (`watch_auto_send_on_an_active_signed_stage_with_verified_eligibility_refuses_with_stage_already_live`
+// et al.), which supersedes what used to be here: an earlier version of
+// this test suite treated `EligibilityState::UnknownUntilActive` alone
+// as sufficient grounds for STAGE_ALREADY_LIVE on an OpenSea stage --
+// that was too broad and has been corrected (see the semantic-correction
+// section's own comment block for the full explanation). This block
+// keeps the exhaustion-must-not-falsely-claim-STAGE_ALREADY_LIVE case
+// (8C, wallet allocation) for the PUBLIC engine, which was always
+// evidence-based and needed no correction. 8D
 // (supply exhaustion) exercises the identical `has_known_capacity()`
 // check as 8C with a different field and is intentionally not
 // duplicated as a second test. 8E (the rehearsal exception against an
@@ -4900,6 +4908,475 @@ fn watch_auto_send_on_an_exhausted_active_public_stage_does_not_falsely_claim_al
     );
 }
 
+// ---------------------------------------------------------------------
+// KAIROX -- FINAL SEMANTIC CORRECTION: `WatchStageDecision::AlreadyLive`
+// alone (temporally active + `EligibilityState::Eligible |
+// UnknownUntilActive`) is NOT sufficient evidence for an OpenSea
+// signed/allowlist/FCFS/FCFA stage to refuse with STAGE_ALREADY_LIVE --
+// `UnknownUntilActive` is not proof any specific wallet can execute it.
+// `resolve_watch_engine` now additionally requires
+// `resolver_adapters::check_opensea_stage_actionable_now` to positively
+// verify a real, wallet-specific mint-builder response (the exact same
+// request/validation path `run_opensea_mint` itself uses) before ever
+// emitting STAGE_ALREADY_LIVE for an OpenSea stage. This block covers
+// every outcome of that preflight, across all three engine-selection
+// modes.
+// ---------------------------------------------------------------------
+
+/// Shared fixture: an on-chain contract/collection lookup plus a
+/// `GET /api/v2/drops/{slug}` reporting one already-active `signed_presale`
+/// stage (`start_time` in the past, `end_time` far future) -- exactly what
+/// `--engine auto` needs to auto-discover it, and what `--engine opensea
+/// --slug` needs to see it as the drop's current `active_stage`. The
+/// `mint_behavior` closure controls what `POST /api/v2/drops/{slug}/mint`
+/// (the real wallet-specific preflight `check_opensea_stage_actionable_now`
+/// performs) returns, so each scenario below only needs to supply that one
+/// outcome.
+fn spawn_active_signed_stage_server(
+    slug: &'static str,
+    mint_behavior: impl Fn() -> Behavior + Send + Sync + 'static,
+) -> LocalHttpServer {
+    LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+                    code: -32000,
+                    message: "must never be called: STAGE_ALREADY_LIVE must refuse before any \
+                              signing or broadcast"
+                        .into(),
+                },
+                _ => opensea_read_response(
+                    &method,
+                    &params,
+                    None,
+                    Some(permissive_signed_mint_validation_params()),
+                    Some(true),
+                )
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!(
+                        "unexpected RPC method in active-signed-stage scenario: {method}"
+                    ),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": slug,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{slug}") {
+            (
+                path.to_string(),
+                rpc_ok_status(opensea_stage_json(slug, "signed_presale", NFT)),
+            )
+        } else if path == format!("/api/v2/drops/{slug}/mint") {
+            (path.to_string(), mint_behavior())
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    })
+}
+
+#[test]
+fn watch_auto_send_on_an_active_signed_stage_with_verified_eligibility_refuses_with_stage_already_live()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-active-signed-verified-eligible";
+    const SIGNER_SEED: &str = "kairox-e2e-active-signed-verified-eligible-signer";
+
+    let server = spawn_active_signed_stage_server(SLUG, move || {
+        rpc_ok_status(signed_mint_response_json(
+            wallet,
+            sample_mint_params_abi(true),
+            SIGNER_SEED,
+            U256::from(1u64),
+        ))
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE"))
+        .stderr(predicates::str::contains("kairox mint"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received
+            .iter()
+            .any(|(m, _)| m == &format!("/api/v2/drops/{SLUG}/mint")),
+        "the real wallet-specific preflight must actually have run"
+    );
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a verified-actionable stage must still never be signed or broadcast by watch itself"
+    );
+}
+
+#[test]
+fn watch_auto_send_on_an_active_signed_stage_with_clear_ineligibility_falls_through_to_a_future_public_stage()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-active-signed-ineligible";
+    let public_stage_start = unix_now() + 2;
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" => echo_tx_hash_behavior(&params),
+                "eth_getTransactionReceipt" => {
+                    let queried_hash = params
+                        .get(0)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    rpc_ok(serde_json::json!({
+                        "transactionHash": queried_hash,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [transfer_log_for(wallet, 7)],
+                    }))
+                }
+                _ => read_response_with_stage_window(
+                    &method,
+                    &params,
+                    public_stage_start,
+                    32_503_680_000,
+                )
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!(
+                        "unexpected RPC method in ineligible-signed scenario: {method}"
+                    ),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            (
+                path.to_string(),
+                rpc_ok_status(opensea_stage_json(SLUG, "signed_presale", NFT)),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            // A clean, unambiguous 422 eligibility rejection -- the exact
+            // classification `execution::opensea_engine` itself already
+            // produces for this response shape.
+            (
+                path.to_string(),
+                Behavior::HttpStatus(
+                    422,
+                    serde_json::json!({"errors": ["wallet is not on the allowlist"]}),
+                ),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE").not())
+        .stdout(predicates::str::contains("BROADCAST RESULT"));
+
+    let received = server.received.lock().unwrap();
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(
+        sends.len(),
+        1,
+        "an ineligible signed stage must never be dispatched to -- exactly one broadcast, to \
+         the legitimately-watched future public stage, expected: {sends:?}"
+    );
+}
+
+/// Shared assertion for item 5's three ambiguous-preflight scenarios
+/// (429, timeout/transport-failure, 5xx): none of them may ever be
+/// reported as STAGE_ALREADY_LIVE (that would fabricate positive proof
+/// from an outcome that proves nothing) or as a clean ineligibility
+/// rejection (that would fabricate a negative proof just as wrongly) --
+/// only the distinct, fail-closed `ACTIVE_STAGE_ELIGIBILITY_UNKNOWN`.
+fn assert_ambiguous_preflight_refuses_with_eligibility_unknown(
+    slug: &'static str,
+    mint_behavior: impl Fn() -> Behavior + Send + Sync + 'static,
+) {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = spawn_active_signed_stage_server(slug, mint_behavior);
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "ACTIVE_STAGE_ELIGIBILITY_UNKNOWN",
+        ))
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE").not());
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an ambiguous preflight outcome must never be signed or broadcast"
+    );
+}
+
+#[test]
+fn watch_auto_send_on_an_active_signed_stage_with_a_rate_limited_preflight_is_eligibility_unknown()
+{
+    assert_ambiguous_preflight_refuses_with_eligibility_unknown(
+        "kairox-e2e-active-signed-429",
+        || Behavior::HttpStatus(429, serde_json::json!({"errors": ["rate limited"]})),
+    );
+}
+
+#[test]
+fn watch_auto_send_on_an_active_signed_stage_with_a_server_error_preflight_is_eligibility_unknown()
+{
+    assert_ambiguous_preflight_refuses_with_eligibility_unknown(
+        "kairox-e2e-active-signed-500",
+        || Behavior::HttpStatus(500, serde_json::json!({"errors": ["internal error"]})),
+    );
+}
+
+#[test]
+fn watch_auto_send_on_an_active_signed_stage_with_a_transport_failure_preflight_is_eligibility_unknown()
+ {
+    // The bounded-retry preflight (`request_mint_with_bounded_retry`)
+    // treats a connection that closes without responding at all
+    // (`ApiUnavailable`/transport failure) exactly like a timeout for
+    // retry purposes -- both are transient/no-response outcomes, and
+    // both must land as ACTIVE_STAGE_ELIGIBILITY_UNKNOWN, never
+    // STAGE_ALREADY_LIVE or a fabricated ineligibility.
+    assert_ambiguous_preflight_refuses_with_eligibility_unknown(
+        "kairox-e2e-active-signed-transport-failure",
+        || Behavior::CloseWithoutResponding,
+    );
+}
+
+#[test]
+fn watch_engine_public_auto_send_on_an_already_active_eligible_stage_refuses_with_stage_already_live()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    // The item 6 audit: explicit `--engine public` must obey the exact
+    // same WATCH-vs-LIVE contract `--engine auto` does, not bypass it.
+    let stage_start = unix_now() - 60;
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_sendRawTransaction" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: "must never be called: explicit --engine public must also refuse an \
+                          already-live stage"
+                    .into(),
+            };
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!(
+                    "unexpected method in explicit-public-already-live scenario: {method}"
+                ),
+            },
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "public",
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "explicit --engine public must refuse an already-live stage before any broadcast"
+    );
+}
+
+#[test]
+fn watch_engine_opensea_slug_auto_send_on_an_active_signed_stage_with_verified_eligibility_refuses_with_stage_already_live()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-explicit-slug-active-signed-eligible";
+    const SIGNER_SEED: &str = "kairox-e2e-explicit-slug-active-signed-eligible-signer";
+
+    // The item 6 audit: an operator-provided `--slug` must obey the same
+    // contract as auto-discovery -- no bypass just because the drop
+    // identity was given explicitly rather than discovered.
+    let server = spawn_active_signed_stage_server(SLUG, move || {
+        rpc_ok_status(signed_mint_response_json(
+            wallet,
+            sample_mint_params_abi(true),
+            SIGNER_SEED,
+            U256::from(1u64),
+        ))
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received
+            .iter()
+            .any(|(m, _)| m == &format!("/api/v2/drops/{SLUG}/mint")),
+        "the real wallet-specific preflight must actually have run for the explicit slug too"
+    );
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an explicit-slug verified-actionable stage must still never be signed or broadcast by \
+         watch itself"
+    );
+}
+
 #[test]
 fn watch_wrong_chain_detected_before_any_wait() {
     let signer = test_signer();
@@ -4976,6 +5453,14 @@ fn watch_json_report_is_exactly_one_valid_json_object_over_real_http() {
     let signer = test_signer();
     let wallet = signer.address();
     let key_hex = signing_key_hex(&signer);
+    // A genuine, short *future* stage -- semantic-correction item 6/7
+    // now makes real `watch --engine public --auto-send` refuse with
+    // STAGE_ALREADY_LIVE against an already-active stage (the standard
+    // fixture's default), which would defeat this test's actual purpose
+    // (verifying `--json` stdout plumbing through a real successful
+    // watch-then-dispatch run). This is the same short-wait pattern
+    // `watch_public_future_stage_waits_then_executes_at_t0` uses.
+    let stage_start = unix_now() + 2;
 
     let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
         "eth_sendRawTransaction" => echo_tx_hash_behavior(params),
@@ -4992,10 +5477,11 @@ fn watch_json_report_is_exactly_one_valid_json_object_over_real_http() {
                 "logs": [transfer_log_for(wallet, 3)],
             }))
         }
-        _ => standard_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
-            code: -32601,
-            message: format!("unexpected method in watch --json scenario: {method}"),
-        }),
+        _ => read_response_with_stage_window(method, params, stage_start, 32_503_680_000)
+            .unwrap_or(Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in watch --json scenario: {method}"),
+            }),
     });
 
     let assert = kairox_bin()
@@ -5009,6 +5495,8 @@ fn watch_json_report_is_exactly_one_valid_json_object_over_real_http() {
             "--engine",
             "public",
             "--auto-send",
+            "--poll-interval-secs",
+            "1",
             "--max-mint-value-wei",
             "1000000000000000000",
             "--max-gas-cost-wei",
@@ -5122,9 +5610,15 @@ fn spawn_autodiscovery_server(
 // discovery request -- simulating a creator publishing a presale (or
 // OpenSea recovering from a transient outage) after `watch` already
 // started waiting on the native public stage. Also now doubles as a
-// STAGE_ALREADY_LIVE regression test (final release gate item 6/7): the
-// freshly-restarted attempt's very first resolution correctly refuses
-// rather than silently minting through the now-active presale.
+// semantic-correction regression test (final release gate item 4): the
+// presale's own display metadata claims sold out, and the real
+// wallet-specific preflight (`check_opensea_stage_actionable_now`)
+// confirms supply exhaustion via the same classification the execution
+// engine itself uses -- this must NOT be reported as STAGE_ALREADY_LIVE
+// (a sold-out stage is never actionable), and since no other supported
+// stage exists once it is excluded, the freshly-restarted attempt's very
+// first resolution correctly reports the genuine no-supported-stage
+// outcome instead.
 // ---------------------------------------------------------------------
 #[test]
 fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_public_wait() {
@@ -5149,10 +5643,28 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
                 .to_string();
             let params = body.get("params").cloned().unwrap_or(Value::Null);
             let behavior = match method.as_str() {
-                "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
-                    code: -32000,
-                    message: "must never be called: this scenario never dispatches".into(),
-                },
+                // After the sold-out presale is excluded, watch falls
+                // back to legitimately waiting for the still-future
+                // public stage -- semantic-correction item 3/4's exact
+                // scenario ("active signed [not actionable] + future
+                // public -> future public selected"). This *does* now
+                // reach real dispatch once the public stage opens, so
+                // unlike the presale's own metadata, this is a genuine
+                // successful completion, not a forbidden call.
+                "eth_sendRawTransaction" => echo_tx_hash_behavior(&params),
+                "eth_getTransactionReceipt" => {
+                    let queried_hash = params
+                        .get(0)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    rpc_ok(serde_json::json!({
+                        "transactionHash": queried_hash,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [transfer_log_for(wallet, 9)],
+                    }))
+                }
                 _ => read_response_with_stage_window(
                     &method,
                     &params,
@@ -5176,6 +5688,20 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
                     "name": "Test",
                 })),
             )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            // The active presale's own metadata claims sold out
+            // (total_supply == max_supply below); a real OpenSea backend
+            // would reject the wallet-specific mint-builder request
+            // itself with a 422 classified as supply-exhausted -- this is
+            // what `check_opensea_stage_actionable_now`'s real preflight
+            // is exercised against, never the untrusted display metadata.
+            (
+                path.to_string(),
+                Behavior::HttpStatus(
+                    422,
+                    serde_json::json!({"errors": ["supply exhausted: sold out"]}),
+                ),
+            )
         } else if path == format!("/api/v2/drops/{SLUG}") {
             let n = opensea_requests_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
@@ -5189,18 +5715,19 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
                 // Every request from here on (the periodic re-resolution
                 // check, and the fresh attempt it triggers): a real,
                 // already-active signed presale. Its total_supply/
-                // max_supply claim it's sold out, but that OpenSea-
-                // reported metadata is deliberately never trusted for
-                // eligibility (see `is_candidate`/`EligibilityState`) --
-                // so the resolver correctly treats it as
-                // eligible-or-unknown and already live, and the fresh
-                // attempt's very first resolution now hits
-                // STAGE_ALREADY_LIVE (a real --auto-send run refuses to
-                // "watch" something already active) before ever reaching
-                // OpenSea's own probe-time sold-out check, terminating
-                // even earlier/more safely than before, still without
-                // needing the full signed-mint/EIP-712 machinery this
-                // test isn't exercising.
+                // max_supply claim it's sold out; that display metadata
+                // alone is deliberately never trusted for eligibility
+                // (see `is_candidate`/`EligibilityState`), so the
+                // resolver still treats it as a genuine
+                // temporally-active candidate worth checking -- but the
+                // real actionability preflight
+                // (`check_opensea_stage_actionable_now`, mocked above via
+                // the `/mint` endpoint's 422 supply-exhausted response)
+                // then correctly determines it is *not* actionable,
+                // excludes it, and re-resolves -- never reporting
+                // STAGE_ALREADY_LIVE for a stage that cannot actually be
+                // minted, and never needing the full signed-mint/EIP-712
+                // machinery this test isn't exercising.
                 (
                     path.to_string(),
                     rpc_ok_status(serde_json::json!({
@@ -5260,17 +5787,24 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
-        .failure()
+        .success()
         .stderr(predicates::str::contains(
             "restarting the attempt against the fresh resolution",
         ))
         .stderr(predicates::str::contains("resolved_engine: OpenSea"))
-        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE"));
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE").not())
+        .stdout(predicates::str::contains("BROADCAST RESULT"));
 
     let received = server.received.lock().unwrap();
-    assert!(
-        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
-        "this scenario must never reach dispatch"
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(
+        sends.len(),
+        1,
+        "the sold-out presale must never be dispatched to -- exactly one broadcast, to the \
+         legitimately-watched public stage, expected: {sends:?}"
     );
 }
 

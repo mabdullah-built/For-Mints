@@ -36,30 +36,75 @@ stage:
   broadcasting): `kairox watch <collection> --rehearsal`.
 
 A real, non-rehearsal `watch --auto-send` never silently behaves like
-`mint`. If its resolution -- run through the exact same
-eligibility/capacity model (`select_for_watch`/`is_candidate`/
-`has_known_capacity`) `mint --engine auto` uses -- lands on a stage that
-is already `Active`, supported, and eligible-or-unknown, `watch` refuses
-immediately with `STAGE_ALREADY_LIVE` and points the operator at `kairox
-mint <collection> --send --yes`, before any signing, before any
-broadcast. This is never emitted merely because *some* stage on the
-collection happens to be active: an active stage whose wallet allocation
-or supply is already exhausted is not a candidate at all under that same
-model, so `watch` correctly reports the real exhaustion outcome (or, if
-a genuine future supported stage still exists, continues waiting for
-it) instead of fabricating `STAGE_ALREADY_LIVE` from the timestamp
-alone.
+`mint`, but `STAGE_ALREADY_LIVE` is deliberately **evidence-based, never
+timestamp-based**: `watch` only ever refuses with it once actionability
+for the configured wallet/quantity has been positively established, not
+merely because *some* stage on the collection happens to be temporally
+active.
+
+- **Native SeaDrop public stage**: `select_for_watch`'s temporal +
+  candidacy check (`is_candidate`/`has_known_capacity`) is itself
+  sufficient proof -- a `NormalizedStage`'s allocation/supply fields for
+  a public stage always come from a real, authoritative on-chain read
+  (`getPublicDrop`/`getMintStats`), so an `Active` public stage with
+  known remaining capacity genuinely can be minted by this wallet right
+  now.
+- **OpenSea signed/allowlist/FCFS/FCFA stage**: temporal activity plus
+  `EligibilityState::UnknownUntilActive` is **not** sufficient proof on
+  its own -- `UnknownUntilActive` means eligibility genuinely cannot be
+  known before the stage opens, not that the wallet is eligible. Before
+  ever refusing with `STAGE_ALREADY_LIVE` for an OpenSea stage, `watch`
+  additionally performs the real preflight the execution engine itself
+  would perform: requesting the official, wallet-specific mint-builder
+  response (`POST /api/v2/drops/{slug}/mint`, official REST only) and
+  running it through the exact same local validation
+  (`execution::opensea_validate::validate_opensea_mint_response`) a real
+  send would -- target, chain, wallet, quantity, value cap, and signer
+  all checked -- before ever signing or broadcasting anything. See
+  `cli::commands::resolver_adapters::check_opensea_stage_actionable_now`.
+
+That preflight has three possible outcomes, and each means something
+distinct -- one is never silently upgraded into another:
+
+- **Actionable** (the response passed every check): `STAGE_ALREADY_LIVE`,
+  with a message that says "verified" because it genuinely was.
+- **Not actionable** (a clean, unambiguous 422 -- wallet ineligible,
+  allocation exceeded, or supply exhausted): never `STAGE_ALREADY_LIVE`.
+  That one specific active stage is excluded from this resolution
+  attempt and `watch` re-resolves; if a later supported stage (a second
+  OpenSea stage, or a still-future on-chain public stage) exists, it
+  becomes the new target, exactly as if it had been the only candidate
+  to begin with. If none exists, `watch` reports the genuine
+  no-supported-stage/exhaustion outcome instead.
+- **Ambiguous** (timeout, rate limit, a 5xx, or a response that failed
+  local validation): Kairox could not establish actionability in either
+  direction and refuses to guess -- reported as
+  `ACTIVE_STAGE_ELIGIBILITY_UNKNOWN`, distinct from both
+  `STAGE_ALREADY_LIVE` and an ineligibility rejection. The stage is
+  *not* excluded (an ambiguous outcome is not proof of anything), and
+  `watch` does not silently fall through to a later stage on this basis
+  either -- it stops and lets the operator retry or use `mint --send
+  --yes` directly.
+
+This contract applies identically across all three engine-selection
+modes -- `--engine auto`, the explicit `--engine public`, and the
+explicit `--engine opensea --slug <slug>` all obey it the same way; none
+of them bypasses it just because the route was named explicitly rather
+than auto-discovered.
 
 The one deliberate exception is `--rehearsal`: because it can never
 broadcast, exercising an already-active stage's full pipeline end to end
 is safe and useful for testing, so `watch --rehearsal` is intentionally
 allowed to proceed through an active stage without the `STAGE_ALREADY_LIVE`
-refusal. A real, non-rehearsal `--auto-send` run still treats an
-already-live eligible stage as `STAGE_ALREADY_LIVE`. The periodic
-re-resolution check that runs during an in-progress wait (see below) is
-a third, separate case: it always allows a stage transitioning to
-`Active` mid-wait, since that transition is the wait succeeding, not an
-error -- the `STAGE_ALREADY_LIVE` refusal applies only to a real run's
+refusal (and without running the OpenSea actionability preflight at all
+-- rehearsal's own pipeline performs the real request/validation itself
+moments later, as part of exercising the full path). A real,
+non-rehearsal `--auto-send` run still applies the full evidence-based
+contract above. The periodic re-resolution check that runs during an
+in-progress wait (see below) is a third, separate case: it always allows
+a stage transitioning to `Active` mid-wait, since that transition is the
+wait succeeding, not an error -- the `STAGE_ALREADY_LIVE` refusal (and
+its OpenSea preflight) applies only to a real run's
 *initial* resolution.
 
 ## Architecture

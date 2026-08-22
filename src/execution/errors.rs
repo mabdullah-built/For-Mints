@@ -130,14 +130,33 @@ pub enum SessionErrorKind {
     /// ineligibility rejection already does.
     StageResolutionChanged,
     /// `watch --auto-send` (real, non-rehearsal) resolved to a stage that
-    /// is already `Active`, supported, and eligible-or-unknown -- `watch`
-    /// exists to wait for a *future* stage, never to silently act on one
-    /// that is already live (that is `mint`'s job). The operator is
-    /// expected to use `kairox mint --send --yes` instead. Never emitted
-    /// merely because *some* stage is active -- only when the resolver's
-    /// own eligibility/capacity model (the same one `mint --engine auto`
-    /// uses) considers it genuinely actionable.
+    /// is already `Active`, supported, and *positively proven actionable*
+    /// for the configured wallet/quantity -- `watch` exists to wait for a
+    /// *future* stage, never to silently act on one that is already live
+    /// (that is `mint`'s job). The operator is expected to use `kairox
+    /// mint --send --yes` instead. Never emitted merely because *some*
+    /// stage is active, and never emitted merely because eligibility is
+    /// `UnknownUntilActive` -- for a native SeaDrop public stage, real
+    /// on-chain timing/allocation/supply reads are themselves sufficient
+    /// proof; for an OpenSea signed/allowlist/FCFS/FCFA stage, the real
+    /// official mint-builder response must additionally be requested and
+    /// locally validated (target/chain/wallet/quantity/value/signer) --
+    /// see `cli::commands::resolver_adapters::check_opensea_stage_actionable_now`.
     StageAlreadyLive,
+    /// An OpenSea signed/allowlist/FCFS/FCFA stage is temporally `Active`
+    /// and otherwise supported, but Kairox could not establish -- in
+    /// either direction -- whether the configured wallet can currently
+    /// execute it: the official mint-builder preflight came back
+    /// ambiguous (timeout, rate limit, server error, or a response that
+    /// failed local validation) rather than a clean success or a clean
+    /// eligibility/allocation/supply rejection. This is deliberately
+    /// distinct from both `StageAlreadyLive` (positively proven
+    /// actionable) and an ineligibility rejection (positively proven
+    /// *not* actionable) -- an ambiguous outcome must never be silently
+    /// upgraded to either. The operator is expected to retry, or fall
+    /// back to `kairox mint --send --yes` and observe the real outcome
+    /// directly.
+    ActiveStageEligibilityUnknown,
 }
 
 /// An error representing a state Kairox has explicitly decided must halt
@@ -234,6 +253,10 @@ pub enum KairoxErrorCode {
     /// `watch --auto-send` refused because the resolved stage is already
     /// live and actionable right now -- use `mint --send` instead.
     StageAlreadyLive,
+    /// An active, supported stage exists, but Kairox could not establish
+    /// either eligibility or ineligibility for the configured wallet --
+    /// refusing to guess in either direction.
+    ActiveStageEligibilityUnknown,
     /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
     /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
     SessionAborted,
@@ -266,6 +289,7 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::ProxyImplementationChanged => "PROXY_IMPLEMENTATION_CHANGED",
             Self::MissingSpendCaps => "MISSING_SPEND_CAPS",
             Self::StageAlreadyLive => "STAGE_ALREADY_LIVE",
+            Self::ActiveStageEligibilityUnknown => "ACTIVE_STAGE_ELIGIBILITY_UNKNOWN",
             Self::SessionAborted => "SESSION_ABORTED",
         };
         f.write_str(s)
@@ -347,6 +371,9 @@ impl KairoxError {
                 }
                 SessionErrorKind::MissingSpendCaps => KairoxErrorCode::MissingSpendCaps,
                 SessionErrorKind::StageAlreadyLive => KairoxErrorCode::StageAlreadyLive,
+                SessionErrorKind::ActiveStageEligibilityUnknown => {
+                    KairoxErrorCode::ActiveStageEligibilityUnknown
+                }
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest
                 | SessionErrorKind::SkippedSharedResourceFailure

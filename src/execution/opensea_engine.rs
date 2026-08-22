@@ -731,7 +731,7 @@ pub async fn run_opensea_mint_for_wallet(
 /// eligibility/allocation/supply/auth/malformed-request outcome is
 /// terminal and never retried, so repeated calls can never be used to
 /// evade an allocation.
-async fn request_mint_with_bounded_retry(
+pub(crate) async fn request_mint_with_bounded_retry(
     client: &OpenSeaClient,
     slug: &str,
     wallet: Address,

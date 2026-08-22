@@ -331,6 +331,7 @@ async fn run_single_target(
             &plan_args,
             config_path,
             &excluded_stage_ids,
+            safety_caps,
             rehearsal,
         )
         .await?;
@@ -471,11 +472,89 @@ enum ResolvedWatchEngine {
 /// treat a `NotStarted` on-chain public stage as a legitimate Public
 /// candidate -- that is precisely the "coming soon" case watch exists to
 /// wait through.
+/// Constructs the operator-facing `STAGE_ALREADY_LIVE` refusal. Only ever
+/// called once actionability has genuinely been *verified* -- see
+/// [`resolve_watch_engine`]'s callers -- so "verified" in the message is
+/// never an overclaim: for a native SeaDrop public stage, real on-chain
+/// timing/allocation/supply reads are themselves sufficient proof; for an
+/// OpenSea stage, [`crate::cli::commands::resolver_adapters::check_opensea_stage_actionable_now`]
+/// has already positively validated a real, wallet-specific mint-builder
+/// response before this is ever constructed.
+fn stage_already_live_error(collection: alloy_primitives::Address) -> KairoxError {
+    KairoxError::Session(SessionError::with_kind(
+        SessionErrorKind::StageAlreadyLive,
+        format!(
+            "STAGE_ALREADY_LIVE: this stage is already active and Kairox verified that the \
+             configured wallet/quantity can currently use it. `watch` is for future stages; use \
+             `kairox mint {collection:#x} --send --yes` instead (or pass --rehearsal to safely \
+             exercise this stage's pipeline without broadcasting)."
+        ),
+    ))
+}
+
+/// Constructs the `ACTIVE_STAGE_ELIGIBILITY_UNKNOWN` refusal -- see
+/// [`SessionErrorKind::ActiveStageEligibilityUnknown`]'s doc comment.
+/// Deliberately distinguishable from both `stage_already_live_error` and
+/// a clean ineligibility rejection: an ambiguous outcome must never be
+/// silently upgraded to either.
+fn active_stage_eligibility_unknown_error(
+    wallet: alloy_primitives::Address,
+    collection: alloy_primitives::Address,
+    cause: KairoxError,
+) -> KairoxError {
+    KairoxError::Session(SessionError::with_kind(
+        SessionErrorKind::ActiveStageEligibilityUnknown,
+        format!(
+            "ACTIVE_STAGE_ELIGIBILITY_UNKNOWN: an active, supported stage exists for this \
+             collection, but Kairox could not establish whether wallet {wallet:#x} can \
+             currently execute it ({cause}); refusing to guess in either direction. Retry, or \
+             use `kairox mint {collection:#x} --send --yes` to attempt it directly and observe \
+             the real outcome."
+        ),
+    ))
+}
+
+/// Bounded cap on how many times [`resolve_watch_engine`]'s `Auto` branch
+/// may exclude a temporally-active-but-not-actionable OpenSea stage and
+/// re-resolve before giving up -- distinct from (and much smaller than)
+/// `MAX_RESOLUTION_ATTEMPTS`, since this only ever runs once per attempt
+/// at initial resolution time, never in a hot polling loop.
+const MAX_LIVE_CHECK_ATTEMPTS: u32 = 4;
+
+/// Resolves which engine a `watch` attempt should target, and -- for a
+/// real (non-rehearsal) initial resolution -- enforces the WATCH-vs-LIVE
+/// contract: `watch` exists to wait for a *future* stage, never to
+/// silently act on one that is already live (that is `mint`'s job).
+///
+/// True-final-release-gate semantic correction: an earlier version of
+/// this check treated `WatchStageDecision::AlreadyLive` alone (temporally
+/// active + `EligibilityState::Eligible | UnknownUntilActive`) as
+/// sufficient grounds for `STAGE_ALREADY_LIVE`. That is correct for a
+/// native SeaDrop public stage (its `NormalizedStage` capacity fields
+/// come from a real, authoritative on-chain read -- see
+/// `resolver_adapters::discover_public_stage`) but was **too broad** for
+/// an OpenSea signed/allowlist/FCFS/FCFA stage: `UnknownUntilActive` is
+/// not positive proof any specific wallet can execute it, only that
+/// eligibility genuinely cannot be known before the stage is active. A
+/// wallet could be temporally looking at an active signed stage it is
+/// actually ineligible for, while a later public stage remains a
+/// perfectly valid future target -- `STAGE_ALREADY_LIVE` must never tell
+/// the operator to switch to `mint` on that basis. For an OpenSea stage,
+/// this now additionally requires
+/// `resolver_adapters::check_opensea_stage_actionable_now` to positively
+/// verify a real, wallet-specific mint-builder response before
+/// `STAGE_ALREADY_LIVE` is ever emitted -- see that function's doc
+/// comment. Applies identically across all three engine-selection modes
+/// (`--engine auto`, `--engine public`, `--engine opensea --slug`): the
+/// specifically-selected route being already `Active` and positively
+/// actionable always means `STAGE_ALREADY_LIVE`, never a silent
+/// immediate execution through `watch`.
 async fn resolve_watch_engine(
     target: &WatchTarget,
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
     excluded_stage_ids: &[crate::domain::stage::StageId],
+    safety_caps: SafetyCaps,
     // `false` only for the *very first* resolution of a fresh attempt
     // (and even then, only when not `--rehearsal`): an `AlreadyLive`
     // decision there means the operator asked `watch` to wait for
@@ -490,11 +569,100 @@ async fn resolve_watch_engine(
     allow_already_live: bool,
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
-        EngineSelection::Public => Ok(ResolvedWatchEngine::Public),
+        EngineSelection::Public => {
+            // Explicit-engine modes obey the exact same WATCH-vs-LIVE
+            // contract as `--engine auto` -- item 6 of the true-final
+            // release gate. A native public stage's on-chain
+            // timing/allocation/supply reads are themselves sufficient
+            // proof, so this reuses `select_for_live_mint` (the identical
+            // check `mint --engine auto` performs) directly on the one
+            // discovered stage -- no separate actionability preflight
+            // needed, unlike OpenSea below.
+            if !allow_already_live
+                && let Some(stage) = crate::cli::commands::resolver_adapters::discover_public_stage(
+                    plan_args,
+                    config_path,
+                )
+                .await?
+                && matches!(
+                    crate::execution::stage_resolver::select_for_live_mint(
+                        std::slice::from_ref(&stage),
+                        OffsetDateTime::now_utc()
+                    ),
+                    crate::execution::stage_resolver::LiveStageDecision::Selected(_)
+                )
+            {
+                return Err(stage_already_live_error(target.collection));
+            }
+            Ok(ResolvedWatchEngine::Public)
+        }
         EngineSelection::Opensea => {
             let slug = target.slug.clone().ok_or(KairoxError::OpenSea(
                 crate::opensea::errors::OpenSeaError::SlugRequired,
             ))?;
+            if !allow_already_live {
+                // An operator-provided slug identifies a whole drop, not
+                // one exact stage -- `get_drop_details` is the same real,
+                // read-only lookup `run_opensea_mint`/`OpenSeaStageProbe`
+                // already perform to learn the drop's current stage.
+                let opensea =
+                    crate::cli::commands::mint::load_opensea_client(StdDuration::from_secs(10))?;
+                let details = opensea
+                    .get_drop_details(&slug)
+                    .await
+                    .map_err(KairoxError::OpenSea)?;
+                let now = OffsetDateTime::now_utc();
+                let is_temporally_active = details.active_stage.as_ref().is_some_and(|stage| {
+                    let start = OffsetDateTime::parse(
+                        &stage.start_time,
+                        &time::format_description::well_known::Rfc3339,
+                    );
+                    let end = OffsetDateTime::parse(
+                        &stage.end_time,
+                        &time::format_description::well_known::Rfc3339,
+                    );
+                    match (start, end) {
+                        (Ok(start), Ok(end)) => now >= start && now < end,
+                        (Ok(start), Err(_)) => now >= start,
+                        (Err(_), _) => false,
+                    }
+                });
+                if is_temporally_active {
+                    match crate::cli::commands::resolver_adapters::check_opensea_stage_actionable_now(
+                        plan_args,
+                        config_path,
+                        &opensea,
+                        &slug,
+                        target.wallet,
+                        target.quantity,
+                        safety_caps,
+                    )
+                    .await
+                    {
+                        crate::cli::commands::resolver_adapters::OpenSeaLiveActionability::Actionable => {
+                            return Err(stage_already_live_error(target.collection));
+                        }
+                        crate::cli::commands::resolver_adapters::OpenSeaLiveActionability::NotActionable { .. } => {
+                            // Not actionable for this wallet right now --
+                            // never invent a fallback beyond this
+                            // explicitly-requested slug (item 8: preserve
+                            // operator intent). The unmodified
+                            // `OpenSeaStageProbe` already falls through to
+                            // `next_stage` *within this same slug* when
+                            // one exists; if not, the normal pipeline
+                            // surfaces the real rejection at T0, ungated
+                            // by this preflight.
+                        }
+                        crate::cli::commands::resolver_adapters::OpenSeaLiveActionability::Ambiguous(e) => {
+                            return Err(active_stage_eligibility_unknown_error(
+                                target.wallet,
+                                target.collection,
+                                e,
+                            ));
+                        }
+                    }
+                }
+            }
             Ok(ResolvedWatchEngine::OpenSea {
                 slug,
                 stage_uuid: None,
@@ -505,76 +673,128 @@ async fn resolve_watch_engine(
             // own AlreadyLive-vs-WaitFor distinction (previously
             // collapsed by routing through the generic
             // `resolve_auto_engine`/`Detection` path, which has no way to
-            // carry it) so a genuinely already-live, eligible-or-unknown
-            // stage refuses with STAGE_ALREADY_LIVE for a real
-            // `--auto-send` run, rather than silently minting immediately
-            // via the watch code path -- `watch` exists to wait for a
-            // *future* stage; an already-live one is `mint`'s job. The
-            // one deliberate exception is `--rehearsal`: it never
+            // carry it) so a genuinely already-live stage refuses with
+            // STAGE_ALREADY_LIVE for a real `--auto-send` run, rather
+            // than silently minting immediately via the watch code path.
+            // The one deliberate exception is `--rehearsal`: it never
             // broadcasts, so exercising an already-active stage's full
             // pipeline is safe and useful for testing -- see
             // docs/watch.md's "WATCH vs LIVE" section.
             let opensea =
                 crate::cli::commands::mint::load_opensea_client(StdDuration::from_secs(10)).ok();
-            let decision = crate::cli::commands::resolver_adapters::resolve_watch_stage_decision(
-                plan_args,
-                config_path,
-                opensea.as_ref(),
-                excluded_stage_ids,
-            )
-            .await?;
+            let mut extra_excluded: Vec<crate::domain::stage::StageId> = Vec::new();
 
-            let (stage, already_live) = match decision {
-                crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(stage) => {
-                    (stage, true)
-                }
-                crate::execution::stage_resolver::WatchStageDecision::WaitFor(stage) => {
-                    (stage, false)
-                }
-                crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
-                    reason,
-                } => {
-                    return Err(KairoxError::Session(SessionError::with_kind(
-                        SessionErrorKind::UnsupportedProtocol,
-                        format!(
-                            "no supported stage (active or future) found for this collection: \
-                             {reason}"
-                        ),
-                    )));
-                }
-            };
+            for _ in 0..MAX_LIVE_CHECK_ATTEMPTS {
+                let mut combined_excluded = excluded_stage_ids.to_vec();
+                combined_excluded.extend(extra_excluded.iter().cloned());
 
-            let detection = crate::cli::commands::resolver_adapters::stage_to_detection(&stage);
-            crate::cli::commands::mint::print_resolution_evidence(&detection);
-
-            if already_live && !allow_already_live {
-                return Err(KairoxError::Session(SessionError::with_kind(
-                    SessionErrorKind::StageAlreadyLive,
-                    format!(
-                        "STAGE_ALREADY_LIVE: this mint is already live (a supported, \
-                         eligible-or-unknown stage is active right now) -- watch exists to wait \
-                         for a future stage, not to act on one that already is. Use `kairox \
-                         mint {:#x} --send --yes` instead (or pass --rehearsal to safely \
-                         exercise this stage's pipeline without broadcasting).",
-                        target.collection
-                    ),
-                )));
-            }
-
-            match detection.engine {
-                crate::execution::resolver::ResolvedEngine::Public => {
-                    Ok(ResolvedWatchEngine::Public)
-                }
-                crate::execution::resolver::ResolvedEngine::OpenSea { slug, stage_uuid } => {
-                    Ok(ResolvedWatchEngine::OpenSea { slug, stage_uuid })
-                }
-                crate::execution::resolver::ResolvedEngine::Generic { .. } => {
-                    unreachable!(
-                        "resolve_watch_stage_decision only ever discovers NormalizedStage \
-                         candidates, never a Generic-engine target"
+                let decision =
+                    crate::cli::commands::resolver_adapters::resolve_watch_stage_decision(
+                        plan_args,
+                        config_path,
+                        opensea.as_ref(),
+                        &combined_excluded,
                     )
+                    .await?;
+
+                let (stage, already_live) = match decision {
+                    crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(stage) => {
+                        (stage, true)
+                    }
+                    crate::execution::stage_resolver::WatchStageDecision::WaitFor(stage) => {
+                        (stage, false)
+                    }
+                    crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
+                        reason,
+                    } => {
+                        return Err(KairoxError::Session(SessionError::with_kind(
+                            SessionErrorKind::UnsupportedProtocol,
+                            format!(
+                                "no supported stage (active or future) found for this \
+                                 collection: {reason}"
+                            ),
+                        )));
+                    }
+                };
+
+                // OpenSea's `UnknownUntilActive` eligibility is not proof
+                // of actionability -- see this function's doc comment.
+                // Verify with a real preflight before ever declaring
+                // STAGE_ALREADY_LIVE; a native public stage needs no
+                // equivalent (its capacity fields are already
+                // authoritative on-chain reads).
+                if already_live
+                    && !allow_already_live
+                    && let crate::domain::stage::StageExecutionRef::OpenSea { slug } =
+                        &stage.execution
+                {
+                    let opensea_client = opensea.as_ref().expect(
+                        "an OpenSea stage was discovered above, which requires an OpenSea client",
+                    );
+                    match crate::cli::commands::resolver_adapters::check_opensea_stage_actionable_now(
+                        plan_args,
+                        config_path,
+                        opensea_client,
+                        slug,
+                        target.wallet,
+                        target.quantity,
+                        safety_caps,
+                    )
+                    .await
+                    {
+                        crate::cli::commands::resolver_adapters::OpenSeaLiveActionability::Actionable => {}
+                        crate::cli::commands::resolver_adapters::OpenSeaLiveActionability::NotActionable { detail } => {
+                            eprintln!(
+                                "watch: active stage {:?} is not actionable for this wallet \
+                                 ({detail}) -- excluding it and re-resolving toward a later \
+                                 supported stage, if any",
+                                stage.id
+                            );
+                            extra_excluded.push(stage.id.clone());
+                            continue;
+                        }
+                        crate::cli::commands::resolver_adapters::OpenSeaLiveActionability::Ambiguous(e) => {
+                            return Err(active_stage_eligibility_unknown_error(
+                                target.wallet,
+                                target.collection,
+                                e,
+                            ));
+                        }
+                    }
                 }
+
+                let detection = crate::cli::commands::resolver_adapters::stage_to_detection(&stage);
+                crate::cli::commands::mint::print_resolution_evidence(&detection);
+
+                if already_live && !allow_already_live {
+                    return Err(stage_already_live_error(target.collection));
+                }
+
+                return match detection.engine {
+                    crate::execution::resolver::ResolvedEngine::Public => {
+                        Ok(ResolvedWatchEngine::Public)
+                    }
+                    crate::execution::resolver::ResolvedEngine::OpenSea { slug, stage_uuid } => {
+                        Ok(ResolvedWatchEngine::OpenSea { slug, stage_uuid })
+                    }
+                    crate::execution::resolver::ResolvedEngine::Generic { .. } => {
+                        unreachable!(
+                            "resolve_watch_stage_decision only ever discovers NormalizedStage \
+                             candidates, never a Generic-engine target"
+                        )
+                    }
+                };
             }
+
+            Err(KairoxError::Session(SessionError::with_kind(
+                SessionErrorKind::ActiveStageEligibilityUnknown,
+                format!(
+                    "gave up after {MAX_LIVE_CHECK_ATTEMPTS} attempts excluding active-but-\
+                     not-actionable OpenSea stages for collection {:#x}; refusing to guess \
+                     further",
+                    target.collection
+                ),
+            )))
         }
     }
 }
@@ -663,6 +883,7 @@ async fn wait_for_stage_with_reresolution(
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
     excluded_stage_ids: &[crate::domain::stage::StageId],
+    safety_caps: SafetyCaps,
     currently_selected: &ResolvedWatchEngine,
     mut on_state: impl FnMut(WatchState),
 ) -> Result<OffsetDateTime, KairoxError> {
@@ -678,9 +899,15 @@ async fn wait_for_stage_with_reresolution(
             // already waiting for transitioning to Active during the
             // wait is success, never grounds for a STAGE_ALREADY_LIVE
             // refusal here.
-            let fresh =
-                resolve_watch_engine(target, plan_args, config_path, excluded_stage_ids, true)
-                    .await?;
+            let fresh = resolve_watch_engine(
+                target,
+                plan_args,
+                config_path,
+                excluded_stage_ids,
+                safety_caps,
+                true,
+            )
+            .await?;
             if &fresh != currently_selected {
                 return Err(KairoxError::Session(SessionError::with_kind(
                     SessionErrorKind::StageResolutionChanged,
@@ -1003,6 +1230,7 @@ async fn run_public_watch(
         &plan_args,
         config_path,
         excluded_stage_ids,
+        safety_caps,
         &currently_selected,
         |state| reporter.emit(state),
     )
@@ -1150,6 +1378,7 @@ async fn run_opensea_watch(
         &plan_args,
         config_path,
         excluded_stage_ids,
+        safety_caps,
         &currently_selected,
         |state| reporter.emit(state),
     )

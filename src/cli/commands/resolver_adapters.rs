@@ -50,7 +50,7 @@ use super::plan::build_mint_plan;
 /// Discovers the collection's native on-chain SeaDrop `PublicDrop` stage,
 /// if any, as a [`NormalizedStage`]. `Ok(None)` (not an error) when the
 /// contract genuinely isn't a SeaDrop collection.
-async fn discover_public_stage(
+pub(crate) async fn discover_public_stage(
     plan_args: &PlanArgs,
     config_path: Option<&Path>,
 ) -> Result<Option<NormalizedStage>, KairoxError> {
@@ -268,6 +268,133 @@ async fn discover_opensea_stages(
             })
         })
         .collect())
+}
+
+/// The outcome of checking whether a temporally-`Active`, otherwise
+/// supported OpenSea signed/allowlist/FCFS/FCFA stage is genuinely
+/// actionable for one specific wallet/quantity *right now* -- i.e.
+/// whether `watch` may honestly refuse with `STAGE_ALREADY_LIVE` for it.
+///
+/// True-final-release-gate semantic correction: `WatchStageDecision::AlreadyLive`
+/// alone only proves a stage is temporally active and not already known
+/// to be `Ineligible`/`Unsupported`/exhausted -- `is_candidate` (which
+/// `select_for_watch` uses) deliberately treats
+/// `EligibilityState::UnknownUntilActive` as a selection candidate, which
+/// is correct for *choosing which stage to look at* but is never proof
+/// any specific wallet can actually execute it. This is that missing
+/// proof step for OpenSea stages (a native SeaDrop public stage needs no
+/// equivalent: its `NormalizedStage` capacity fields already come from a
+/// real, authoritative on-chain read -- see `discover_public_stage`).
+pub(crate) enum OpenSeaLiveActionability {
+    /// The official mint-builder response was requested and passed every
+    /// check [`crate::execution::opensea_validate::validate_opensea_mint_response`]
+    /// performs (chain, target, wallet, quantity, value cap, signer) --
+    /// this wallet genuinely can execute this stage right now.
+    Actionable,
+    /// A clear, unambiguous negative outcome (wallet ineligible,
+    /// allocation exhausted, supply exhausted) -- this specific active
+    /// stage is not actionable for this wallet, but that is not itself
+    /// grounds to give up on the collection: a later supported stage may
+    /// still be legitimately watchable.
+    NotActionable { detail: String },
+    /// A transient or unclassifiable outcome (timeout, rate limit,
+    /// server error, or a response that failed local validation) --
+    /// Kairox could not establish actionability in either direction and
+    /// refuses to guess.
+    Ambiguous(KairoxError),
+}
+
+/// Performs the actionability check described on [`OpenSeaLiveActionability`].
+/// Reuses the exact same request path and error classification the real
+/// execution engine uses (`request_mint_with_bounded_retry`,
+/// `validate_opensea_mint_response`) -- never a second, ad-hoc parser --
+/// so one OpenSea response is guaranteed to mean the same thing here as
+/// it would at real T0 dispatch. Stops immediately after local
+/// validation: never signs, never simulates (`eth_estimateGas`), never
+/// broadcasts, never polls a receipt -- only what is required to prove
+/// (or disprove) actionability.
+pub(crate) async fn check_opensea_stage_actionable_now(
+    plan_args: &PlanArgs,
+    config_path: Option<&Path>,
+    opensea: &crate::opensea::client::OpenSeaClient,
+    slug: &str,
+    wallet: alloy_primitives::Address,
+    quantity: u64,
+    safety_caps: crate::domain::fees::SafetyCaps,
+) -> OpenSeaLiveActionability {
+    let registry = crate::chain::registry::ChainRegistry::builtin();
+    let (resolved, runtime) =
+        match resolve_chain_and_runtime(&registry, &plan_args.chain_args, config_path) {
+            Ok(r) => r,
+            Err(e) => return OpenSeaLiveActionability::Ambiguous(e),
+        };
+    let read_client = match connect_read_client(
+        &resolved.info,
+        plan_args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return OpenSeaLiveActionability::Ambiguous(e),
+    };
+    let quantity_u32 = match u32::try_from(quantity) {
+        Ok(q) => q,
+        Err(_) => {
+            return OpenSeaLiveActionability::Ambiguous(KairoxError::Session(
+                crate::execution::errors::SessionError::new(format!(
+                    "quantity {quantity} does not fit the OpenSea mint API's u32 range"
+                )),
+            ));
+        }
+    };
+
+    use crate::opensea::errors::OpenSeaError;
+    let mint_response = match crate::execution::opensea_engine::request_mint_with_bounded_retry(
+        opensea,
+        slug,
+        wallet,
+        quantity_u32,
+    )
+    .await
+    {
+        Ok((response, _retry_count)) => response,
+        Err(
+            e @ (OpenSeaError::EligibilityRejected { .. }
+            | OpenSeaError::AllocationExceeded { .. }
+            | OpenSeaError::SupplyExhausted { .. }),
+        ) => {
+            return OpenSeaLiveActionability::NotActionable {
+                detail: e.to_string(),
+            };
+        }
+        Err(e) => return OpenSeaLiveActionability::Ambiguous(KairoxError::OpenSea(e)),
+    };
+
+    let input = crate::execution::opensea_validate::OpenSeaValidationInput {
+        chain_id: resolved.info.chain_id,
+        expected_seadrop_contract: resolved.seadrop_contract,
+        expected_collection: plan_args.collection,
+        expected_wallet: wallet,
+        expected_quantity: quantity,
+        safety_caps,
+        // Never spend-authorization-grade for OpenSea's own display price
+        // -- see `opensea_display_price_provenance_unavailable`. Omitting
+        // it only skips the optional cross-check; every other field
+        // (target/chain/wallet/quantity/value-cap/signer) is still fully
+        // validated.
+        expected_price_per_token: None,
+    };
+    match crate::execution::opensea_validate::validate_opensea_mint_response(
+        &mint_response,
+        &input,
+        &read_client,
+    )
+    .await
+    {
+        Ok(_validated) => OpenSeaLiveActionability::Actionable,
+        Err(e) => OpenSeaLiveActionability::Ambiguous(e),
+    }
 }
 
 pub(crate) fn stage_to_detection(stage: &NormalizedStage) -> Detection {
