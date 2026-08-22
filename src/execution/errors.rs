@@ -121,6 +121,14 @@ pub enum SessionErrorKind {
     /// entry). Unattended broadcast must never fall back to a permissive
     /// default monetary exposure.
     MissingSpendCaps,
+    /// A long `watch` wait's periodic re-resolution found that the
+    /// currently-targeted stage/engine is no longer what auto-resolution
+    /// would pick right now (a different stage UUID, a changed start
+    /// time, a newly-available earlier stage, or an engine-type change).
+    /// Never itself a failure -- the caller is expected to catch this and
+    /// restart resolution with the fresh answer, exactly like a clear
+    /// ineligibility rejection already does.
+    StageResolutionChanged,
 }
 
 /// An error representing a state Kairox has explicitly decided must halt
@@ -327,7 +335,8 @@ impl KairoxError {
                 SessionErrorKind::MissingSpendCaps => KairoxErrorCode::MissingSpendCaps,
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest
-                | SessionErrorKind::SkippedSharedResourceFailure => KairoxErrorCode::SessionAborted,
+                | SessionErrorKind::SkippedSharedResourceFailure
+                | SessionErrorKind::StageResolutionChanged => KairoxErrorCode::SessionAborted,
             },
         }
     }

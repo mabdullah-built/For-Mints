@@ -4626,6 +4626,156 @@ fn spawn_autodiscovery_server(
     })
 }
 
+// ---------------------------------------------------------------------
+// Round 6 item 10: a long `watch --engine auto` wait must periodically
+// re-run resolution rather than staying permanently committed to
+// whatever it picked before entering the wait. This scenario models
+// item 10.A almost exactly: an on-chain public stage is the only thing
+// visible initially (not yet started, several seconds out), and OpenSea
+// only reveals a genuine, already-active signed presale on the *second*
+// discovery request -- simulating a creator publishing a presale (or
+// OpenSea recovering from a transient outage) after `watch` already
+// started waiting on the native public stage.
+// ---------------------------------------------------------------------
+#[test]
+fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_public_wait() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-watch-reresolution-presale";
+    // Comfortably beyond arm_threshold/poll_interval so wait_for_stage is
+    // genuinely still polling (not yet armed/handed off) when the
+    // re-resolution check fires.
+    let public_stage_start = unix_now() + 20;
+    let opensea_requests: std::sync::Arc<std::sync::atomic::AtomicU32> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let opensea_requests_for_closure = opensea_requests.clone();
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+                    code: -32000,
+                    message: "must never be called: this scenario never dispatches".into(),
+                },
+                _ => read_response_with_stage_window(
+                    &method,
+                    &params,
+                    public_stage_start,
+                    32_503_680_000,
+                )
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!("unexpected RPC method in reresolution scenario: {method}"),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            let n = opensea_requests_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // First discovery request (the initial resolution, before
+                // the wait even begins): genuinely no drop yet.
+                (
+                    path.to_string(),
+                    Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+                )
+            } else {
+                // Every request from here on (the periodic re-resolution
+                // check, and the fresh attempt it triggers): a real,
+                // already-active signed presale -- sold out, so the
+                // restarted attempt terminates quickly and deterministically
+                // once it reaches OpenSea, without needing the full signed
+                // -mint/EIP-712 machinery this test isn't exercising.
+                (
+                    path.to_string(),
+                    rpc_ok_status(serde_json::json!({
+                        "collection_slug": SLUG,
+                        "collection_name": "Test Collection",
+                        "chain": "ethereum",
+                        "contract_address": format!("{NFT:#x}"),
+                        "drop_type": "signed_presale",
+                        "is_minting": true,
+                        "active_stage": {
+                            "uuid": "presale-appeared-mid-wait",
+                            "stage_type": "signed_presale",
+                            "label": null,
+                            "price": "0",
+                            "price_currency_address": "0x0000000000000000000000000000000000000000",
+                            "start_time": "2020-01-01T00:00:00Z",
+                            "end_time": "2999-01-01T00:00:00Z",
+                            "max_per_wallet": "10",
+                        },
+                        "next_stage": null,
+                        "stages": [],
+                        "total_supply": "1",
+                        "max_supply": "1",
+                    })),
+                )
+            }
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_WATCH_RERESOLUTION_INTERVAL_MS", "300")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "restarting the attempt against the fresh resolution",
+        ))
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stderr(predicates::str::contains("sold out"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "this scenario must never reach dispatch"
+    );
+}
+
 #[test]
 fn auto_engine_prefers_auto_discovered_signed_presale_over_active_onchain_public() {
     let wallet = test_signer().address();

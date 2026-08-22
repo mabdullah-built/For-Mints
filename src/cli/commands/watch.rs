@@ -316,8 +316,9 @@ async fn run_single_target(
     // now-irrelevant ranking data.
     const MAX_RESOLUTION_ATTEMPTS: u32 = 4;
     let mut excluded_stage_ids: Vec<crate::domain::stage::StageId> = Vec::new();
-    let mut last_err = None;
-    for attempt in 0..MAX_RESOLUTION_ATTEMPTS {
+    let mut ineligibility_attempts = 0u32;
+    let mut reresolution_restarts = 0u32;
+    loop {
         let plan_args = target.to_plan_args();
         let engine =
             resolve_watch_engine(&target, &plan_args, config_path, &excluded_stage_ids).await?;
@@ -333,6 +334,8 @@ async fn run_single_target(
                     &profile,
                     &signer,
                     safety_caps,
+                    &excluded_stage_ids,
+                    engine.clone(),
                     json,
                 )
                 .await
@@ -341,12 +344,15 @@ async fn run_single_target(
                 run_opensea_watch(
                     target.clone(),
                     slug.clone(),
+                    plan_args,
                     config_path,
                     &poll_config,
                     &resolved,
                     &profile,
                     &signer,
                     safety_caps,
+                    &excluded_stage_ids,
+                    engine.clone(),
                     json,
                 )
                 .await
@@ -356,6 +362,29 @@ async fn run_single_target(
         match result {
             Ok(()) => return Ok(()),
             Err(e) => {
+                // Round 6 item 10: a long wait's periodic re-resolution
+                // found a materially different stage/engine than the one
+                // this attempt started with -- restart against the fresh
+                // resolution. Never a wallet-eligibility signal, never
+                // added to the exclusion list, and bounded independently
+                // of the ineligibility-retry counter below.
+                if matches!(
+                    &e,
+                    KairoxError::Session(SessionError {
+                        kind: SessionErrorKind::StageResolutionChanged,
+                        ..
+                    })
+                ) {
+                    reresolution_restarts += 1;
+                    if reresolution_restarts > MAX_RERESOLUTION_RESTARTS {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "watch: {e} (restart {reresolution_restarts}/{MAX_RERESOLUTION_RESTARTS})"
+                    );
+                    continue;
+                }
+
                 let stage_id = match &engine {
                     ResolvedWatchEngine::OpenSea {
                         stage_uuid: Some(uuid),
@@ -373,24 +402,22 @@ async fn run_single_target(
                     | ResolvedWatchEngine::Public => None,
                 };
                 if let (Some(stage_id), true) = (stage_id, is_clear_ineligibility_rejection(&e)) {
+                    ineligibility_attempts += 1;
+                    if ineligibility_attempts >= MAX_RESOLUTION_ATTEMPTS {
+                        return Err(e);
+                    }
                     eprintln!(
                         "watch: stage {stage_id:?} rejected as ineligible for this wallet \
-                         (attempt {}/{MAX_RESOLUTION_ATTEMPTS}) -- re-resolving, excluding it: {e}",
-                        attempt + 1
+                         (attempt {ineligibility_attempts}/{MAX_RESOLUTION_ATTEMPTS}) -- \
+                         re-resolving, excluding it: {e}"
                     );
                     excluded_stage_ids.push(stage_id);
-                    last_err = Some(e);
                     continue;
                 }
                 return Err(e);
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        KairoxError::Session(SessionError::new(
-            "exhausted re-resolution attempts after repeated stage ineligibility",
-        ))
-    }))
 }
 
 /// `true` only for a fresh, semantically unambiguous OpenSea
@@ -411,6 +438,7 @@ fn is_clear_ineligibility_rejection(err: &KairoxError) -> bool {
     )
 }
 
+#[derive(Clone, PartialEq, Eq)]
 enum ResolvedWatchEngine {
     Public,
     OpenSea {
@@ -476,6 +504,94 @@ async fn resolve_watch_engine(
                 }
             }
         }
+    }
+}
+
+/// How often a long `Auto`-engine wait re-runs full resolution to check
+/// whether the currently-targeted stage is still what auto-resolution
+/// would pick right now. Deliberately coarse (bounded API/RPC traffic,
+/// "no hammering") -- this is a background correctness check for a
+/// multi-hour/multi-day wait, not a tight polling loop; `wait_for_stage`'s
+/// own `poll_interval` already covers the "is the targeted stage open
+/// yet" question at whatever cadence the operator configured.
+const DEFAULT_RERESOLUTION_INTERVAL: StdDuration = StdDuration::from_secs(30);
+
+/// The real interval, honoring `KAIROX_WATCH_RERESOLUTION_INTERVAL_MS` when
+/// set. This override exists solely so tests can observe re-resolution
+/// restart behavior in seconds rather than real minutes -- it is never
+/// documented as an operator-facing tuning flag, and an invalid/absent
+/// value always falls back to [`DEFAULT_RERESOLUTION_INTERVAL`], never a
+/// parse error.
+fn reresolution_interval() -> StdDuration {
+    std::env::var("KAIROX_WATCH_RERESOLUTION_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(StdDuration::from_millis)
+        .unwrap_or(DEFAULT_RERESOLUTION_INTERVAL)
+}
+
+/// Bounded cap on how many times a single long wait may restart due to a
+/// detected material resolution change, independent of
+/// `MAX_RESOLUTION_ATTEMPTS` (which governs restarts after a clear
+/// ineligibility rejection). Generous -- a real stage change is a rare
+/// event even over a very long wait -- but never unbounded.
+const MAX_RERESOLUTION_RESTARTS: u32 = 20;
+
+/// Runs [`wait_for_stage`] (`execution::watch`'s unmodified, hardened
+/// state machine) exactly as-is, but for an `Auto`-selected engine, races
+/// it against a periodic full re-resolution check so a long wait never
+/// remains permanently committed to a stage selection that has gone
+/// stale -- see Round 6 item 10. Returns
+/// `Err(SessionErrorKind::StageResolutionChanged)` the moment a
+/// re-resolution disagrees with `currently_selected`; the caller
+/// (`run_single_target`) is expected to catch that specific kind and
+/// restart the whole attempt (a fresh pool connect + fresh benchmark +
+/// fresh wait against the new selection), exactly like it already does
+/// for a clear ineligibility rejection.
+///
+/// For an operator-forced `--engine public`/`--engine opensea` target
+/// there is no ambiguity to re-check (`resolve_watch_engine` is
+/// deterministic for those), so this is a pure pass-through to
+/// `wait_for_stage` with no extra RPC/API traffic at all.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_stage_with_reresolution(
+    probe: &dyn StageProbe,
+    poll_config: &WatchPollConfig,
+    target: &WatchTarget,
+    plan_args: &PlanArgs,
+    config_path: Option<&Path>,
+    excluded_stage_ids: &[crate::domain::stage::StageId],
+    currently_selected: &ResolvedWatchEngine,
+    mut on_state: impl FnMut(WatchState),
+) -> Result<OffsetDateTime, KairoxError> {
+    if !matches!(target.engine, EngineSelection::Auto) {
+        return wait_for_stage(probe, poll_config, on_state).await;
+    }
+
+    let reresolution_check = async {
+        loop {
+            tokio::time::sleep(reresolution_interval()).await;
+            let fresh =
+                resolve_watch_engine(target, plan_args, config_path, excluded_stage_ids).await?;
+            if &fresh != currently_selected {
+                return Err(KairoxError::Session(SessionError::with_kind(
+                    SessionErrorKind::StageResolutionChanged,
+                    "periodic re-resolution during a long wait found a materially different \
+                     stage/engine than the one currently being waited on (a creator-changed \
+                     start time, a new earlier-supported stage, a changed stage identity, or \
+                     an OpenSea recovery/outage) -- restarting the attempt against the fresh \
+                     resolution",
+                )));
+            }
+            // Unchanged: loop and re-check again after another interval.
+        }
+    };
+    tokio::pin!(reresolution_check);
+
+    tokio::select! {
+        biased;
+        result = wait_for_stage(probe, poll_config, &mut on_state) => result,
+        changed = &mut reresolution_check => changed,
     }
 }
 
@@ -660,6 +776,8 @@ async fn run_public_watch(
     profile: &ExecutionProfile,
     signer: &dyn Signer,
     safety_caps: SafetyCaps,
+    excluded_stage_ids: &[crate::domain::stage::StageId],
+    currently_selected: ResolvedWatchEngine,
     json: bool,
 ) -> Result<(), KairoxError> {
     let started_at = OffsetDateTime::now_utc();
@@ -687,7 +805,17 @@ async fn run_public_watch(
         store: &telemetry,
         network_source: pool.preferred_read(),
     };
-    let stage_start = wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
+    let stage_start = wait_for_stage_with_reresolution(
+        &probe,
+        poll_config,
+        &target,
+        &plan_args,
+        config_path,
+        excluded_stage_ids,
+        &currently_selected,
+        |state| print_state(&state),
+    )
+    .await?;
     // NOTE: no telemetry/reporting output here -- this is the boundary
     // between "stage detected as open" and dispatch preparation. Nothing
     // optional runs between here and the broadcast; the telemetry
@@ -768,12 +896,15 @@ async fn run_public_watch(
 async fn run_opensea_watch(
     target: WatchTarget,
     slug: String,
-    _config_path: Option<&Path>,
+    plan_args: PlanArgs,
+    config_path: Option<&Path>,
     poll_config: &WatchPollConfig,
     resolved: &crate::cli::context::ResolvedChain,
     profile: &ExecutionProfile,
     signer: &dyn Signer,
     safety_caps: SafetyCaps,
+    excluded_stage_ids: &[crate::domain::stage::StageId],
+    currently_selected: ResolvedWatchEngine,
     json: bool,
 ) -> Result<(), KairoxError> {
     let started_at = OffsetDateTime::now_utc();
@@ -804,7 +935,17 @@ async fn run_opensea_watch(
     // knowable ahead of T0 -- wallet-specific eligibility/proof/
     // authorization is only ever obtained from the real mint-request call
     // `run_opensea_mint` makes below, never fabricated here.
-    wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
+    wait_for_stage_with_reresolution(
+        &probe,
+        poll_config,
+        &target,
+        &plan_args,
+        config_path,
+        excluded_stage_ids,
+        &currently_selected,
+        |state| print_state(&state),
+    )
+    .await?;
     // No telemetry/reporting output here -- see run_public_watch's
     // identical comment; printed only after dispatch/receipt, below.
     print_state(&WatchState::Arming);
