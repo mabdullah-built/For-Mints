@@ -687,23 +687,12 @@ impl StageProbe for TelemetryProbe<'_> {
         let result = self.inner.probe().await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        // A poisoned telemetry mutex is never allowed to affect the real
-        // probe outcome -- telemetry is strictly advisory, so a recording
-        // failure here is silently skipped, never propagated or panicked
-        // on. Cheap and in-memory only -- never a network call -- so this
-        // always runs, even on a result about to hand off.
-        if let Ok(mut store) = self.store.lock() {
-            match &result {
-                Ok(_) => store.record_probe_success(self.label, elapsed_ms),
-                Err(_) => store.record_probe_failure(self.label),
-            }
-        }
-
-        // About to hand off (or terminate) -- skip every optional network
-        // telemetry call for this cycle and return `result` right now.
-        // Mirrors `wait_for_stage`'s own `remaining <= arm_threshold`
-        // check exactly, so this can never disagree with the real
-        // handoff decision made a moment later by the caller.
+        // About to hand off (or terminate)? Computed purely from `result`
+        // -- no lock involved -- so this check itself can never be
+        // delayed by anything. Mirrors `wait_for_stage`'s own
+        // `remaining <= arm_threshold` check exactly, so this can never
+        // disagree with the real handoff decision made a moment later by
+        // the caller.
         let about_to_hand_off_or_terminate = match &result {
             Ok(snapshot) => {
                 matches!(snapshot.status, crate::domain::timing::StageStatus::Ended)
@@ -711,6 +700,21 @@ impl StageProbe for TelemetryProbe<'_> {
             }
             Err(_) => true,
         };
+
+        // Cheap, in-memory-only latency/outcome recording. Even though
+        // this never does network I/O, the mutex itself is OPTIONAL work
+        // -- a MANDATORY stage observation must never wait on lock
+        // contention either, so this uses `try_lock`, never `lock`: if
+        // another thread happens to be holding it, the sample is simply
+        // dropped rather than waited for. A poisoned lock is handled
+        // identically (treated as "unavailable right now").
+        if let Ok(mut store) = self.store.try_lock() {
+            match &result {
+                Ok(_) => store.record_probe_success(self.label, elapsed_ms),
+                Err(_) => store.record_probe_failure(self.label),
+            }
+        }
+
         if about_to_hand_off_or_terminate {
             return result;
         }
@@ -725,8 +729,10 @@ impl StageProbe for TelemetryProbe<'_> {
         // `--poll-interval-secs` -- an aggressive poll interval (e.g. 1s)
         // must never turn into optional network RPC traffic every single
         // second for the whole (possibly very long) wait. This check is a
-        // fast, in-memory lock only; it never itself performs I/O.
-        let due_for_telemetry = match self.store.lock() {
+        // fast, in-memory `try_lock` only; it never itself performs I/O
+        // and never waits on contention (a busy lock here simply means
+        // "skip telemetry this cycle", never "wait").
+        let due_for_telemetry = match self.store.try_lock() {
             Ok(store) => !matches!(
                 store.network.latest_block_number(),
                 crate::chain::telemetry::Freshness::Fresh { age, .. }
@@ -739,7 +745,7 @@ impl StageProbe for TelemetryProbe<'_> {
         }
 
         if let Some(client) = self.network_source {
-            if let Ok(mut store) = self.store.lock() {
+            if let Ok(mut store) = self.store.try_lock() {
                 store.record_endpoint_identity(
                     client.label().unwrap_or("(unlabeled send-pool endpoint)"),
                     client.role(),
@@ -748,7 +754,7 @@ impl StageProbe for TelemetryProbe<'_> {
             if let Ok(block) = client.latest_block().await {
                 let priority_fee = client.max_priority_fee_per_gas().await.ok();
                 if let Some(base_fee) = block.base_fee_per_gas
-                    && let Ok(mut store) = self.store.lock()
+                    && let Ok(mut store) = self.store.try_lock()
                 {
                     store.record_network_observation(
                         block.number,
@@ -901,6 +907,16 @@ async fn run_public_watch(
         network_source: pool.preferred_read(),
         arm_threshold: poll_config.arm_threshold,
     };
+    // Round 6 (final hardening pass) item 1: every progress event from
+    // here through dispatch is emitted through a non-blocking reporter
+    // (`ProgressReporter::emit` is a `try_send`, never awaited, never
+    // blocking) -- a stalled stderr consumer can no longer delay a
+    // MANDATORY stage observation or any step of the dispatch-critical
+    // path. The dedicated consumer task owns all the actual `eprintln!`
+    // work, running independently.
+    let reporter = crate::cli::progress_reporter::ProgressReporter::spawn(|state: WatchState| {
+        print_state(&state)
+    });
     let stage_start = wait_for_stage_with_reresolution(
         &probe,
         poll_config,
@@ -909,7 +925,7 @@ async fn run_public_watch(
         config_path,
         excluded_stage_ids,
         &currently_selected,
-        |state| print_state(&state),
+        |state| reporter.emit(state),
     )
     .await?;
     // NOTE: no telemetry/reporting output here -- this is the boundary
@@ -917,7 +933,7 @@ async fn run_public_watch(
     // optional runs between here and the broadcast; the telemetry
     // summary is printed only after the whole send/receipt sequence
     // completes, below.
-    print_state(&WatchState::Arming);
+    reporter.emit(WatchState::Arming);
 
     let request = LiveMintRequest {
         chain: resolved.info.clone(),
@@ -940,14 +956,18 @@ async fn run_public_watch(
     config.skip_benchmark = true;
 
     let outcome = run_live_mint(&mut pool, signer, &request, &config, |progress| {
-        print_state(&live_progress_to_watch_state(&progress))
+        reporter.emit(live_progress_to_watch_state(&progress))
     })
     .await?;
 
-    print_state(&WatchState::Success);
-    // Telemetry is printed here, after dispatch/receipt -- never between
-    // stage-open detection and broadcast. See the module's regression
-    // test proving this ordering.
+    reporter.emit(WatchState::Success);
+    // Only now, after dispatch/receipt, is it safe to block briefly:
+    // flush the reporter (bounded, never more than
+    // `progress_reporter::FINISH_TIMEOUT`) so the summary lines above
+    // aren't lost, then print the telemetry summary directly -- never
+    // between stage-open detection and broadcast. See the module's
+    // regression test proving this ordering.
+    reporter.finish().await;
     print_telemetry_summary(&telemetry);
 
     if json {
@@ -1032,6 +1052,12 @@ async fn run_opensea_watch(
     // knowable ahead of T0 -- wallet-specific eligibility/proof/
     // authorization is only ever obtained from the real mint-request call
     // `run_opensea_mint` makes below, never fabricated here.
+    //
+    // Same non-blocking reporter design as `run_public_watch` -- see its
+    // identical comment.
+    let reporter = crate::cli::progress_reporter::ProgressReporter::spawn(|state: WatchState| {
+        print_state(&state)
+    });
     wait_for_stage_with_reresolution(
         &probe,
         poll_config,
@@ -1040,12 +1066,12 @@ async fn run_opensea_watch(
         config_path,
         excluded_stage_ids,
         &currently_selected,
-        |state| print_state(&state),
+        |state| reporter.emit(state),
     )
     .await?;
     // No telemetry/reporting output here -- see run_public_watch's
     // identical comment; printed only after dispatch/receipt, below.
-    print_state(&WatchState::Arming);
+    reporter.emit(WatchState::Arming);
 
     let request = OpenSeaMintRequest {
         chain: resolved.info.clone(),
@@ -1070,11 +1096,12 @@ async fn run_opensea_watch(
     };
 
     let outcome = run_opensea_mint(&opensea, &mut pool, signer, &request, |progress| {
-        print_state(&opensea_progress_to_watch_state(&progress))
+        reporter.emit(opensea_progress_to_watch_state(&progress))
     })
     .await?;
 
-    print_state(&WatchState::Success);
+    reporter.emit(WatchState::Success);
+    reporter.finish().await;
     print_telemetry_summary(&telemetry);
 
     if json {
@@ -1635,5 +1662,115 @@ mod telemetry_probe_critical_path_tests {
             "a second probe cycle immediately after the first must not re-issue the network \
              telemetry read before NETWORK_TELEMETRY_MIN_INTERVAL has elapsed"
         );
+    }
+
+    /// Final hardening pass item 2: a telemetry mutex held by another
+    /// thread for 500ms must never delay delivery of an active-stage
+    /// handoff -- `try_lock` skips the sample rather than waiting.
+    #[tokio::test]
+    async fn a_contended_telemetry_lock_never_delays_an_active_stage_result() {
+        let inner = FakeAboutToHandOffProbe;
+        let store = std::sync::Arc::new(Mutex::new(
+            crate::chain::telemetry::TelemetryStore::default(),
+        ));
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: None,
+            arm_threshold: Duration::seconds(10),
+        };
+
+        // Hold the lock from another (blocking, non-tokio) thread for
+        // 500ms while the async probe runs concurrently on this test's
+        // own tokio task.
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let store_for_thread = store.clone();
+        let held_for_thread = held.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = store_for_thread.lock().unwrap();
+            held_for_thread.wait();
+            std::thread::sleep(StdDuration::from_millis(500));
+        });
+        held.wait();
+
+        let started = std::time::Instant::now();
+        let result = probe.probe().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result.status, StageStatus::Active { .. }));
+        assert!(
+            elapsed < StdDuration::from_millis(200),
+            "a contended telemetry lock must never delay an active-stage handoff, took {elapsed:?}"
+        );
+        holder.join().unwrap();
+    }
+
+    /// Final hardening pass item 2: a poisoned telemetry lock must also
+    /// never delay delivery of an active-stage handoff (complements the
+    /// existing `a_poisoned_telemetry_lock_never_alters_the_stage_result`,
+    /// which proves correctness far from T0; this proves latency exactly
+    /// at the handoff boundary).
+    #[tokio::test]
+    async fn a_poisoned_telemetry_lock_never_delays_an_active_stage_result() {
+        let inner = FakeAboutToHandOffProbe;
+        let store = Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.lock().unwrap();
+            panic!("simulated panic while holding the telemetry lock");
+        }));
+        assert!(store.is_poisoned());
+
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: None,
+            arm_threshold: Duration::seconds(10),
+        };
+
+        let started = std::time::Instant::now();
+        let result = probe.probe().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result.status, StageStatus::Active { .. }));
+        assert!(elapsed < StdDuration::from_millis(100));
+    }
+
+    /// Final hardening pass item 2: far from T0, a busy telemetry lock
+    /// causes the sample to be silently dropped -- stage semantics
+    /// (the returned snapshot) are unaffected either way.
+    #[tokio::test]
+    async fn a_busy_telemetry_lock_far_from_t0_drops_the_sample_without_affecting_stage_semantics()
+    {
+        let inner = FakeFarFromT0Probe;
+        let store = std::sync::Arc::new(Mutex::new(
+            crate::chain::telemetry::TelemetryStore::default(),
+        ));
+        let probe = TelemetryProbe {
+            inner: &inner,
+            label: "test",
+            store: &store,
+            network_source: None,
+            arm_threshold: Duration::seconds(10),
+        };
+
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let store_for_thread = store.clone();
+        let held_for_thread = held.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = store_for_thread.lock().unwrap();
+            held_for_thread.wait();
+            std::thread::sleep(StdDuration::from_millis(300));
+        });
+        held.wait();
+
+        // Stage semantics are correct regardless of the lock contention
+        // above -- this is the only load-bearing assertion here; whether
+        // the probe/failure sample itself was recorded or silently
+        // dropped under contention is unobserved and irrelevant.
+        let result = probe.probe().await.unwrap();
+        assert!(matches!(result.status, StageStatus::NotStarted { .. }));
+        holder.join().unwrap();
     }
 }

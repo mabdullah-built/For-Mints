@@ -727,11 +727,22 @@ async fn run_send_public(
     }
     config.rehearsal = args.rehearsal;
 
+    // Non-blocking progress reporting (final hardening pass item 1) --
+    // see `cli::progress_reporter`'s module docs. `mint --send` is a
+    // single, shorter-lived attempt (no long wait beforehand), but the
+    // same stalled-consumer risk applies to every synchronous progress
+    // print inside `run_live_mint`'s dispatch-critical checkpoint loop,
+    // so it gets the identical treatment `watch` does.
     let mut receipt_pending_announced = false;
+    let reporter =
+        crate::cli::progress_reporter::ProgressReporter::spawn(move |progress: LiveProgress| {
+            report_progress(progress, &mut receipt_pending_announced)
+        });
     let outcome = run_live_mint(&mut pool, &signer, &request, &config, |progress| {
-        report_progress(progress, &mut receipt_pending_announced)
+        reporter.emit(progress)
     })
     .await?;
+    reporter.finish().await;
 
     if json || output.is_some() {
         let broadcast =
@@ -932,10 +943,14 @@ async fn run_send_opensea(
         rehearsal: args.rehearsal,
     };
 
+    // Non-blocking progress reporting -- see run_send_public's identical
+    // comment and `cli::progress_reporter`'s module docs.
+    let reporter = crate::cli::progress_reporter::ProgressReporter::spawn(report_opensea_progress);
     let outcome = run_opensea_mint(&opensea, &mut pool, &signer, &request, |progress| {
-        report_opensea_progress(progress)
+        reporter.emit(progress)
     })
     .await?;
+    reporter.finish().await;
 
     if json || output.is_some() {
         let broadcast =

@@ -8,6 +8,7 @@ pub mod commands;
 pub mod context;
 pub mod format;
 pub mod gather;
+pub mod progress_reporter;
 pub mod report;
 
 use clap::Parser;
