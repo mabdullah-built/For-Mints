@@ -19,4 +19,5 @@ pub mod receipt;
 pub mod resolver;
 pub mod scheduler;
 pub mod stage_resolver;
+pub mod thirdweb_engine;
 pub mod watch;

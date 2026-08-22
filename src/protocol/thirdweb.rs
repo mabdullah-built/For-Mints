@@ -18,6 +18,7 @@ use alloy_sol_types::{SolCall, sol};
 use thiserror::Error;
 
 sol! {
+    #[derive(Debug)]
     // Verified against thirdweb-dev/contracts `contracts/extension/Drop.sol`
     // and `contracts/extension/interface/IDropSinglePhase.sol`.
     struct ClaimConditionAbi {
@@ -31,6 +32,7 @@ sol! {
         string metadata;
     }
 
+    #[derive(Debug)]
     struct AllowlistProofAbi {
         bytes32[] proof;
         uint256 quantityLimitPerWallet;
