@@ -174,4 +174,89 @@ mod tests {
 
         assert_eq!(rendered.load(Ordering::SeqCst), 6);
     }
+
+    /// Final hardening pass item 9: measure `emit()`'s own overhead
+    /// (never the consumer's rendering time, which is independent) under
+    /// three conditions -- consumer draining immediately, consumer
+    /// permanently stalled, and no consumer at all (channel already
+    /// closed). No fragile microsecond gate: just a generous upper bound
+    /// and a printed median/p90/p95 for a human to read, proving overhead
+    /// stays negligible and independent of how fast anything downstream
+    /// consumes.
+    // A permanently-stalled consumer occupies one worker thread forever
+    // (matching real production, where the runtime is multi-threaded via
+    // `#[tokio::main]`) -- the default single-threaded `#[tokio::test]`
+    // runtime would starve the test's own task behind it, since a
+    // synchronous, never-yielding closure can't be preempted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn emit_overhead_is_negligible_and_independent_of_consumer_speed() {
+        fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let at = |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize];
+            (at(0.5), at(0.9), at(0.95))
+        }
+
+        const SAMPLES: usize = 500;
+
+        // Condition 1: consumer draining immediately.
+        let draining = ProgressReporter::spawn(|_item: u32| {});
+        let mut draining_ns = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES as u32 {
+            let started = std::time::Instant::now();
+            draining.emit(i);
+            draining_ns.push(started.elapsed().as_nanos());
+        }
+        draining.finish().await;
+
+        // Condition 2: consumer permanently stalled (first item blocks it
+        // forever; the bounded queue behind it fills and every emit past
+        // that point is a guaranteed-full try_send).
+        let stalled = ProgressReporter::spawn_with_capacity(1, |_item: u32| {
+            // Long enough to stay stalled for this test's entire
+            // measurement window (well under a second), short enough
+            // that a torn-down runtime's worker thread doesn't linger
+            // past the test process's own lifetime by much.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        stalled.emit(0); // occupies the consumer thread
+        tokio::time::sleep(Duration::from_millis(20)).await; // let it actually start
+        let mut stalled_ns = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES as u32 {
+            let started = std::time::Instant::now();
+            stalled.emit(i);
+            stalled_ns.push(started.elapsed().as_nanos());
+        }
+
+        // Condition 3: no consumer at all (its task already exited, e.g.
+        // panicked) -- `tx` is still alive so `emit()` still runs its
+        // real try_send path, just against a permanently-closed channel.
+        let disabled = ProgressReporter::spawn(|_item: u32| panic!("consumer exits immediately"));
+        disabled.emit(0);
+        tokio::time::sleep(Duration::from_millis(20)).await; // let it actually exit
+        let mut disabled_ns = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES as u32 {
+            let started = std::time::Instant::now();
+            disabled.emit(i);
+            disabled_ns.push(started.elapsed().as_nanos());
+        }
+
+        let (d_p50, d_p90, d_p95) = percentiles(draining_ns);
+        let (s_p50, s_p90, s_p95) = percentiles(stalled_ns);
+        let (x_p50, x_p90, x_p95) = percentiles(disabled_ns);
+        println!(
+            "emit() overhead (ns): draining p50={d_p50} p90={d_p90} p95={d_p95} | \
+             stalled p50={s_p50} p90={s_p90} p95={s_p95} | \
+             disabled p50={x_p50} p90={x_p90} p95={x_p95}"
+        );
+
+        // Generous, never fragile: emit() is a single try_send, so even a
+        // slow CI box should stay several orders of magnitude under 1ms.
+        for p95 in [d_p95, s_p95, x_p95] {
+            assert!(
+                p95 < 1_000_000,
+                "emit() p95 overhead should be well under 1ms regardless of consumer state, \
+                 got {p95}ns"
+            );
+        }
+    }
 }
