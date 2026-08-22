@@ -466,6 +466,55 @@ async fn resolve_watch_engine(
     }
 }
 
+/// Decorates any [`StageProbe`] with bounded, in-memory, advisory-only
+/// latency/outcome telemetry -- see `chain::telemetry`'s module docs for
+/// the full rationale and invariants. Deliberately implemented as a pure
+/// decorator around an existing probe, rather than a change to
+/// `execution::watch::wait_for_stage` itself: telemetry piggybacks on
+/// I/O the watch loop already performs every poll, so recording it adds
+/// no new RPC/HTTP call, no new task, and zero risk to
+/// `wait_for_stage`'s own already-hardened state machine (which remains
+/// completely unmodified).
+struct TelemetryProbe<'a> {
+    inner: &'a dyn StageProbe,
+    label: &'a str,
+    store: &'a std::sync::Mutex<crate::chain::telemetry::TelemetryStore>,
+}
+
+#[async_trait::async_trait]
+impl StageProbe for TelemetryProbe<'_> {
+    async fn probe(&self) -> Result<StageSnapshot, KairoxError> {
+        let started = std::time::Instant::now();
+        let result = self.inner.probe().await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        // A poisoned telemetry mutex is never allowed to affect the real
+        // probe outcome -- telemetry is strictly advisory, so a recording
+        // failure here is silently skipped, never propagated or panicked
+        // on.
+        if let Ok(mut store) = self.store.lock() {
+            match &result {
+                Ok(_) => store.record_probe_success(self.label, elapsed_ms),
+                Err(_) => store.record_probe_failure(self.label),
+            }
+        }
+        result
+    }
+}
+
+/// Prints one advisory-only summary line per endpoint/probe observed
+/// during the wait -- purely informational, never consulted by any
+/// downstream decision. `eprintln!`'d once, right after `wait_for_stage`
+/// returns (i.e. once, well before T0's own critical path -- this is
+/// not on it).
+fn print_telemetry_summary(store: &std::sync::Mutex<crate::chain::telemetry::TelemetryStore>) {
+    let Ok(store) = store.lock() else {
+        return;
+    };
+    for line in store.summary_lines() {
+        eprintln!("watch: telemetry (advisory only): {line}");
+    }
+}
+
 struct PublicStageProbe<'a> {
     plan_args: &'a PlanArgs,
     config_path: Option<&'a Path>,
@@ -562,11 +611,18 @@ async fn run_public_watch(
     let started_at = OffsetDateTime::now_utc();
     let session_id = crate::cli::report::generate_session_id();
 
-    let probe = PublicStageProbe {
+    let inner_probe = PublicStageProbe {
         plan_args: &plan_args,
         config_path,
     };
+    let telemetry = std::sync::Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+    let probe = TelemetryProbe {
+        inner: &inner_probe,
+        label: "public-stage-probe",
+        store: &telemetry,
+    };
     let stage_start = wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
+    print_telemetry_summary(&telemetry);
     print_state(&WatchState::Arming);
 
     let mut pool = connect_send_pool(
@@ -650,15 +706,22 @@ async fn run_opensea_watch(
     let started_at = OffsetDateTime::now_utc();
     let session_id = crate::cli::report::generate_session_id();
     let opensea = load_opensea_client(StdDuration::from_secs(10))?;
-    let probe = OpenSeaStageProbe {
+    let inner_probe = OpenSeaStageProbe {
         opensea: &opensea,
         slug: &slug,
+    };
+    let telemetry = std::sync::Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+    let probe = TelemetryProbe {
+        inner: &inner_probe,
+        label: "opensea-drop-details-probe",
+        store: &telemetry,
     };
     // Per the OpenSea engine's own design, only stage timing/supply is
     // knowable ahead of T0 -- wallet-specific eligibility/proof/
     // authorization is only ever obtained from the real mint-request call
     // `run_opensea_mint` makes below, never fabricated here.
     wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
+    print_telemetry_summary(&telemetry);
     print_state(&WatchState::Arming);
 
     let mut pool = connect_send_pool(resolved, target.chain_args.rpc_url.as_ref(), None).await?;

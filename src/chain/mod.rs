@@ -7,3 +7,4 @@ pub mod mock;
 pub mod pool;
 pub mod registry;
 pub mod rpc;
+pub mod telemetry;
