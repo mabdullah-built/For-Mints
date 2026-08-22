@@ -67,6 +67,150 @@ fn contract_matches(reported: &str, expected: Address) -> bool {
     reported.parse::<Address>().is_ok_and(|a| a == expected)
 }
 
+/// A structured classification of one [`resolve_drop`] attempt --
+/// final hardening pass item 5. Nothing in Kairox's actual control flow
+/// (exclusion lists, re-resolution comparisons) has ever depended on
+/// parsing diagnostic text; this type exists so that fact is also true
+/// by construction going forward, and so a caller reasoning about "what
+/// happened" never has to pattern-match on `Result<Option<T>, E>`
+/// directly. It never fabricates a stage -- `Available` is the only
+/// variant that carries drop data, and it is only ever produced from a
+/// genuine `resolve_drop` success.
+#[derive(Debug)]
+pub enum OpenSeaDiscoveryOutcome {
+    /// A genuine, contract-matched drop was found.
+    Available(Box<DropDetailedResponse>),
+    /// OpenSea authoritatively reports no drop for this collection (a
+    /// real 404, or no candidate slug matched) -- distinct from every
+    /// other variant, none of which permit this conclusion.
+    NoDrop,
+    /// OpenSea rejected the configured API key.
+    AuthenticationFailed,
+    /// OpenSea rate-limited this request.
+    RateLimited,
+    /// A transport, timeout, server, or malformed-response problem --
+    /// discovery could not be completed. Never evidence of "no drop".
+    TransientFailure(OpenSeaError),
+}
+
+impl OpenSeaDiscoveryOutcome {
+    /// Classify one `resolve_drop` result. Exhaustive over every
+    /// [`OpenSeaError`] variant `resolve_drop` can actually produce, so
+    /// this can never silently miscategorize a new error case as
+    /// `NoDrop` by falling through a wildcard arm.
+    pub fn classify(result: Result<Option<DropDetailedResponse>, OpenSeaError>) -> Self {
+        match result {
+            Ok(Some(details)) => Self::Available(Box::new(details)),
+            Ok(None) => Self::NoDrop,
+            Err(OpenSeaError::AuthenticationFailed) => Self::AuthenticationFailed,
+            Err(OpenSeaError::RateLimited) => Self::RateLimited,
+            Err(e) => Self::TransientFailure(e),
+        }
+    }
+
+    /// `true` only for a result that is itself proof of "no drop" --
+    /// never true for a degraded/uncheckable outcome, which must never
+    /// be treated as equivalent evidence.
+    pub fn is_authoritative_no_drop(&self) -> bool {
+        matches!(self, Self::NoDrop)
+    }
+
+    /// `true` for any outcome where discovery could not be completed at
+    /// all (as opposed to completing and finding nothing) -- the class
+    /// of outcomes a caller should retry (bounded) rather than trust as
+    /// a final answer.
+    pub fn is_degraded(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthenticationFailed | Self::RateLimited | Self::TransientFailure(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod discovery_outcome_tests {
+    use super::*;
+
+    fn drop() -> DropDetailedResponse {
+        DropDetailedResponse {
+            collection_slug: "test".to_string(),
+            collection_name: None,
+            chain: "ethereum".to_string(),
+            contract_address: "0x0".to_string(),
+            drop_type: "seadrop_v1_erc721".to_string(),
+            is_minting: true,
+            active_stage: None,
+            next_stage: None,
+            stages: vec![],
+            total_supply: None,
+            max_supply: None,
+        }
+    }
+
+    #[test]
+    fn a_genuine_drop_classifies_as_available_and_is_never_degraded() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Ok(Some(drop())));
+        assert!(matches!(outcome, OpenSeaDiscoveryOutcome::Available(_)));
+        assert!(!outcome.is_authoritative_no_drop());
+        assert!(!outcome.is_degraded());
+    }
+
+    #[test]
+    fn a_genuine_404_classifies_as_authoritative_no_drop_and_is_never_degraded() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Ok(None));
+        assert!(outcome.is_authoritative_no_drop());
+        assert!(!outcome.is_degraded());
+    }
+
+    #[test]
+    fn a_server_error_is_degraded_never_no_drop() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Err(OpenSeaError::ServerError {
+            detail: "internal error".to_string(),
+        }));
+        assert!(outcome.is_degraded());
+        assert!(!outcome.is_authoritative_no_drop());
+        assert!(matches!(
+            outcome,
+            OpenSeaDiscoveryOutcome::TransientFailure(_)
+        ));
+    }
+
+    #[test]
+    fn a_timeout_is_degraded_never_no_drop() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Err(OpenSeaError::ApiTimeout));
+        assert!(outcome.is_degraded());
+        assert!(!outcome.is_authoritative_no_drop());
+    }
+
+    #[test]
+    fn a_rate_limit_is_its_own_distinct_degraded_variant_never_no_drop() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Err(OpenSeaError::RateLimited));
+        assert!(matches!(outcome, OpenSeaDiscoveryOutcome::RateLimited));
+        assert!(outcome.is_degraded());
+        assert!(!outcome.is_authoritative_no_drop());
+    }
+
+    #[test]
+    fn an_auth_failure_is_its_own_distinct_degraded_variant_never_no_drop() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Err(OpenSeaError::AuthenticationFailed));
+        assert!(matches!(
+            outcome,
+            OpenSeaDiscoveryOutcome::AuthenticationFailed
+        ));
+        assert!(outcome.is_degraded());
+        assert!(!outcome.is_authoritative_no_drop());
+    }
+
+    #[test]
+    fn a_transport_failure_is_degraded_never_no_drop() {
+        let outcome = OpenSeaDiscoveryOutcome::classify(Err(OpenSeaError::ApiUnavailable {
+            detail: "connection reset".to_string(),
+        }));
+        assert!(outcome.is_degraded());
+        assert!(!outcome.is_authoritative_no_drop());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

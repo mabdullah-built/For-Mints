@@ -167,26 +167,36 @@ async fn discover_opensea_stages(
         return Ok(Vec::new());
     };
 
+    // Round 6 (final hardening pass) item 5: classified through the
+    // typed `OpenSeaDiscoveryOutcome` rather than an ad-hoc
+    // `Ok(Some)`/`Ok(None)`/`Err` match -- structurally distinguishes
+    // "no drop" from every degraded (auth/rate-limit/transient) outcome,
+    // so nothing downstream can conflate "couldn't check" with "checked,
+    // nothing there".
+    use crate::opensea::discovery::OpenSeaDiscoveryOutcome;
     let max_attempts: u32 = if allow_not_yet_started { 3 } else { 1 };
     let mut details = None;
-    let mut last_transient_err = None;
+    let mut last_degraded_outcome = None;
     for attempt in 0..max_attempts {
-        match crate::opensea::discovery::resolve_drop(
-            opensea,
-            chain_identifier,
-            plan_args.collection,
-        )
-        .await
-        {
-            Ok(Some(d)) => {
+        let outcome = OpenSeaDiscoveryOutcome::classify(
+            crate::opensea::discovery::resolve_drop(
+                opensea,
+                chain_identifier,
+                plan_args.collection,
+            )
+            .await,
+        );
+        match outcome {
+            OpenSeaDiscoveryOutcome::Available(d) => {
                 details = Some(d);
                 break;
             }
             // A genuine 404 (or an unmatched candidate) is authoritative,
             // not transient -- retrying it would never change the answer.
-            Ok(None) => break,
-            Err(e) => {
-                last_transient_err = Some(e);
+            OpenSeaDiscoveryOutcome::NoDrop => break,
+            degraded => {
+                debug_assert!(degraded.is_degraded());
+                last_degraded_outcome = Some(degraded);
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
@@ -194,9 +204,23 @@ async fn discover_opensea_stages(
         }
     }
     let Some(details) = details else {
-        if let Some(e) = last_transient_err {
+        if let Some(outcome) = last_degraded_outcome {
+            let reason = match outcome {
+                OpenSeaDiscoveryOutcome::AuthenticationFailed => {
+                    "OPENSEA_DISCOVERY_UNAVAILABLE (authentication failed)".to_string()
+                }
+                OpenSeaDiscoveryOutcome::RateLimited => {
+                    "OPENSEA_DISCOVERY_UNAVAILABLE (rate limited)".to_string()
+                }
+                OpenSeaDiscoveryOutcome::TransientFailure(e) => {
+                    format!("OPENSEA_DISCOVERY_UNAVAILABLE (transient failure: {e})")
+                }
+                OpenSeaDiscoveryOutcome::Available(_) | OpenSeaDiscoveryOutcome::NoDrop => {
+                    unreachable!("only degraded outcomes are ever stored here")
+                }
+            };
             eprintln!(
-                "OpenSea auto-discovery unavailable after {max_attempts} attempt(s) ({e}); \
+                "OpenSea auto-discovery unavailable after {max_attempts} attempt(s): {reason}; \
                  proceeding as if no OpenSea drop was found for this collection -- this is NOT \
                  proof no signed stage exists, only that it could not be checked"
             );
