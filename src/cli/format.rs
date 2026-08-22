@@ -1,6 +1,6 @@
 //! Small, dependency-free display helpers shared by CLI commands.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use url::Url;
@@ -31,6 +31,25 @@ pub fn parse_gwei_to_wei(field: &str, value: &str) -> Result<u128, KairoxError> 
             "{field} '{value}' overflows when converted to wei"
         )))
     })
+}
+
+/// Parse a `0x`-prefixed 32-byte hex string (e.g. one entry of an
+/// operator-supplied Merkle proof) into a [`B256`], with a clear error
+/// message naming the offending field. Never guesses at a shorter/longer
+/// value's meaning -- an allowlist proof entry of the wrong length is a
+/// caller mistake that must fail closed, not silently pad/truncate.
+pub fn parse_b256_hex(field: &str, value: &str) -> Result<B256, KairoxError> {
+    let stripped = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(stripped).map_err(|e| {
+        KairoxError::Session(SessionError::new(format!("invalid {field} '{value}': {e}")))
+    })?;
+    if bytes.len() != 32 {
+        return Err(KairoxError::Session(SessionError::new(format!(
+            "invalid {field} '{value}': expected exactly 32 bytes, got {}",
+            bytes.len()
+        ))));
+    }
+    Ok(B256::from_slice(&bytes))
 }
 
 pub fn format_unix(seconds: u64) -> String {
@@ -253,6 +272,31 @@ mod tests {
     #[test]
     fn parse_gwei_to_wei_multiplies_by_1e9() {
         assert_eq!(parse_gwei_to_wei("x", "2").unwrap(), 2_000_000_000u128);
+    }
+
+    #[test]
+    fn parse_b256_hex_accepts_0x_prefixed_value() {
+        let hex_str = format!("0x{}", "11".repeat(32));
+        let parsed = parse_b256_hex("x", &hex_str).unwrap();
+        assert_eq!(parsed, B256::from([0x11u8; 32]));
+    }
+
+    #[test]
+    fn parse_b256_hex_accepts_unprefixed_value() {
+        let hex_str = "22".repeat(32);
+        let parsed = parse_b256_hex("x", &hex_str).unwrap();
+        assert_eq!(parsed, B256::from([0x22u8; 32]));
+    }
+
+    #[test]
+    fn parse_b256_hex_rejects_wrong_length() {
+        assert!(parse_b256_hex("x", "0x1234").is_err());
+    }
+
+    #[test]
+    fn parse_b256_hex_rejects_non_hex() {
+        let bogus = format!("0x{}", "zz".repeat(32));
+        assert!(parse_b256_hex("x", &bogus).is_err());
     }
 
     #[test]

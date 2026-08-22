@@ -36,7 +36,7 @@ pub enum Command {
     /// Produce a dry-run execution plan for a public mint.
     Plan(PlanArgs),
     /// Dry run by default. Pass --send (with --yes, or interactive confirmation) to broadcast live.
-    Mint(MintArgs),
+    Mint(Box<MintArgs>),
     /// Connect to every configured RPC endpoint for a chain and report latency/role/capability. Never signs or broadcasts.
     Bench(BenchArgs),
     /// Write a safe starter config file. Never generates wallets, private keys, or API key values.
@@ -272,6 +272,35 @@ pub struct MintArgs {
     /// --wallet-manifest and --engine opensea.
     #[arg(long)]
     pub opensea_api_concurrency: Option<usize>,
+    /// One 32-byte hex Merkle proof node (0x-prefixed or not), proving this
+    /// wallet's inclusion in a gated thirdweb claim phase's allowlist. Pass
+    /// once per proof node, in order, exactly as exported by the project's
+    /// own claim page or thirdweb dashboard -- Kairox never derives or
+    /// brute-forces a proof itself. Only meaningful with --engine thirdweb;
+    /// required whenever the resolved claim condition's merkleRoot is
+    /// nonzero, ignored for a public (merkleRoot == 0) phase.
+    #[arg(long = "allowlist-proof")]
+    pub allowlist_proof: Vec<String>,
+    /// Overrides this wallet's per-wallet claim limit for the allowlist
+    /// entry above, in tokens (decimal). Only consulted together with
+    /// --allowlist-proof. Defaults to "0", meaning "use the claim
+    /// condition's own per-wallet limit" -- a nonzero value here always
+    /// overrides it (verified against thirdweb's Drop.sol).
+    #[arg(long, requires = "allowlist_proof", default_value = "0")]
+    pub allowlist_quantity_limit_per_wallet: String,
+    /// Overrides this wallet's allowlist price per token, in wei (decimal).
+    /// Only consulted together with --allowlist-proof. If omitted, the
+    /// claim condition's own price is used unmodified -- note this is
+    /// genuinely different from passing "0", which is a legitimate
+    /// free-mint override (the real sentinel for "no override" is
+    /// internal, not user-facing).
+    #[arg(long, requires_all = ["allowlist_proof", "allowlist_currency"])]
+    pub allowlist_price_per_token_wei: Option<String>,
+    /// The ERC-20 currency address the allowlist price override above is
+    /// denominated in. Required if --allowlist-price-per-token-wei is
+    /// given; ignored otherwise.
+    #[arg(long, requires = "allowlist_proof")]
+    pub allowlist_currency: Option<Address>,
 }
 
 #[derive(Args, Debug)]

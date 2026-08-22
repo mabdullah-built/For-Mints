@@ -15,7 +15,7 @@ use crate::chain::registry::ChainRegistry;
 use crate::cli::args::{EngineSelection, MintArgs};
 use crate::cli::commands::plan::{build_mint_plan, print_plan};
 use crate::cli::context::resolve_chain_and_runtime;
-use crate::cli::format::{format_unix, parse_wei};
+use crate::cli::format::{format_unix, parse_b256_hex, parse_wei};
 use crate::domain::fees::SafetyCaps;
 use crate::domain::timing::SleepSegment;
 use crate::execution::broadcast::BroadcastSummary;
@@ -892,13 +892,47 @@ async fn run_send_public(
     Ok(())
 }
 
-/// `kairox mint --engine thirdweb --send` -- public-phase (no allowlist
-/// gating) native-currency claims only, for now; see
-/// `execution::thirdweb_engine`'s module doc comment for the exact
-/// scope. An operator-supplied allowlist-proof CLI flag for gated phases
-/// is explicit follow-up work -- the engine itself already supports it
-/// (`ThirdwebMintRequest::allowlist_proof`), only the CLI plumbing to
-/// accept one does not exist yet.
+/// Parse `--allowlist-proof`/`--allowlist-quantity-limit-per-wallet`/
+/// `--allowlist-price-per-token-wei`/`--allowlist-currency` into an
+/// [`OperatorAllowlistProof`](crate::execution::thirdweb_engine::OperatorAllowlistProof),
+/// or `None` when no proof was supplied (a public, non-gated phase).
+/// `clap`'s `requires` constraints already guarantee
+/// `allowlist_price_per_token_wei` implies `allowlist_currency`, and both
+/// imply `allowlist_proof`; nothing here re-derives or brute-forces a
+/// proof -- only what the operator explicitly passed is used.
+fn parse_thirdweb_allowlist_proof(
+    args: &MintArgs,
+) -> Result<Option<crate::execution::thirdweb_engine::OperatorAllowlistProof>, KairoxError> {
+    if args.allowlist_proof.is_empty() {
+        return Ok(None);
+    }
+    let proof = args
+        .allowlist_proof
+        .iter()
+        .map(|entry| parse_b256_hex("--allowlist-proof", entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    let quantity_limit_per_wallet = parse_wei(
+        "--allowlist-quantity-limit-per-wallet",
+        &args.allowlist_quantity_limit_per_wallet,
+    )?;
+    let price_per_token = match &args.allowlist_price_per_token_wei {
+        Some(value) => parse_wei("--allowlist-price-per-token-wei", value)?,
+        None => crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
+    };
+    let currency = args.allowlist_currency.unwrap_or_default();
+    Ok(Some(
+        crate::execution::thirdweb_engine::OperatorAllowlistProof {
+            proof,
+            quantity_limit_per_wallet,
+            price_per_token,
+            currency,
+        },
+    ))
+}
+
+/// `kairox mint --engine thirdweb --send` -- public and allowlist-gated
+/// (via --allowlist-proof) native-currency claims; see
+/// `execution::thirdweb_engine`'s module doc comment for the exact scope.
 async fn run_send_thirdweb(
     args: MintArgs,
     config_path: Option<&std::path::Path>,
@@ -999,6 +1033,8 @@ async fn run_send_thirdweb(
         max_total_spend: parse_wei("--max-total-spend-wei", &args.plan_args.max_total_spend_wei)?,
     };
 
+    let allowlist_proof = parse_thirdweb_allowlist_proof(&args)?;
+
     let request = crate::execution::thirdweb_engine::ThirdwebMintRequest {
         chain: resolved.info.clone(),
         drop_contract: args.plan_args.collection,
@@ -1006,7 +1042,7 @@ async fn run_send_thirdweb(
         quantity: args.plan_args.quantity,
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
         safety_caps,
-        allowlist_proof: None,
+        allowlist_proof,
     };
 
     let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
@@ -1418,6 +1454,7 @@ fn report_opensea_progress(progress: OpenSeaProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{Address, B256, U256};
 
     #[test]
     fn yes_flag_always_satisfies_without_reading_input() {
@@ -1448,5 +1485,105 @@ mod tests {
     #[test]
     fn closed_stdin_aborts_rather_than_defaulting_to_confirmed() {
         assert!(!confirmation_satisfied(false, || None));
+    }
+
+    fn parse_mint_args(extra: &[&str]) -> MintArgs {
+        use clap::Parser;
+        let mut argv = vec![
+            "kairox",
+            "mint",
+            "0x0000000000000000000000000000000000000001",
+            "--engine",
+            "thirdweb",
+            "--wallet",
+            "0x0000000000000000000000000000000000000002",
+        ];
+        argv.extend_from_slice(extra);
+        match crate::cli::args::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::args::Command::Mint(args) => *args,
+            other => panic!("expected Command::Mint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_allowlist_flags_yields_no_proof() {
+        let args = parse_mint_args(&[]);
+        assert!(parse_thirdweb_allowlist_proof(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn allowlist_proof_without_overrides_uses_no_price_override_sentinel_and_zero_limit() {
+        let hex_entry = format!("0x{}", "ab".repeat(32));
+        let args = parse_mint_args(&["--allowlist-proof", &hex_entry]);
+        let proof = parse_thirdweb_allowlist_proof(&args).unwrap().unwrap();
+        assert_eq!(proof.proof.len(), 1);
+        assert_eq!(proof.quantity_limit_per_wallet, U256::from(0));
+        assert_eq!(
+            proof.price_per_token,
+            crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE
+        );
+        assert_eq!(proof.currency, Address::ZERO);
+    }
+
+    #[test]
+    fn allowlist_proof_accepts_multiple_nodes_in_order() {
+        let a = format!("0x{}", "11".repeat(32));
+        let b = format!("0x{}", "22".repeat(32));
+        let args = parse_mint_args(&["--allowlist-proof", &a, "--allowlist-proof", &b]);
+        let proof = parse_thirdweb_allowlist_proof(&args).unwrap().unwrap();
+        assert_eq!(
+            proof.proof,
+            vec![B256::from([0x11u8; 32]), B256::from([0x22u8; 32])]
+        );
+    }
+
+    #[test]
+    fn allowlist_price_override_requires_currency_and_is_enforced_by_clap() {
+        use clap::Parser;
+        let hex_entry = format!("0x{}", "ab".repeat(32));
+        let result = crate::cli::args::Cli::try_parse_from([
+            "kairox",
+            "mint",
+            "0x0000000000000000000000000000000000000001",
+            "--engine",
+            "thirdweb",
+            "--wallet",
+            "0x0000000000000000000000000000000000000002",
+            "--allowlist-proof",
+            &hex_entry,
+            "--allowlist-price-per-token-wei",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allowlist_proof_with_explicit_overrides_parses_all_fields() {
+        let hex_entry = format!("0x{}", "cd".repeat(32));
+        let args = parse_mint_args(&[
+            "--allowlist-proof",
+            &hex_entry,
+            "--allowlist-quantity-limit-per-wallet",
+            "5",
+            "--allowlist-price-per-token-wei",
+            "0",
+            "--allowlist-currency",
+            "0x0000000000000000000000000000000000000003",
+        ]);
+        let proof = parse_thirdweb_allowlist_proof(&args).unwrap().unwrap();
+        assert_eq!(proof.quantity_limit_per_wallet, U256::from(5));
+        assert_eq!(proof.price_per_token, U256::from(0));
+        assert_eq!(
+            proof.currency,
+            "0x0000000000000000000000000000000000000003"
+                .parse::<Address>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_allowlist_proof_hex_fails_closed() {
+        let args = parse_mint_args(&["--allowlist-proof", "0xnothex"]);
+        assert!(parse_thirdweb_allowlist_proof(&args).is_err());
     }
 }

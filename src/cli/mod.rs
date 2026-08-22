@@ -35,7 +35,7 @@ async fn run_with(config_path: Option<std::path::PathBuf>, command: Command) -> 
         }
         Command::Inspect(args) => commands::inspect::run(args, config_path).await,
         Command::Plan(args) => commands::plan::run(args, config_path).await,
-        Command::Mint(args) => commands::mint::run(args, config_path).await,
+        Command::Mint(args) => commands::mint::run(*args, config_path).await,
         Command::Bench(args) => commands::bench::run(args, config_path).await,
         Command::Init(args) => commands::init::run(args),
         Command::Receipt(args) => commands::receipt::run(args, config_path).await,
