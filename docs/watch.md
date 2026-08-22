@@ -17,7 +17,50 @@ kairox watch --manifest watchlist.toml --auto-send
 ```
 
 For an already-open stage, use `kairox mint <collection> --send --yes`
-instead -- `watch` is specifically for a stage that has not opened yet.
+instead -- `watch` is specifically for a stage that has not opened yet. A
+real `watch --auto-send` run that resolves to a stage which is already
+active refuses outright with `STAGE_ALREADY_LIVE` rather than silently
+acting like `mint`; see "WATCH vs LIVE" below.
+
+## WATCH vs LIVE
+
+Kairox's semantic contract is fixed across all three ways of engaging a
+stage:
+
+- **LIVE** (act now, on a stage that is already open):
+  `kairox mint <collection> --send --yes`.
+- **UPCOMING** (wait for a stage that has not opened yet, then act
+  automatically at T0): `kairox watch <collection> --auto-send`.
+- **SAFE WATCH REHEARSAL** (exercise the full watch pipeline -- resolve,
+  benchmark, poll, sign -- against any stage, active or not, without ever
+  broadcasting): `kairox watch <collection> --rehearsal`.
+
+A real, non-rehearsal `watch --auto-send` never silently behaves like
+`mint`. If its resolution -- run through the exact same
+eligibility/capacity model (`select_for_watch`/`is_candidate`/
+`has_known_capacity`) `mint --engine auto` uses -- lands on a stage that
+is already `Active`, supported, and eligible-or-unknown, `watch` refuses
+immediately with `STAGE_ALREADY_LIVE` and points the operator at `kairox
+mint <collection> --send --yes`, before any signing, before any
+broadcast. This is never emitted merely because *some* stage on the
+collection happens to be active: an active stage whose wallet allocation
+or supply is already exhausted is not a candidate at all under that same
+model, so `watch` correctly reports the real exhaustion outcome (or, if
+a genuine future supported stage still exists, continues waiting for
+it) instead of fabricating `STAGE_ALREADY_LIVE` from the timestamp
+alone.
+
+The one deliberate exception is `--rehearsal`: because it can never
+broadcast, exercising an already-active stage's full pipeline end to end
+is safe and useful for testing, so `watch --rehearsal` is intentionally
+allowed to proceed through an active stage without the `STAGE_ALREADY_LIVE`
+refusal. A real, non-rehearsal `--auto-send` run still treats an
+already-live eligible stage as `STAGE_ALREADY_LIVE`. The periodic
+re-resolution check that runs during an in-progress wait (see below) is
+a third, separate case: it always allows a stage transitioning to
+`Active` mid-wait, since that transition is the wait succeeding, not an
+error -- the `STAGE_ALREADY_LIVE` refusal applies only to a real run's
+*initial* resolution.
 
 ## Architecture
 
