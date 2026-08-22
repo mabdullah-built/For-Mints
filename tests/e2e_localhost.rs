@@ -5377,6 +5377,213 @@ fn watch_engine_opensea_slug_auto_send_on_an_active_signed_stage_with_verified_e
     );
 }
 
+/// Promotion-gate item 1: the explicit-slug negative case the prior
+/// pass's positive test (`..._verified_eligibility_...`) never actually
+/// covered -- an active signed stage the wallet is clearly ineligible
+/// for, with no future stage inside that same explicitly-requested slug
+/// (`next_stage: null`, per `opensea_stage_json`). Must terminate on the
+/// genuine ineligibility outcome: never `STAGE_ALREADY_LIVE` (it isn't),
+/// never `ACTIVE_STAGE_ELIGIBILITY_UNKNOWN` (the rejection is
+/// unambiguous, not ambiguous), never signed/broadcast, never
+/// re-resolved/bounced outside the operator's explicit slug (an
+/// operator-provided `--slug` carries no discovered stage identity to
+/// exclude -- see `is_clear_ineligibility_rejection`'s doc comment --
+/// so this is a single, direct, un-retried terminal failure).
+#[test]
+fn watch_engine_opensea_slug_active_signed_ineligible_with_no_future_stage_in_slug_terminates_cleanly()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-explicit-slug-active-signed-ineligible-no-future";
+
+    let server = spawn_active_signed_stage_server(SLUG, || {
+        Behavior::HttpStatus(
+            422,
+            serde_json::json!({"errors": ["wallet is not on the allowlist"]}),
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--auto-send",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE").not())
+        .stderr(predicates::str::contains("ACTIVE_STAGE_ELIGIBILITY_UNKNOWN").not());
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a clearly-ineligible active stage must never be signed or broadcast"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|(m, _)| m == "eth_getTransactionReceipt"),
+        "no receipt polling must ever occur without a broadcast"
+    );
+}
+
+/// Promotion-gate item 1's second requirement: an explicit `--slug` with
+/// a genuine *future* stage (no `active_stage` at all yet -- only
+/// `next_stage`) must remain completely unaffected by the new
+/// already-live preflight, since `is_temporally_active` is false and the
+/// check is never even attempted. Real, non-rehearsal `--auto-send`
+/// waits, then dispatches normally once the stage opens.
+#[test]
+fn watch_engine_opensea_slug_future_stage_waits_then_executes_normally() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-explicit-slug-future-stage";
+    const SIGNER_SEED: &str = "kairox-e2e-explicit-slug-future-stage-signer";
+    let stage_start = unix_now() + 2;
+    let start_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_start as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" => echo_tx_hash_behavior(&params),
+                "eth_getTransactionReceipt" => {
+                    let queried_hash = params
+                        .get(0)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    rpc_ok(serde_json::json!({
+                        "transactionHash": queried_hash,
+                        "status": "0x1",
+                        "blockNumber": "0x1",
+                        "logs": [transfer_log_for(wallet, 11)],
+                    }))
+                }
+                _ => opensea_read_response(
+                    &method,
+                    &params,
+                    None,
+                    Some(permissive_signed_mint_validation_params()),
+                    Some(true),
+                )
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!(
+                        "unexpected RPC method in explicit-slug-future scenario: {method}"
+                    ),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "collection_slug": SLUG,
+                    "collection_name": "Test Collection",
+                    "chain": "ethereum",
+                    "contract_address": format!("{NFT:#x}"),
+                    "drop_type": "signed_presale",
+                    "is_minting": true,
+                    "active_stage": null,
+                    "next_stage": {
+                        "uuid": "future-stage",
+                        "stage_type": "signed_presale",
+                        "label": null,
+                        "price": "0",
+                        "price_currency_address": "0x0000000000000000000000000000000000000000",
+                        "start_time": start_rfc3339,
+                        "end_time": "2999-01-01T00:00:00Z",
+                        "max_per_wallet": "10",
+                    },
+                    "stages": [],
+                    "total_supply": null,
+                    "max_supply": null,
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            (
+                path.to_string(),
+                rpc_ok_status(signed_mint_response_json(
+                    wallet,
+                    sample_mint_params_abi(true),
+                    SIGNER_SEED,
+                    U256::from(1u64),
+                )),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "opensea",
+            "--slug",
+            SLUG,
+            "--auto-send",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("STAGE_ALREADY_LIVE").not())
+        .stdout(predicates::str::contains("BROADCAST RESULT"));
+
+    let received = server.received.lock().unwrap();
+    let sends: Vec<_> = received
+        .iter()
+        .filter(|(m, _)| m == "eth_sendRawTransaction")
+        .collect();
+    assert_eq!(sends.len(), 1, "expected exactly one broadcast: {sends:?}");
+}
+
 #[test]
 fn watch_wrong_chain_detected_before_any_wait() {
     let signer = test_signer();

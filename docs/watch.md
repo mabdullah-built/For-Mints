@@ -373,8 +373,11 @@ browser headers.
 
 ## Remaining limitations
 
-- No `--json`/`--output` structured report yet (text/stderr progress only);
-  the final broadcast/receipt result reuses `mint`'s existing text report.
+- `--json` is supported (one JSON object per target on stdout, reusing
+  `mint`'s existing schema; progress/warning text always stays on
+  stderr in that mode) -- see `watch_json_report_is_exactly_one_valid_json_object_over_real_http`.
+  `--output <path>` (writing the same report to a file) is not yet
+  implemented for `watch`, unlike `mint`/`plan`.
 - The signing key is loaded once at watch start (immediately after VERIFY,
   before any waiting) and held in process memory for the full wait, the same
   trust model an unattended process already implies elsewhere in Kairox --
