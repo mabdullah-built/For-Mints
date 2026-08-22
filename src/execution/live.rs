@@ -31,8 +31,14 @@ pub struct LiveMintConfig {
     pub scheduler: SchedulerTimings,
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
-    /// Benchmark sampling policy applied to the pool before endpoint
-    /// selection. See [`crate::chain::benchmark`].
+    /// Reserved for a caller-side full benchmark performed *before*
+    /// calling [`run_live_mint`] (e.g. `watch`'s early, well-before-T0
+    /// ranking pass). `run_live_mint` itself always benchmarks with
+    /// [`BenchmarkConfig::minimal`] internally, regardless of this field --
+    /// see that constructor's doc comment for why. Kept on this struct so
+    /// a caller building a full profile-derived config doesn't need a
+    /// second, parallel settings type merely to carry this value through
+    /// to its own separate early-benchmark call.
     pub benchmark: BenchmarkConfig,
     /// Exclusion thresholds applied when selecting read/send endpoints
     /// from benchmark data.
@@ -148,12 +154,18 @@ pub async fn run_live_mint(
 ) -> Result<LiveMintOutcome, KairoxError> {
     let mut metrics = LatencyMetrics::default();
 
-    // BENCHMARK: bounded, repeated latency samples of every read-capable
-    // endpoint. Never broadcasts anything, never sends a real transaction
-    // merely to measure a send-only endpoint.
+    // BENCHMARK: exactly one reachability/role-correctness sample per
+    // read-capable endpoint -- never the full multi-sample ranking pass
+    // (`config.benchmark`, still available to a caller with time to spare
+    // before calling this function). An already-live mint has no lead
+    // time to hide a multi-second synchronous ranking benchmark in; see
+    // `chain::benchmark::BenchmarkConfig::minimal`'s doc comment. Never
+    // broadcasts anything, never sends a real transaction merely to
+    // measure a send-only endpoint.
     on_progress(LiveProgress::Benchmarking);
     let benchmark_sw = Stopwatch::start();
-    pool.benchmark_all(&config.benchmark).await;
+    pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::minimal())
+        .await;
     metrics.benchmark_ms = Some(benchmark_sw.elapsed_ms());
 
     // REWARM (near-T0 prewarm): refresh liveness on every already-connected

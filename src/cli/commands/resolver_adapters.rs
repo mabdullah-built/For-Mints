@@ -386,16 +386,23 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
                 None
             };
 
-            if let Some(standard) = expected_standard {
-                let metadata = provider
-                    .fetch(self.plan_args.collection)
-                    .await
-                    .map_err(|e| {
-                        KairoxError::Session(crate::execution::errors::SessionError::new(format!(
-                            "verified-metadata provider {} error: {e}",
-                            provider.name()
-                        )))
-                    })?;
+            // A metadata-provider transport/server error is never treated
+            // as verification evidence of any kind (positive or
+            // negative) -- but it also never aborts the whole session,
+            // exactly like an OpenSea auto-discovery error above: a
+            // provider being briefly unreachable must not take down a
+            // resolution that still has a safe (never-broadcasting,
+            // LOW-confidence) operator-schema fallback available below.
+            let metadata = if let Some(standard) = expected_standard {
+                match provider.fetch(self.plan_args.collection).await {
+                    Ok(metadata) => Some((metadata, standard)),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some((metadata, standard)) = metadata {
                 match crate::execution::generic_semantics::resolve_mint_function(
                     &metadata, standard,
                 ) {

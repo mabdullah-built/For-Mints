@@ -38,6 +38,28 @@ impl Default for BenchmarkConfig {
     }
 }
 
+impl BenchmarkConfig {
+    /// Exactly one sample per endpoint, no inter-sample delay -- enough to
+    /// establish reachability/role-correctness (which
+    /// [`super::pool::RpcPool::benchmark_all`] always still checks in
+    /// full), without the multi-sample ranking pass's added latency. Used
+    /// on the already-live single-wallet critical path
+    /// ([`crate::execution::live::run_live_mint`],
+    /// [`crate::execution::opensea_engine::run_opensea_mint`]) instead of
+    /// a full [`Self::default`]-shaped config: an already-active mint has
+    /// no time budget to hide a multi-second ranking benchmark in, and a
+    /// single sample still proves every read-capable endpoint is reachable
+    /// and chain-verified before selection. `watch` still gets full
+    /// multi-sample ranking, performed well before T0 -- see
+    /// `cli::commands::watch`'s early-benchmark step.
+    pub const fn minimal() -> Self {
+        Self {
+            sample_count: 1,
+            sample_delay: Duration::ZERO,
+        }
+    }
+}
+
 /// Aggregate latency statistics computed from a bounded, fixed-size sample
 /// set. Deliberately simple — sample count, min/max/mean/median/p90/p95,
 /// and failure/timeout counts are enough to make a safe selection decision

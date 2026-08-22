@@ -59,6 +59,10 @@ pub struct OpenSeaMintRequest {
     pub safety_caps: SafetyCaps,
     pub receipt_poll_interval: StdDuration,
     pub receipt_timeout: StdDuration,
+    /// Reserved for a caller-side full benchmark performed *before*
+    /// calling [`run_opensea_mint`] -- see [`super::live::LiveMintConfig::benchmark`]'s
+    /// doc comment (same rationale). `run_opensea_mint` always benchmarks
+    /// internally with [`crate::chain::benchmark::BenchmarkConfig::minimal`].
     pub benchmark: crate::chain::benchmark::BenchmarkConfig,
     pub health: crate::chain::benchmark::HealthPolicy,
     pub prewarm_lead: StdDuration,
@@ -119,10 +123,14 @@ pub async fn run_opensea_mint(
 
     let mut metrics = LatencyMetrics::default();
 
-    // BENCHMARK — identical role to the public engine's.
+    // BENCHMARK — identical role to the public engine's: exactly one
+    // reachability/role-correctness sample per read-capable endpoint, not
+    // the full multi-sample ranking pass -- see
+    // `live::LiveMintConfig::benchmark`'s doc comment.
     on_progress(OpenSeaProgress::Benchmarking);
     let sw = Stopwatch::start();
-    pool.benchmark_all(&request.benchmark).await;
+    pool.benchmark_all(&crate::chain::benchmark::BenchmarkConfig::minimal())
+        .await;
     metrics.benchmark_ms = Some(sw.elapsed_ms());
 
     // PRE-STAGE OPENSEA PREPARATION: fetching drop details is both how
