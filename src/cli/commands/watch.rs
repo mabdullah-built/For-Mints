@@ -492,6 +492,16 @@ struct TelemetryProbe<'a> {
     inner: &'a dyn StageProbe,
     label: &'a str,
     store: &'a std::sync::Mutex<crate::chain::telemetry::TelemetryStore>,
+    /// A read-capable client from the same already-connected, already
+    /// -warm send `RpcPool` `watch` maintains for dispatch (never a new
+    /// connection). When present, each probe cycle also takes one
+    /// additional bounded, read-only `eth_getBlockByNumber` (+
+    /// best-effort `eth_maxPriorityFeePerGas`) sample to populate
+    /// [`crate::chain::telemetry::NetworkTelemetry`]. `None` when the
+    /// pool currently has no healthy read-capable client -- network
+    /// telemetry is then simply left unpopulated for this cycle, never a
+    /// reason to fail the real probe.
+    network_source: Option<&'a crate::chain::rpc::RpcClient>,
 }
 
 #[async_trait::async_trait]
@@ -500,6 +510,35 @@ impl StageProbe for TelemetryProbe<'_> {
         let started = std::time::Instant::now();
         let result = self.inner.probe().await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        // A best-effort, read-only network observation -- entirely
+        // separate from `self.inner.probe()`'s own outcome above, and
+        // never allowed to affect it: a failure here is silently
+        // dropped, never propagated. See `NetworkTelemetry`'s doc
+        // comment for why this is safe to call every poll cycle (it
+        // reuses an already-connected client, never opens a new one).
+        if let Some(client) = self.network_source {
+            if let Ok(mut store) = self.store.lock() {
+                store.record_endpoint_identity(
+                    client.label().unwrap_or("(unlabeled send-pool endpoint)"),
+                    client.role(),
+                );
+            }
+            if let Ok(block) = client.latest_block().await {
+                let priority_fee = client.max_priority_fee_per_gas().await.ok();
+                if let Some(base_fee) = block.base_fee_per_gas
+                    && let Ok(mut store) = self.store.lock()
+                {
+                    store.record_network_observation(
+                        block.number,
+                        block.timestamp,
+                        base_fee,
+                        priority_fee,
+                    );
+                }
+            }
+        }
+
         // A poisoned telemetry mutex is never allowed to affect the real
         // probe outcome -- telemetry is strictly advisory, so a recording
         // failure here is silently skipped, never propagated or panicked
@@ -646,6 +685,7 @@ async fn run_public_watch(
         inner: &inner_probe,
         label: "public-stage-probe",
         store: &telemetry,
+        network_source: pool.preferred_read(),
     };
     let stage_start = wait_for_stage(&probe, poll_config, |state| print_state(&state)).await?;
     // NOTE: no telemetry/reporting output here -- this is the boundary
@@ -758,6 +798,7 @@ async fn run_opensea_watch(
         inner: &inner_probe,
         label: "opensea-drop-details-probe",
         store: &telemetry,
+        network_source: pool.preferred_read(),
     };
     // Per the OpenSea engine's own design, only stage timing/supply is
     // knowable ahead of T0 -- wallet-specific eligibility/proof/
