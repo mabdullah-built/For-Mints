@@ -96,27 +96,48 @@ pub struct ContractResponse {
     pub name: Option<String>,
 }
 
-/// Best-effort mapping from OpenSea's `DropStageResponse.stage_type` wire
-/// string to a [`StageProtocol`]. Deliberately conservative: an
-/// unrecognized string returns `None` rather than a guessed protocol --
-/// callers must treat `None` as "do not auto-route this stage", never as
-/// "assume public". `"public"`/`"signed_presale"` are the two values
-/// independently confirmed against real Robinhood-mainnet acceptance
-/// evidence (`GET /api/v2/drops/{slug}` for a real signed-presale-then-public
-/// collection); `"presale"`/`"fcfs"`/`"fcfa"` are SeaDrop's own well-known
-/// terminology, included defensively but not independently re-verified
-/// against a live response this pass. Misclassifying a stage here only
-/// affects Kairox's own routing *preference* -- the actual mint transaction
-/// OpenSea returns is always independently re-validated (target/collection/
-/// wallet/quantity/value) before signing, regardless of what label this
-/// function assigned.
+/// Mapping from OpenSea's `DropStageResponse.stage_type` wire string to a
+/// [`StageProtocol`] -- deliberately containing **only** wire values with
+/// genuine, first-party evidence, per Kairox's fail-closed trust model:
+/// a UI label or SeaDrop's own terminology is never treated as protocol
+/// semantics.
+///
+/// `"signed_presale"` is the one value here: it is quoted verbatim in real
+/// Robinhood-mainnet acceptance evidence (`GET /api/v2/drops/{slug}`'s
+/// actual response for a real signed-presale-then-public collection).
+///
+/// An earlier version of this function also mapped `"public"`,
+/// `"presale"`, `"allowlist"`, `"whitelist"`, `"fcfs"`, and `"fcfa"`. Those
+/// were removed on review: none had genuine first-party evidence --
+/// `"presale"`/`"allowlist"`/`"whitelist"`/`"fcfs"`/`"fcfa"` were inferred
+/// from SeaDrop's own terminology (exactly the kind of UI-label-as-protocol
+/// guess this trust model forbids), and `"public"` was asserted as
+/// "independently confirmed" in that version's doc comment when the actual
+/// acceptance evidence only ever quotes the *signed presale* stage's
+/// `stage_type` string -- the public stage's wire value was never actually
+/// observed. Independent research this pass (OpenSea's own reference docs)
+/// found a documented example value of `"public_sale"`, not `"public"`,
+/// reinforcing that the removed mapping would likely have been wrong.
+///
+/// Removing an entry here is always safe, never a regression: an
+/// unrecognized `stage_type` (including a genuinely public one) simply
+/// returns `None`, and [`super::super::cli::commands::resolver_adapters::OpenSeaDropsAdapter`]
+/// treats `None` as "do not auto-prefer this stage over native SeaDrop" --
+/// never as "assume public" or any other guess. A real public-only OpenSea
+/// stage with no on-chain SeaDrop fallback would, with this narrower
+/// mapping, need an explicit `--slug` rather than being auto-routed; that
+/// is the correct fail-closed tradeoff until `"public_sale"` (or whatever
+/// the real value is) is independently re-verified and added back with its
+/// own evidence.
+///
+/// Misclassifying (or failing to classify) a stage here only ever affects
+/// Kairox's own routing *preference* -- the actual mint transaction OpenSea
+/// returns is always independently re-validated (target/collection/wallet/
+/// quantity/value) before signing, regardless of what this function
+/// decided.
 pub fn map_stage_type(stage_type: &str) -> Option<StageProtocol> {
     match stage_type.to_ascii_lowercase().as_str() {
-        "public" => Some(StageProtocol::Public),
         "signed_presale" => Some(StageProtocol::SignedPresale),
-        "presale" | "allowlist" | "whitelist" => Some(StageProtocol::Allowlist),
-        "fcfs" => Some(StageProtocol::Fcfs),
-        "fcfa" => Some(StageProtocol::Fcfa),
         _ => None,
     }
 }
@@ -181,11 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn map_stage_type_recognizes_public_and_signed_presale() {
-        assert_eq!(map_stage_type("public"), Some(StageProtocol::Public));
-        assert_eq!(map_stage_type("PUBLIC"), Some(StageProtocol::Public));
+    fn map_stage_type_recognizes_only_the_evidenced_signed_presale_value() {
         assert_eq!(
             map_stage_type("signed_presale"),
+            Some(StageProtocol::SignedPresale)
+        );
+        assert_eq!(
+            map_stage_type("SIGNED_PRESALE"),
             Some(StageProtocol::SignedPresale)
         );
     }
@@ -194,6 +217,29 @@ mod tests {
     fn map_stage_type_never_guesses_an_unrecognized_string() {
         assert_eq!(map_stage_type("mystery_stage"), None);
         assert_eq!(map_stage_type(""), None);
+    }
+
+    #[test]
+    fn map_stage_type_no_longer_infers_public_or_seadrop_terminology() {
+        // Regression test for the trust-model fix: these were all removed
+        // because none had genuine first-party wire-value evidence -- see
+        // map_stage_type's doc comment. A human-facing label/SeaDrop
+        // terminology must never be treated as protocol semantics.
+        for unverified in [
+            "public",
+            "public_sale",
+            "presale",
+            "allowlist",
+            "whitelist",
+            "fcfs",
+            "fcfa",
+        ] {
+            assert_eq!(
+                map_stage_type(unverified),
+                None,
+                "{unverified:?} must not be auto-routed without independent evidence"
+            );
+        }
     }
 
     #[test]

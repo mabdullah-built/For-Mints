@@ -204,7 +204,12 @@ impl MintAdapter for OpenSeaDropsAdapter<'_> {
         };
 
         // An already-active non-public stage always wins outright,
-        // whether called from `mint` or `watch`.
+        // whether called from `mint` or `watch`. `map_stage_type` only
+        // ever returns a non-public protocol today (see its doc comment
+        // for why "public" was removed as unverified) -- the explicit
+        // `!= Public` check is kept as defense in depth for if/when a
+        // `Public`-mapping wire value is independently re-verified and
+        // added back.
         if let Some(stage) = details.active_stage.as_ref()
             && let Some(protocol) = crate::opensea::models::map_stage_type(&stage.stage_type)
             && protocol != StageProtocol::Public
