@@ -126,11 +126,15 @@ an uncertain broadcast.
 
 ## T0 critical-path trace
 
-Everything below "stage detected active" runs with no optional work
-interleaved -- no telemetry formatting, no full benchmark, no unrelated
-discovery, no report generation, no disk I/O between activation and
-dispatch. `M` = mandatory, `O` = optional/deferred (never runs on this
-path).
+Everything below "stage detected active" runs with no *blocking*
+optional work interleaved -- no telemetry formatting, no full benchmark,
+no unrelated discovery, no disk I/O, no synchronous terminal write
+between activation and dispatch. `M` = mandatory (synchronous). `O-NB` =
+optional, non-blocking (a `ProgressReporter::emit` -- a `try_send`,
+proven never to await or block regardless of consumer state; see
+`cli::progress_reporter`'s tests). `O` = optional, synchronous -- there
+are none left in this interval; every progress print between handoff and
+dispatch now goes through the non-blocking reporter.
 
 ### PUBLIC engine
 
@@ -140,16 +144,18 @@ path).
 | T-early | Full multi-sample benchmark (`benchmark_all`) | M (once) |
 | T-early | Immediate rewarm | M |
 | T-early..T-10 | WAITING poll loop (own connection, `build_mint_plan`) | M |
-| T-early..T-10 | Advisory telemetry recording (latency, block/fee) | O -- never blocks the poll |
+| T-early..T-10 | Advisory telemetry recording (latency, block/fee) | O-NB -- `try_lock`, gated off entirely once close to T0 |
+| handoff | `reporter.emit(Arming)` | O-NB |
 | T-10 (StateCheck) | Fresh `getPublicDrop` read, end-time check | M |
+| T-10..T0 | Checkpoint/waiting progress events | O-NB |
 | T-6 (Refresh) | Fresh nonce/fee/balance/gas-estimate read, re-sign | M |
 | T-1 (Finalize) | Fresh nonce/fee/balance/gas-estimate read, re-sign | M |
 | T0 | Near-T0 rewarm (liveness only, no re-ranking) | M |
 | T0 | Endpoint selection (health-filtered, already-ranked) | M |
-| T0 | `eth_sendRawTransaction` fan-out (identical raw bytes, every selected endpoint) | M |
-| after dispatch | Receipt polling | M |
-| after dispatch | `WatchState::Success` printed | M |
-| after dispatch | Telemetry summary printed | O -- explicitly *after* this point, never before |
+| T0 | `eth_sendRawTransaction` fan-out (identical raw bytes, every selected endpoint) -- skipped under `--rehearsal` | M |
+| after dispatch | Receipt polling (skipped under `--rehearsal`) | M |
+| after dispatch | `reporter.emit(Success)`, then a single bounded (≤500ms) `reporter.finish().await` flush | O-NB, then a one-time bounded wait -- never on the path above |
+| after dispatch | Telemetry summary printed | O -- explicitly *after* this point and after the flush, never before |
 
 ### OPENSEA (signed) engine
 
@@ -159,31 +165,78 @@ path).
 | T-early | Full multi-sample benchmark (`benchmark_all`) | M (once) |
 | T-early | Immediate rewarm | M |
 | T-early..T-10 | WAITING poll loop (OpenSea drop-details polling, real, already-warm client) | M |
-| T-early..T-10 | Advisory telemetry recording | O |
+| T-early..T-10 | Advisory telemetry recording | O-NB |
+| handoff | `reporter.emit(Arming)` | O-NB |
 | fresh authorization point (at/near activation) | `POST /drops/{slug}/mint` -- wallet-specific authorization, bounded retries, classified (inactive/ineligible/allocation/supply/rate-limit/server/transport/success) | M |
 | fresh authorization point | Local validation (target, calldata, quantity, signer, chain, value cap) of the untrusted response | M |
 | fresh authorization point | On-chain simulation (`eth_estimateGas`) | M |
+| fresh authorization point..T0 | Progress events (`RequestingMintTransaction`/`Validating`/`Simulating`) | O-NB |
 | T0 | Near-T0 rewarm | M |
-| T0 | `eth_sendRawTransaction` fan-out | M |
-| after dispatch | Receipt polling, `Success`, telemetry summary | M / M / O |
+| T0 | `eth_sendRawTransaction` fan-out -- skipped under `--rehearsal` | M |
+| after dispatch | Receipt polling (skipped under `--rehearsal`), `reporter.emit(Success)`, bounded flush, telemetry summary | M / O-NB / bounded wait / O |
 
 Never obtained speculatively early and never obtained more than once per
 attempt: the OpenSea wallet-specific authorization. It carries its own
 short validity window, so `watch` neither fetches it ahead of the stage
 opening (it could expire before use) nor hammers the endpoint -- exactly
-one bounded-retry request at the point it is actually needed.
+one bounded-retry request at the point it is actually needed. See
+"OpenSea authorization freshness" below.
+
+## Freshness table
+
+Every field that actually matters for a safe, correctly-priced,
+authorized transaction is sourced fresh, immediately before it is used
+to sign -- never from discovery-time or resolution-time metadata. `n/a`
+where a field doesn't apply to that engine.
+
+| Field | Discovery-time source | Final pre-sign source | Fail-closed check | Test |
+|---|---|---|---|---|
+| Stage start/end time | `NormalizedStage.window` (resolution) | `PublicStageProbe`/`OpenSeaStageProbe`'s fresh re-read every poll cycle, used directly by `wait_for_stage` | Stage `Ended` stops the wait with an error; a moved start is picked up live | `stage_start_moving_later_while_waiting_updates_the_target`, `..._moving_earlier_..._and_arms_promptly` |
+| Nonce | n/a (never known ahead of time) | `eth_getTransactionCount`, re-read at every scheduler checkpoint (StateCheck/Refresh/Finalize) | A changed nonce between two prepares produces different signed output | `nonce_change_between_two_prepares_yields_different_signed_output` |
+| Base fee / priority fee | n/a | `eth_getBlockByNumber`/`eth_maxPriorityFeePerGas`, re-read at every checkpoint | Changed fee data produces different signed output | `fee_refresh_changes_prepared_transaction` |
+| Balance | n/a | `eth_getBalance`, read fresh in the prepare pipeline | Insufficient balance fails closed before signing | `insufficient_balance_fails_closed` |
+| Wallet allocation remaining / minted count | `MintPlan`'s discovery-time read (display only) | `getMintStats` (PUBLIC) / the real OpenSea mint-builder response + local validation (OpenSea), read fresh at prepare time | Exceeding remaining allocation is rejected | `watch_wallet_allocation_exhausted_while_waiting_stops_safely` |
+| Total / remaining supply | `MintPlan`'s discovery-time read (display only) | `getMintStats` fresh read | Quantity exceeding remaining supply fails closed | `validate_rejects_quantity_exceeding_collection_supply` |
+| Mint value / price | discovery-time `stage.price` (OpenSea) is *never* trusted for value -- deliberately returns `None` (see `opensea_display_price_provenance_unavailable`) | PUBLIC: `getPublicDrop.mintPrice`, read fresh. OpenSea: the real, freshly-fetched mint-builder response's own `value` field | OpenSea: real value must equal `expected_price * quantity`, both freshly fetched moments apart, or `UnsafeValue` | `rejects_value_disagreeing_with_expected_stage_price` |
+| Max gas cost / total spend caps | Operator-supplied, not discovered | Compared against the real, freshly-estimated gas cost immediately before signing | Exceeding either cap fails closed | `safety_caps_reject_gas_cost_over_cap` |
+| Fee recipient | `getAllowedFeeRecipients` (PUBLIC only) | Same call, read fresh; OpenSea's fee recipient comes from the real mint-builder response, locally validated | An unauthorized/mismatched fee recipient is rejected | `opensea_response_with_wrong_minter_is_rejected_before_signing`-style validation tests |
+| max_per_wallet / signed-mint bounds | OpenSea `stage.max_per_wallet` (display only) | `getSignedMintValidationParams`, read fresh; the real signed authorization's own params are bounds-checked against it | Exceeding the signer's bound is rejected | `validate_signed_mint_params_bounds` (internal) |
+| OpenSea authorization itself | n/a (never exists ahead of activation) | The real `POST /drops/{slug}/mint` response, fetched exactly once per attempt, validated in the same attempt it is signed in | Any mismatch (target/chain/minter/quantity/value/signature/collection) is rejected before signing | the `opensea_response_with_*_is_rejected_before_signing` test family |
+
+## Advisory background work
+
+`watch`'s only background-shaped work is the periodic re-resolution
+check (a plain `tokio::select!` race, not a spawned task -- see "Periodic
+re-resolution" above) and, since this pass, the `ProgressReporter`
+consumer task. Both are bounded, session-scoped, and cleanly cancel:
+`tokio::select!` simply drops the losing branch's future when
+`wait_for_stage` wins, and `ProgressReporter`'s consumer task ends on its
+own once its sender is dropped (or is silently abandoned, past a bounded
+500ms flush, if it is somehow still stuck). Neither ever holds a lock
+across an `.await`, neither can panic into the mint-execution path (a
+`ProgressReporter` consumer panic only ends that one task; a poisoned
+telemetry lock is treated as "unavailable" via `try_lock`), and T0 never
+awaits either one's completion.
 
 ## Local no-broadcast rehearsal
 
-`kairox mint --rehearsal` runs this same pipeline (benchmark, prewarm,
-every checkpoint, fresh reads, real local signing/serialization) end to
-end for both the PUBLIC and OpenSea engines, and stops immediately before
-`eth_sendRawTransaction` -- never sending a real or dummy transaction.
-Useful for rehearsing an already-open stage's timing/latency without
-risking a real broadcast. `watch` itself has no `--rehearsal` flag of its
-own (it is always a real, unattended `--auto-send` flow by design); its
-pre-T0 timing is instead observable via the advisory telemetry summary
-and the `LatencyMetrics` fields on every real run's final report.
+Both `kairox mint --rehearsal` and `kairox watch --rehearsal` run the
+complete real pipeline (`mint`: benchmark, prewarm, every checkpoint,
+fresh reads, real local signing/serialization; `watch`: additionally,
+the early pool connect, full pre-T0 benchmark, stage polling, periodic
+auto re-resolution, exact-stage exclusion after a clear ineligibility
+rejection, and near-T0 rewarm) end to end for both the PUBLIC and
+OpenSea engines, and stop immediately before `eth_sendRawTransaction` --
+never sending a real or dummy transaction, never polling a receipt.
+
+`watch --rehearsal` satisfies the same explicit-consent gate
+`--auto-send` exists for on its own (a rehearsal never broadcasts, so it
+needs no separate consent for *that*): `kairox watch <collection>
+--wallet <w> --rehearsal` works standalone, or combine
+`--auto-send --rehearsal` to be explicit about both. Output ends with
+`REHEARSAL RESULT` / `REHEARSAL COMPLETE` (never `BROADCAST RESULT`),
+including the local tx hash, selected engine/stage, and the same
+`LatencyMetrics` timing breakdown a real run reports.
 
 ## Watchlist (`--manifest`) schema
 
@@ -247,7 +300,6 @@ browser headers.
   A collection with neither a configured on-chain public stage nor any
   discoverable/explicit OpenSea drop is still rejected outright (never
   guessed).
-- `watch` still has no `--rehearsal` flag of its own (see above).
 - The 30-second periodic re-resolution interval is fixed, not exposed as
   an operator-facing flag (a test-only environment variable exists purely
   so this behavior is testable in seconds rather than real minutes -- it
