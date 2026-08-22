@@ -556,6 +556,60 @@ mod tests {
         assert_eq!(prepared.value, U256::from(10_000_000_000_000_000u64));
     }
 
+    /// Round 6 item 13 (benchmark suite: generic-engine concurrent
+    /// prepare): the five independent reads in `prepare_generic_transaction`
+    /// (gas estimate, latest block, priority fee, nonce, balance) run
+    /// concurrently via `tokio::try_join!` -- deterministic, mock-latency
+    /// -based proof that this takes roughly one delay's worth of wall
+    /// -clock time, not the sum of five. Mirrors
+    /// `execution::prepared::tests::parallel_reads_take_the_slowest_call_not_the_sum`
+    /// and `opensea_engine::tests::parallel_prepare_reads_take_the_slowest_call_not_the_sum`.
+    #[tokio::test]
+    async fn parallel_prepare_reads_take_the_slowest_call_not_the_sum() {
+        let code_hex = format!("0x{}", hex::encode(FAKE_BYTECODE));
+        let bytecode_hash = keccak256(FAKE_BYTECODE);
+        let delay = std::time::Duration::from_millis(80);
+        let client = client_with(
+            base_builder(&code_hex)
+                .respond("eth_estimateGas", serde_json::json!("0x30d40"))
+                .delay("eth_estimateGas", delay)
+                .delay("eth_getBlockByNumber", delay)
+                .delay("eth_maxPriorityFeePerGas", delay)
+                .delay("eth_getTransactionCount", delay)
+                .delay("eth_getBalance", delay),
+        )
+        .await;
+
+        let fp = fingerprint(bytecode_hash);
+        let signer = signer();
+        let request = GenericMintRequest {
+            chain: ChainRegistry::builtin().by_id(1).unwrap().clone(),
+            collection: Address::from([0x11; 20]),
+            wallet: signer.address(),
+            quantity: 1,
+            target: target_from_fingerprint(&fp, bytecode_hash),
+            operator_max_price_per_token_wei: None,
+            gas_buffer_multiplier: 1.25,
+            safety_caps: SafetyCaps {
+                max_mint_value: U256::from(10_000_000_000_000_000u64),
+                max_gas_cost: U256::from(1_000_000_000_000_000_000u128),
+                max_total_spend: U256::from(2_000_000_000_000_000_000u128),
+            },
+        };
+
+        let started = std::time::Instant::now();
+        prepare_generic_transaction(&client, &signer, &request)
+            .await
+            .expect("registry-matched target should prepare and sign successfully");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < delay * 3,
+            "five concurrent 80ms-delayed reads took {elapsed:?}; expected roughly one delay's \
+             worth of wall-clock time, not anywhere near the ~400ms sum of five sequential ones"
+        );
+    }
+
     #[tokio::test]
     async fn proxy_implementation_changed_since_resolution_stops_before_signing() {
         let original_code = format!("0x{}", hex::encode(FAKE_BYTECODE));

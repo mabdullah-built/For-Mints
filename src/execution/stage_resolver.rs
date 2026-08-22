@@ -385,16 +385,43 @@ mod tests {
     /// must stay comfortably sub-millisecond, since it involves no I/O at
     /// all. Not a network-latency measurement -- a hard local threshold
     /// is legitimate here precisely because nothing here can be flaky.
-    #[test]
-    fn selection_over_a_large_candidate_set_is_comfortably_sub_millisecond() {
+    fn candidate_set(n: u32) -> Vec<NormalizedStage> {
         let mut stages = Vec::new();
-        for i in 0..500u32 {
+        for i in 0..n {
             let mut s = base(&format!("stage-{i}"), StageProtocol::Fcfs);
             s.window.start = NOW - Duration::seconds(i as i64);
             stages.push(s);
         }
-        let public = base("public", StageProtocol::Public);
-        stages.push(public);
+        stages.push(base("public", StageProtocol::Public));
+        stages
+    }
+
+    /// Round 6 item 13: report selection timing at each of the requested
+    /// candidate-set sizes (~1/10/100/500), not just the largest one --
+    /// a relaxed sanity threshold scaled to each size, never a fragile
+    /// microsecond-tight bound.
+    #[test]
+    fn selection_timing_across_candidate_set_sizes() {
+        for n in [1u32, 10, 100, 500] {
+            let stages = candidate_set(n);
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                let _ = select_for_live_mint(&stages, NOW);
+                let _ = select_for_watch(&stages, NOW);
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(100),
+                "40 selection calls over {} candidates took {elapsed:?}, expected well under \
+                 100ms for pure in-memory logic",
+                n + 1
+            );
+        }
+    }
+
+    #[test]
+    fn selection_over_a_large_candidate_set_is_comfortably_sub_millisecond() {
+        let stages = candidate_set(500);
 
         let started = std::time::Instant::now();
         for _ in 0..20 {
