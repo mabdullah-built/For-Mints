@@ -346,4 +346,17 @@ pub struct WatchArgs {
     /// human-readable text on stderr.
     #[arg(long)]
     pub json: bool,
+    /// Run the complete watch pipeline (resolve, early pool connect, full
+    /// benchmark, stage polling, periodic re-resolution, near-T0 rewarm,
+    /// fresh execution-time reads, OpenSea authorization where
+    /// applicable, validation, simulation, local signing/serialization)
+    /// exactly as `--auto-send` would, but stop immediately before
+    /// `eth_sendRawTransaction` -- never a real or dummy broadcast, never
+    /// a receipt poll. Satisfies the same "explicit consent" requirement
+    /// `--auto-send` exists for on its own (a rehearsal never broadcasts,
+    /// so it needs no separate unattended-broadcast consent) -- pass this
+    /// alone, or combine with `--auto-send` if you prefer to be explicit
+    /// about both.
+    #[arg(long)]
+    pub rehearsal: bool,
 }

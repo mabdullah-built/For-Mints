@@ -3996,6 +3996,252 @@ fn watch_public_future_stage_waits_then_executes_at_t0() {
 }
 
 // ---------------------------------------------------------------------
+// Final hardening pass items 3-4: `watch --rehearsal` exercises the
+// actual watch pipeline (resolve, early pool connect, full benchmark,
+// stage polling, near-T0 rewarm, fresh state, sign, serialize) and stops
+// immediately before eth_sendRawTransaction. Scenario A: PUBLIC engine.
+// ---------------------------------------------------------------------
+#[test]
+fn watch_public_rehearsal_prepares_and_signs_but_never_broadcasts() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    let stage_start = unix_now() + 2;
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_sendRawTransaction" || method == "eth_getTransactionReceipt" {
+            return Behavior::JsonRpcError {
+                code: -32000,
+                message: format!("must never be called in a rehearsal scenario: {method}"),
+            };
+        }
+        read_response_with_stage_window(method, params, stage_start, 32_503_680_000).unwrap_or(
+            Behavior::JsonRpcError {
+                code: -32601,
+                message: format!("unexpected method in watch rehearsal scenario: {method}"),
+            },
+        )
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--rehearsal",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"))
+        .stdout(predicates::str::contains("tx hash: 0x"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never call eth_sendRawTransaction"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|(m, _)| m == "eth_getTransactionReceipt"),
+        "watch --rehearsal must never poll for a receipt"
+    );
+    // The real pipeline (early full benchmark, fresh nonce/gas-estimate
+    // reads) genuinely ran -- proves this is not a stub.
+    assert!(received.iter().any(|(m, _)| m == "eth_getTransactionCount"));
+    assert!(received.iter().any(|(m, _)| m == "eth_estimateGas"));
+}
+
+// ---------------------------------------------------------------------
+// Final hardening pass item 4, scenario B: OPENSEA signed engine. Auto
+// -discovery finds an already-active signed presale; watch waits (near
+// -instantly, since it's already active), requests the real mint
+// -builder authorization, validates it locally, simulates on-chain,
+// signs, and serializes -- then stops before ever broadcasting.
+// ---------------------------------------------------------------------
+#[test]
+fn watch_opensea_signed_rehearsal_prepares_and_signs_but_never_broadcasts() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-watch-opensea-rehearsal";
+    const SIGNER_SEED: &str = "kairox-e2e-watch-rehearsal-authorized-signer";
+    // Already active -- watch's wait completes near-instantly, keeping
+    // this test fast and deterministic.
+    let stage_start = unix_now() - 60;
+    let stage_end = unix_now() + 3600;
+    let start_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_start as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let end_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_end as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+                    code: -32000,
+                    message: format!("must never be called in a rehearsal scenario: {method}"),
+                },
+                _ => opensea_read_response(
+                    &method,
+                    &params,
+                    None,
+                    Some(permissive_signed_mint_validation_params()),
+                    Some(true),
+                )
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!(
+                        "unexpected RPC method in watch-opensea-rehearsal scenario: {method}"
+                    ),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "collection_slug": SLUG,
+                    "collection_name": "Test Collection",
+                    "chain": "ethereum",
+                    "contract_address": format!("{NFT:#x}"),
+                    "drop_type": "signed_presale",
+                    "is_minting": true,
+                    "active_stage": {
+                        "uuid": "stage-1",
+                        "stage_type": "signed_presale",
+                        "label": null,
+                        "price": "0",
+                        "price_currency_address": "0x0000000000000000000000000000000000000000",
+                        "start_time": start_rfc3339,
+                        "end_time": end_rfc3339,
+                        "max_per_wallet": "10",
+                    },
+                    "next_stage": null,
+                    "stages": [],
+                    "total_supply": null,
+                    "max_supply": null,
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            (
+                path.to_string(),
+                rpc_ok_status(signed_mint_response_json(
+                    wallet,
+                    sample_mint_params_abi(true),
+                    SIGNER_SEED,
+                    U256::from(1u64),
+                )),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--rehearsal",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"))
+        .stdout(predicates::str::contains("tx hash: 0x"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received.iter().any(|(p, _)| p.ends_with("/mint")),
+        "rehearsal should have requested the real mint-builder authorization"
+    );
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never call eth_sendRawTransaction"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|(m, _)| m == "eth_getTransactionReceipt"),
+        "watch --rehearsal must never poll for a receipt"
+    );
+    assert!(received.iter().any(|(m, _)| m == "eth_estimateGas"));
+}
+
+#[test]
+fn watch_without_auto_send_or_rehearsal_refuses_to_run_and_touches_no_endpoint() {
+    let wallet = test_signer().address();
+    kairox_bin()
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--auto-send"))
+        .stderr(predicates::str::contains("--rehearsal"));
+}
+
+// ---------------------------------------------------------------------
 // Round 6 items 1 + 3(A/B/C): the watch RpcPool must run its full,
 // multi-sample benchmark entirely *before* the stage wait begins (not
 // after), that full benchmark must never repeat once the wait is over,
@@ -4149,25 +4395,6 @@ fn watch_public_runs_the_full_benchmark_before_the_wait_never_repeats_it_and_tou
         near_t0_rewarm_idx < send_idx,
         "the near-T0 rewarm must happen strictly before dispatch, never after"
     );
-}
-
-#[test]
-fn watch_without_auto_send_refuses_to_run_and_touches_no_endpoint() {
-    let wallet = test_signer().address();
-    // No server at all is spawned/pointed at -- if watch ever tried to
-    // connect before checking --auto-send, this test would hang or error
-    // in a way that isn't the intended "refused before doing anything"
-    // message.
-    kairox_bin()
-        .args([
-            "watch",
-            &format!("{NFT:#x}"),
-            "--wallet",
-            &format!("{wallet:#x}"),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("--auto-send"));
 }
 
 #[test]
@@ -4869,6 +5096,176 @@ fn watch_auto_engine_switches_to_a_presale_that_appears_partway_through_a_long_p
     );
 }
 
+// ---------------------------------------------------------------------
+// Final hardening pass item 4, scenario D: identical setup to the
+// re-resolution scenario above (OpenSea unavailable initially, native
+// public discovered and waited on, OpenSea reveals an earlier signed
+// presale mid-wait, watch switches) but with --rehearsal, and this time
+// the revealed presale is a genuinely completable signed mint (not sold
+// out) -- so the rehearsal actually reaches signing/serialization rather
+// than stopping early on a supply check.
+// ---------------------------------------------------------------------
+#[test]
+fn watch_rehearsal_switches_to_a_recovered_presale_and_prepares_without_broadcasting() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-watch-rehearsal-reresolution";
+    const SIGNER_SEED: &str = "kairox-e2e-watch-rehearsal-reresolution-signer";
+    let public_stage_start = unix_now() + 20;
+    let opensea_requests: std::sync::Arc<std::sync::atomic::AtomicU32> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let opensea_requests_for_closure = opensea_requests.clone();
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+                    code: -32000,
+                    message: "must never be called: this scenario never dispatches".into(),
+                },
+                // getPublicDrop must report a genuinely far-future
+                // NotStarted window (never active) so the public stage
+                // never wins outright before the presale is discovered;
+                // everything else (including the allow-list-root/
+                // validation-params/fee-recipient selectors the signed
+                // -mint path needs) falls through to opensea_read_response.
+                _ => read_response_with_stage_window(
+                    &method,
+                    &params,
+                    public_stage_start,
+                    32_503_680_000,
+                )
+                .or_else(|| {
+                    opensea_read_response(
+                        &method,
+                        &params,
+                        None,
+                        Some(permissive_signed_mint_validation_params()),
+                        Some(true),
+                    )
+                })
+                .unwrap_or(Behavior::JsonRpcError {
+                    code: -32601,
+                    message: format!(
+                        "unexpected RPC method in watch-rehearsal-reresolution scenario: {method}"
+                    ),
+                }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            let n = opensea_requests_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                (
+                    path.to_string(),
+                    Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+                )
+            } else {
+                (
+                    path.to_string(),
+                    rpc_ok_status(serde_json::json!({
+                        "collection_slug": SLUG,
+                        "collection_name": "Test Collection",
+                        "chain": "ethereum",
+                        "contract_address": format!("{NFT:#x}"),
+                        "drop_type": "signed_presale",
+                        "is_minting": true,
+                        "active_stage": {
+                            "uuid": "presale-recovered-mid-wait",
+                            "stage_type": "signed_presale",
+                            "label": null,
+                            "price": "0",
+                            "price_currency_address": "0x0000000000000000000000000000000000000000",
+                            "start_time": "2020-01-01T00:00:00Z",
+                            "end_time": "2999-01-01T00:00:00Z",
+                            "max_per_wallet": "10",
+                        },
+                        "next_stage": null,
+                        "stages": [],
+                        "total_supply": null,
+                        "max_supply": null,
+                    })),
+                )
+            }
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            (
+                path.to_string(),
+                rpc_ok_status(signed_mint_response_json(
+                    wallet,
+                    sample_mint_params_abi(true),
+                    SIGNER_SEED,
+                    U256::from(1u64),
+                )),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_WATCH_RERESOLUTION_INTERVAL_MS", "300")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+            "--rehearsal",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "restarting the attempt against the fresh resolution",
+        ))
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never dispatch, even after switching engines mid-wait"
+    );
+    assert!(
+        received.iter().any(|(p, _)| p.ends_with("/mint")),
+        "rehearsal should have reached the recovered presale's mint authorization"
+    );
+}
+
 #[test]
 fn auto_engine_prefers_auto_discovered_signed_presale_over_active_onchain_public() {
     let wallet = test_signer().address();
@@ -5208,6 +5605,152 @@ fn watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_act
         1,
         "after re-resolving past the ineligible presale, watch must broadcast exactly one \
          transaction via the public stage, got {sends:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Final hardening pass item 4, scenario C: the exact same "ineligible
+// signed stage falls through to public" flow as
+// watch_engine_auto_discovers_and_waits_for_an_upcoming_signed_presale_over_active_public
+// above, but with --rehearsal instead of --auto-send -- the presale's
+// exact StageId must still be excluded and re-resolution must still
+// reach the public stage, but nothing may ever be broadcast.
+// ---------------------------------------------------------------------
+#[test]
+fn watch_rehearsal_still_excludes_an_ineligible_signed_stage_and_reaches_public_without_broadcasting()
+ {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+    const SLUG: &str = "kairox-e2e-watch-rehearsal-presale";
+    let stage_start = unix_now() + 2;
+    let start_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_start as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let end_rfc3339 = time::OffsetDateTime::from_unix_timestamp(stage_start as i64 + 3600)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let public_start = unix_now() + 4;
+    let public_end = public_start + 3600;
+
+    let server = LocalHttpServer::spawn_raw(move |path, body| {
+        if path == "/" {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let params = body.get("params").cloned().unwrap_or(Value::Null);
+            let behavior = match method.as_str() {
+                "eth_sendRawTransaction" | "eth_getTransactionReceipt" => {
+                    Behavior::JsonRpcError {
+                        code: -32000,
+                        message: format!(
+                            "must never be called in a rehearsal scenario: {method}"
+                        ),
+                    }
+                }
+                _ => read_response_with_stage_window(&method, &params, public_start, public_end)
+                    .unwrap_or(Behavior::JsonRpcError {
+                        code: -32601,
+                        message: format!(
+                            "unexpected RPC method in watch-rehearsal-reresolution scenario: {method}"
+                        ),
+                    }),
+            };
+            (method, behavior)
+        } else if path == format!("/api/v2/chain/ethereum/contract/{NFT:#x}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "address": format!("{NFT:#x}"),
+                    "chain": "ethereum",
+                    "collection": SLUG,
+                    "contract_standard": "erc721",
+                    "name": "Test",
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}") {
+            (
+                path.to_string(),
+                rpc_ok_status(serde_json::json!({
+                    "collection_slug": SLUG,
+                    "collection_name": "Test Collection",
+                    "chain": "ethereum",
+                    "contract_address": format!("{NFT:#x}"),
+                    "drop_type": "signed_presale",
+                    "is_minting": true,
+                    "active_stage": null,
+                    "next_stage": {
+                        "uuid": "stage-1",
+                        "stage_type": "signed_presale",
+                        "label": null,
+                        "price": "0",
+                        "price_currency_address": "0x0000000000000000000000000000000000000000",
+                        "start_time": start_rfc3339,
+                        "end_time": end_rfc3339,
+                        "max_per_wallet": "10",
+                    },
+                    "stages": [],
+                    "total_supply": null,
+                    "max_supply": null,
+                })),
+            )
+        } else if path == format!("/api/v2/drops/{SLUG}/mint") {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(
+                    422,
+                    serde_json::json!({"errors": ["wallet is not eligible for this stage"]}),
+                ),
+            )
+        } else {
+            (
+                path.to_string(),
+                Behavior::HttpStatus(404, serde_json::json!({"errors": ["not found"]})),
+            )
+        }
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_OPENSEA_BASE_URL", server.url())
+        .env("KAIROX_OPENSEA_API_KEY", "test-key-value")
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--rehearsal",
+            "--poll-interval-secs",
+            "1",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("resolved_engine: OpenSea"))
+        .stderr(predicates::str::contains("re-resolving"))
+        .stderr(predicates::str::contains("resolved_engine: Public"))
+        .stdout(predicates::str::contains("REHEARSAL RESULT"))
+        .stdout(predicates::str::contains("REHEARSAL COMPLETE"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received.iter().any(|(p, _)| p.ends_with("/mint")),
+        "rehearsal should still have requested a fresh mint authorization for the presale"
+    );
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never broadcast, even after re-resolving to the public stage"
     );
 }
 

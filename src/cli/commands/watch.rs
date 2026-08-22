@@ -119,14 +119,19 @@ fn require_explicit_caps(
 }
 
 pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), KairoxError> {
-    if !args.auto_send {
+    // `--rehearsal` never broadcasts, so it needs none of the "unattended
+    // real broadcast" consent `--auto-send` exists for -- it satisfies
+    // this same gate on its own.
+    if !args.auto_send && !args.rehearsal {
         return Err(KairoxError::Session(SessionError::new(
-            "watch requires --auto-send: explicit informed consent for unattended broadcast at \
-             T0. There is no interactive operator present to confirm mid-wait, so watch refuses \
-             to run at all without it -- rerun with --auto-send once you have reviewed the \
-             target below.",
+            "watch requires --auto-send (or --rehearsal, which never broadcasts): explicit \
+             informed consent for unattended broadcast at T0. There is no interactive operator \
+             present to confirm mid-wait, so watch refuses to run at all without one of them -- \
+             rerun with --auto-send once you have reviewed the target below, or with \
+             --rehearsal to safely exercise the full pipeline without ever broadcasting.",
         )));
     }
+    let rehearsal = args.rehearsal;
 
     let targets = if let Some(manifest_path) = &args.manifest {
         load_manifest(manifest_path)?
@@ -191,7 +196,7 @@ pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), Kair
     let results: Vec<Result<(), KairoxError>> = stream::iter(
         targets
             .into_iter()
-            .map(|target| run_single_target(target, poll_interval, config_path, json)),
+            .map(|target| run_single_target(target, poll_interval, config_path, json, rehearsal)),
     )
     .buffered(concurrency)
     .collect()
@@ -242,6 +247,7 @@ async fn run_single_target(
     poll_interval: StdDuration,
     config_path: Option<&Path>,
     json: bool,
+    rehearsal: bool,
 ) -> Result<(), KairoxError> {
     eprintln!(
         "=== watch target: collection={} wallet={} ===",
@@ -337,6 +343,7 @@ async fn run_single_target(
                     &excluded_stage_ids,
                     engine.clone(),
                     json,
+                    rehearsal,
                 )
                 .await
             }
@@ -354,6 +361,7 @@ async fn run_single_target(
                     &excluded_stage_ids,
                     engine.clone(),
                     json,
+                    rehearsal,
                 )
                 .await
             }
@@ -880,6 +888,7 @@ async fn run_public_watch(
     excluded_stage_ids: &[crate::domain::stage::StageId],
     currently_selected: ResolvedWatchEngine,
     json: bool,
+    rehearsal: bool,
 ) -> Result<(), KairoxError> {
     let started_at = OffsetDateTime::now_utc();
     let session_id = crate::cli::report::generate_session_id();
@@ -954,6 +963,11 @@ async fn run_public_watch(
     // never touches ranking) still runs unconditionally inside
     // `run_live_mint`, giving a genuine near-T0 liveness re-check.
     config.skip_benchmark = true;
+    // See `execution::live::LiveMintConfig::rehearsal`'s doc comment --
+    // everything up to and including local signing/serialization runs
+    // exactly as it would for a real send; only the final
+    // `eth_sendRawTransaction` dispatch is skipped.
+    config.rehearsal = rehearsal;
 
     let outcome = run_live_mint(&mut pool, signer, &request, &config, |progress| {
         reporter.emit(live_progress_to_watch_state(&progress))
@@ -1003,7 +1017,7 @@ async fn run_public_watch(
         &outcome.broadcast_summary,
         &outcome.receipt_state,
         &outcome.metrics,
-        false,
+        rehearsal,
     );
     Ok(())
 }
@@ -1022,6 +1036,7 @@ async fn run_opensea_watch(
     excluded_stage_ids: &[crate::domain::stage::StageId],
     currently_selected: ResolvedWatchEngine,
     json: bool,
+    rehearsal: bool,
 ) -> Result<(), KairoxError> {
     let started_at = OffsetDateTime::now_utc();
     let session_id = crate::cli::report::generate_session_id();
@@ -1090,9 +1105,7 @@ async fn run_opensea_watch(
         skip_benchmark: true,
         health: profile.health_policy,
         prewarm_lead: profile.prewarm_lead.try_into().unwrap_or(StdDuration::ZERO),
-        // `watch` has no rehearsal mode of its own -- it is always a real,
-        // unattended --auto-send flow.
-        rehearsal: false,
+        rehearsal,
     };
 
     let outcome = run_opensea_mint(&opensea, &mut pool, signer, &request, |progress| {
@@ -1137,7 +1150,7 @@ async fn run_opensea_watch(
         &outcome.broadcast_summary,
         &outcome.receipt_state,
         &outcome.metrics,
-        false,
+        rehearsal,
     );
     Ok(())
 }
