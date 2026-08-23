@@ -1004,15 +1004,21 @@ async fn resolve_watch_engine(
                     crate::execution::resolver::ResolvedEngine::Thirdweb { .. } => {
                         unreachable!(
                             "resolve_watch_stage_decision only ever discovers NormalizedStage \
-                             candidates, never a Thirdweb-engine target -- watch --engine auto \
-                             does not consider thirdweb at all, exactly like Generic above"
+                             (SeaDrop/OpenSea) candidates, never a Thirdweb-engine target -- \
+                             watch --engine auto DOES consider thirdweb, but only via the \
+                             separate resolve_thirdweb_manifold_auto_watch fallback tier \
+                             (tried when this stage-based path finds nothing at all), never \
+                             through this conversion"
                         )
                     }
                     crate::execution::resolver::ResolvedEngine::Manifold { .. } => {
                         unreachable!(
                             "resolve_watch_stage_decision only ever discovers NormalizedStage \
-                             candidates, never a Manifold-engine target -- watch --engine auto \
-                             does not consider Manifold at all, exactly like Generic above"
+                             (SeaDrop/OpenSea) candidates, never a Manifold-engine target -- \
+                             watch --engine auto DOES consider Manifold, but only via the \
+                             separate resolve_thirdweb_manifold_auto_watch fallback tier \
+                             (tried when this stage-based path finds nothing at all), never \
+                             through this conversion"
                         )
                     }
                 };
@@ -2035,6 +2041,54 @@ async fn run_thirdweb_watch(
     pool.benchmark_all(&profile.benchmark_policy).await;
     pool.rewarm_all().await;
 
+    let outcome = run_thirdweb_watch_with_pool(
+        &pool,
+        &target,
+        drop_contract,
+        &expected_stage_id,
+        poll_config,
+        &resolved.info,
+        signer,
+        safety_caps,
+        crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+        profile,
+        rehearsal,
+    )
+    .await?;
+
+    print_broadcast_result(
+        outcome.prepared.tx_hash,
+        &outcome.broadcast_results,
+        &outcome.broadcast_summary,
+        &outcome.receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
+        rehearsal,
+    );
+    Ok(())
+}
+
+/// The testable core of [`run_thirdweb_watch`] -- takes an
+/// already-connected (and, in production, already-benchmarked/rewarmed)
+/// pool and an explicit trusted-fingerprint registry, so tests can inject
+/// both a `MockTransport`-backed pool and a synthetic registry to prove
+/// the complete wait -> arm -> T0-revalidate -> sign -> (rehearsal:
+/// never broadcast) pipeline end to end. Production's only call site
+/// (`run_thirdweb_watch` above) always passes
+/// `thirdweb_registry::BUILTIN_REGISTRY`.
+#[allow(clippy::too_many_arguments)]
+async fn run_thirdweb_watch_with_pool(
+    pool: &crate::chain::pool::RpcPool,
+    target: &WatchTarget,
+    drop_contract: Address,
+    expected_stage_id: &crate::domain::stage::StageId,
+    poll_config: &WatchPollConfig,
+    chain: &crate::chain::registry::ChainInfo,
+    signer: &dyn Signer,
+    safety_caps: SafetyCaps,
+    thirdweb_trusted_registry: &[crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint],
+    profile: &ExecutionProfile,
+    rehearsal: bool,
+) -> Result<crate::execution::thirdweb_engine::ThirdwebMintOutcome, KairoxError> {
     let read_client = pool.preferred_read().ok_or_else(|| {
         KairoxError::Session(SessionError::with_kind(
             SessionErrorKind::NoVerifiedReadRpc,
@@ -2063,7 +2117,7 @@ async fn run_thirdweb_watch(
             e.to_string(),
         ))
     })?;
-    let Some(stage) = stages.iter().find(|s| s.id == expected_stage_id).cloned() else {
+    let Some(stage) = stages.iter().find(|s| &s.id == expected_stage_id).cloned() else {
         return Err(KairoxError::Session(SessionError::with_kind(
             SessionErrorKind::StageResolutionChanged,
             format!(
@@ -2134,7 +2188,7 @@ async fn run_thirdweb_watch(
     )?;
 
     let request = crate::execution::thirdweb_engine::ThirdwebMintRequest {
-        chain: resolved.info.clone(),
+        chain: chain.clone(),
         drop_contract,
         wallet: target.wallet,
         quantity: target.quantity,
@@ -2145,10 +2199,10 @@ async fn run_thirdweb_watch(
     };
 
     let outcome = crate::execution::thirdweb_engine::run_thirdweb_mint(
-        &pool,
+        pool,
         signer,
         &request,
-        crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+        thirdweb_trusted_registry,
         &profile.health_policy,
         profile.receipt_poll_interval,
         profile.receipt_timeout,
@@ -2160,15 +2214,7 @@ async fn run_thirdweb_watch(
     reporter.finish().await;
     print_telemetry_summary(&telemetry);
 
-    print_broadcast_result(
-        outcome.prepared.tx_hash,
-        &outcome.broadcast_results,
-        &outcome.broadcast_summary,
-        &outcome.receipt_state,
-        &crate::execution::metrics::LatencyMetrics::default(),
-        rehearsal,
-    );
-    Ok(())
+    Ok(outcome)
 }
 
 /// Mirrors [`run_thirdweb_watch`]'s exact shape and rationale, dispatched
@@ -2197,6 +2243,50 @@ async fn run_manifold_watch(
     pool.benchmark_all(&profile.benchmark_policy).await;
     pool.rewarm_all().await;
 
+    let outcome = run_manifold_watch_with_pool(
+        &pool,
+        &target,
+        extension_contract,
+        creator_contract,
+        instance_id,
+        poll_config,
+        &resolved.info,
+        signer,
+        safety_caps,
+        crate::execution::manifold_registry::BUILTIN_REGISTRY,
+        profile,
+        rehearsal,
+    )
+    .await?;
+
+    print_broadcast_result(
+        outcome.prepared.tx_hash,
+        &outcome.broadcast_results,
+        &outcome.broadcast_summary,
+        &outcome.receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
+        rehearsal,
+    );
+    Ok(())
+}
+
+/// The testable core of [`run_manifold_watch`] -- mirrors
+/// [`run_thirdweb_watch_with_pool`]'s exact rationale.
+#[allow(clippy::too_many_arguments)]
+async fn run_manifold_watch_with_pool(
+    pool: &crate::chain::pool::RpcPool,
+    target: &WatchTarget,
+    extension_contract: Address,
+    creator_contract: Address,
+    instance_id: alloy_primitives::U256,
+    poll_config: &WatchPollConfig,
+    chain: &crate::chain::registry::ChainInfo,
+    signer: &dyn Signer,
+    safety_caps: SafetyCaps,
+    manifold_trusted_registry: &[crate::execution::manifold_registry::ManifoldTrustedFingerprint],
+    profile: &ExecutionProfile,
+    rehearsal: bool,
+) -> Result<crate::execution::manifold_engine::ManifoldMintOutcome, KairoxError> {
     let read_client = pool.preferred_read().ok_or_else(|| {
         KairoxError::Session(SessionError::with_kind(
             SessionErrorKind::NoVerifiedReadRpc,
@@ -2258,7 +2348,7 @@ async fn run_manifold_watch(
     )?;
 
     let request = crate::execution::manifold_engine::ManifoldMintRequest {
-        chain: resolved.info.clone(),
+        chain: chain.clone(),
         extension_contract,
         creator_contract,
         instance_id,
@@ -2270,10 +2360,10 @@ async fn run_manifold_watch(
     };
 
     let outcome = crate::execution::manifold_engine::run_manifold_mint(
-        &pool,
+        pool,
         signer,
         &request,
-        crate::execution::manifold_registry::BUILTIN_REGISTRY,
+        manifold_trusted_registry,
         &profile.health_policy,
         profile.receipt_poll_interval,
         profile.receipt_timeout,
@@ -2285,15 +2375,7 @@ async fn run_manifold_watch(
     reporter.finish().await;
     print_telemetry_summary(&telemetry);
 
-    print_broadcast_result(
-        outcome.prepared.tx_hash,
-        &outcome.broadcast_results,
-        &outcome.broadcast_summary,
-        &outcome.receipt_state,
-        &crate::execution::metrics::LatencyMetrics::default(),
-        rehearsal,
-    );
-    Ok(())
+    Ok(outcome)
 }
 
 fn live_progress_to_watch_state(progress: &LiveProgress) -> WatchState {
@@ -3059,6 +3141,19 @@ mod auto_watch_thirdweb_manifold_routing_tests {
                 tw::getClaimConditionByIdCall::SELECTOR,
                 json!(condition_hex),
             )
+            // Still used by the signing path (execution::thirdweb_engine::
+            // fetch_condition_and_wallet_claimed), unlike discovery, which
+            // no longer depends on it -- see multi_phase_list's doc
+            // comment for why these are two deliberately separate reads.
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
             .respond_eth_call_selector(
                 tw::getSupplyClaimedByWalletCall::SELECTOR,
                 json!(format!(
@@ -3331,6 +3426,15 @@ mod auto_watch_thirdweb_manifold_routing_tests {
                 json!(condition_hex),
             )
             .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond_eth_call_selector(
                 tw::getSupplyClaimedByWalletCall::SELECTOR,
                 json!(format!(
                     "0x{}",
@@ -3384,6 +3488,407 @@ mod auto_watch_thirdweb_manifold_routing_tests {
         assert_eq!(
             err.code(),
             crate::execution::errors::KairoxErrorCode::AmbiguousProtocol
+        );
+    }
+
+    fn active_condition_abi() -> ClaimConditionAbi {
+        ClaimConditionAbi {
+            startTimestamp: alloy_primitives::U256::from(1_700_000_000u64),
+            maxClaimableSupply: alloy_primitives::U256::from(1_000u64),
+            supplyClaimed: alloy_primitives::U256::ZERO,
+            quantityLimitPerWallet: alloy_primitives::U256::from(5u64),
+            merkleRoot: alloy_primitives::B256::ZERO,
+            pricePerToken: alloy_primitives::U256::from(10_000_000_000_000_000u64),
+            currency: tw::NATIVE_TOKEN,
+            metadata: String::new(),
+        }
+    }
+
+    /// Every mock needed for the FULL thirdweb watch orchestration --
+    /// stage discovery, provenance, and the complete
+    /// prepare/sign/(rehearsal: never broadcast) pipeline -- not just
+    /// engine-level prepare, proving `run_thirdweb_watch_with_pool`
+    /// itself (wait -> arm -> T0 revalidate -> sign) actually runs.
+    fn thirdweb_rehearsal_transport() -> MockTransport {
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &active_condition_abi()
+            ))
+        );
+        MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getClaimConditionByIdCall::SELECTOR,
+                json!(condition_hex),
+            )
+            // Still used by the signing path (execution::thirdweb_engine::
+            // fetch_condition_and_wallet_claimed), unlike discovery, which
+            // no longer depends on it.
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
+    fn manifold_rehearsal_transport() -> MockTransport {
+        let extensions_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::manifold::getExtensionsCall::abi_encode_returns(&vec![EXTENSION])
+            )
+        );
+        let mut claim = manifold_claim_abi();
+        claim.startDate = alloy_primitives::U256::from(1_700_000_000u64);
+        claim.endDate = alloy_primitives::U256::from(1_900_000_000u64);
+        let claim_hex = format!(
+            "0x{}",
+            hex::encode(crate::protocol::manifold::getClaimCall::abi_encode_returns(
+                &claim
+            ))
+        );
+        MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getExtensionsCall::SELECTOR,
+                json!(extensions_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getClaimCall::SELECTOR,
+                json!(claim_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getTotalMintsCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::getTotalMintsCall::abi_encode_returns(&0u32)
+                    )
+                )),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::MEMBERSHIP_ADDRESSCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::MEMBERSHIP_ADDRESSCall::abi_encode_returns(
+                            &Address::ZERO
+                        )
+                    )
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
+    fn test_signer() -> crate::signing::signer::LocalSigner {
+        crate::signing::signer::LocalSigner::from_bytes(
+            keccak256(b"kairox-watch-full-pipeline-test-key").0,
+        )
+        .unwrap()
+    }
+
+    fn chain_info() -> crate::chain::registry::ChainInfo {
+        ChainRegistry::builtin().by_id(1).unwrap().clone()
+    }
+
+    fn safety_caps() -> SafetyCaps {
+        SafetyCaps {
+            max_mint_value: alloy_primitives::U256::from(1_000_000_000_000_000_000u128),
+            max_gas_cost: alloy_primitives::U256::from(1_000_000_000_000_000_000u128),
+            max_total_spend: alloy_primitives::U256::from(1_000_000_000_000_000_000u128),
+        }
+    }
+
+    /// Section 5's mandatory THIRDWEB requirement: future/active stage
+    /// -> wait -> T0 -> trusted provenance -> fresh reads -> exact
+    /// expected-condition check -> sign + serialize -> rehearsal success
+    /// -> zero `eth_sendRawTransaction` calls. Exercises
+    /// `run_thirdweb_watch_with_pool` itself, not just the engine.
+    #[tokio::test]
+    async fn full_trusted_thirdweb_watch_rehearsal_succeeds_with_zero_broadcast() {
+        let signer = test_signer();
+        let transport = thirdweb_rehearsal_transport();
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+
+        let stage_id = crate::domain::stage::StageId::ThirdwebMultiPhase {
+            drop_contract: DROP,
+            condition_id: alloy_primitives::U256::ZERO,
+            config_fingerprint: crate::protocol::thirdweb::ClaimCondition::from_abi(
+                active_condition_abi(),
+            )
+            .unwrap()
+            .config_fingerprint(),
+        };
+        let mut t = target(DROP);
+        t.wallet = signer.address();
+
+        let outcome = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.broadcast_summary,
+            crate::execution::broadcast::BroadcastSummary::NotSent
+        );
+        assert!(outcome.receipt_state.is_none());
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "rehearsal must never call eth_sendRawTransaction"
+        );
+    }
+
+    /// Same requirement, Manifold.
+    #[tokio::test]
+    async fn full_trusted_manifold_watch_rehearsal_succeeds_with_zero_broadcast() {
+        let signer = test_signer();
+        let transport = manifold_rehearsal_transport();
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+
+        let mut t = target(CREATOR);
+        t.wallet = signer.address();
+
+        let outcome = run_manifold_watch_with_pool(
+            &pool,
+            &t,
+            EXTENSION,
+            CREATOR,
+            alloy_primitives::U256::ZERO,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[manifold_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.broadcast_summary,
+            crate::execution::broadcast::BroadcastSummary::NotSent
+        );
+        assert!(outcome.receipt_state.is_none());
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "rehearsal must never call eth_sendRawTransaction"
+        );
+    }
+
+    /// Section 6: AUTO + trusted protocol + future GATED stage +
+    /// legitimate operator-supplied allowlist proof + wait + T0
+    /// revalidation + signing + rehearsal + zero broadcast, exercising
+    /// watch orchestration end to end (auto-resolution through to
+    /// dispatch), not just the mint engine in isolation.
+    #[tokio::test]
+    async fn auto_trusted_thirdweb_gated_stage_with_allowlist_proof_rehearses_successfully() {
+        let signer = test_signer();
+        let wallet = signer.address();
+
+        // A genuine two-leaf allowlist tree (this wallet's real leaf,
+        // plus one unrelated sibling) -- not the single-leaf
+        // leaf-equals-root degenerate case, so `--allowlist-proof` is
+        // exercised with a real, nonempty proof array.
+        let leaf = crate::protocol::thirdweb::allowlist_leaf(
+            wallet,
+            alloy_primitives::U256::ZERO, // no per-wallet-limit override
+            crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
+            Address::ZERO,
+        );
+        let sibling = alloy_primitives::B256::repeat_byte(0x42);
+        let root = crate::protocol::seadrop_crypto::commutative_keccak256(leaf, sibling);
+        let mut gated_condition = active_condition_abi();
+        gated_condition.merkleRoot = root;
+
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &gated_condition
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getClaimConditionByIdCall::SELECTOR,
+                json!(condition_hex),
+            )
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+
+        // AUTO resolution first -- proves the resolver itself (not just
+        // an explicit --engine thirdweb caller) finds and selects this
+        // trusted, gated stage.
+        let mut t = target(DROP);
+        t.wallet = wallet;
+        t.engine = EngineSelection::Auto;
+        t.allowlist_proof = vec![format!("0x{}", hex::encode(sibling))];
+        t.allowlist_quantity_limit_per_wallet = "0".to_string();
+        t.allowlist_price_per_token_wei = None;
+        t.allowlist_currency = None;
+        let plan_args = t.to_plan_args();
+
+        let resolved = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[thirdweb_fingerprint()],
+            &[],
+        )
+        .await
+        .unwrap();
+        let stage_id = match resolved {
+            Some(ResolvedWatchEngine::Thirdweb { stage_id, .. }) => stage_id,
+            other => panic!("expected Some(ResolvedWatchEngine::Thirdweb), got {other:?}"),
+        };
+
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+        let outcome = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.broadcast_summary,
+            crate::execution::broadcast::BroadcastSummary::NotSent
+        );
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "rehearsal must never call eth_sendRawTransaction, even for a successfully-proven \
+             gated auto-resolved stage"
         );
     }
 }
