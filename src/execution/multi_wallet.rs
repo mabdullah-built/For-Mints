@@ -483,8 +483,13 @@ pub async fn run_multi_wallet_public_mint(
                     gas_buffer_multiplier: config.gas_buffer_multiplier,
                     safety_caps: config.safety_caps,
                 };
-                let outcome =
-                    gather_unsigned_plan(read_client, signer_address, &live_request).await;
+                let outcome = gather_unsigned_plan(
+                    read_client,
+                    signer_address,
+                    &live_request,
+                    crate::execution::seadrop_registry::BUILTIN_REGISTRY,
+                )
+                .await;
                 (request, outcome)
             }
         }))

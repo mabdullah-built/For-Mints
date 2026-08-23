@@ -21,8 +21,10 @@ use crate::signing::signer::Signer;
 use crate::signing::transaction::UnsignedEip1559Tx;
 
 use super::errors::{KairoxError, SessionError, SessionErrorKind};
+use super::op_stack_fees::bound_op_stack_fees;
 use super::plan::PlanInputs;
 use super::plan::build_plan;
+use super::seadrop_registry::TrustedSeaDropFingerprint;
 
 /// A fully signed, ready-to-broadcast transaction plus the validated
 /// metadata that produced it. Contains no secret key material — only the
@@ -102,10 +104,21 @@ pub struct PreparedUnsignedPlan {
 /// key check, not a signing operation) so a wrong-key wallet still fails
 /// fast, before spending any RPC round trip, exactly as the combined
 /// function always has.
+///
+/// `seadrop_trusted_registry` is consulted **only** when
+/// `request.chain.seadrop_requires_trusted_fingerprint` is `true`
+/// (currently only Ink) -- see `execution::seadrop_registry`'s module
+/// doc comment. Every other chain's behavior is completely unaffected by
+/// this parameter; production call sites always pass
+/// `seadrop_registry::BUILTIN_REGISTRY`, exactly mirroring the existing
+/// thirdweb/Manifold trusted-registry DI pattern (a plain parameter
+/// production always hardcodes to the real registry, so tests can inject
+/// synthetic fixtures directly).
 pub async fn gather_unsigned_plan(
     client: &RpcClient,
     signer_address: Address,
     request: &LiveMintRequest,
+    seadrop_trusted_registry: &[TrustedSeaDropFingerprint],
 ) -> Result<PreparedUnsignedPlan, KairoxError> {
     if signer_address != request.wallet {
         return Err(KairoxError::Session(SessionError::with_kind(
@@ -229,6 +242,36 @@ pub async fn gather_unsigned_plan(
         .await?;
     let gas_limit = ((gas_estimate as f64) * request.gas_buffer_multiplier.max(1.0)).ceil() as u64;
 
+    // Pre-sign SeaDrop provenance recheck -- only for a chain that
+    // requires it (see `ChainInfo::seadrop_requires_trusted_fingerprint`'s
+    // doc comment). Re-reads the SeaDrop contract's *live* runtime
+    // bytecode right now (never trusts an earlier read) and requires an
+    // exact chain/address/bytecode-hash match against
+    // `seadrop_trusted_registry` -- no fallback to selector compatibility
+    // or "same ABI, therefore safe".
+    if request.chain.seadrop_requires_trusted_fingerprint {
+        let live_code = client.get_code(request.seadrop_contract).await?;
+        let live_hash = keccak256(&live_code);
+        if crate::execution::seadrop_registry::find_fingerprint(
+            seadrop_trusted_registry,
+            request.chain.chain_id,
+            request.seadrop_contract,
+            live_hash,
+        )
+        .is_none()
+        {
+            return Err(KairoxError::Session(SessionError::with_kind(
+                SessionErrorKind::SeaDropProvenanceUnverified,
+                format!(
+                    "SeaDrop contract {:#x} on chain {} does not match any trusted fingerprint \
+                     (live runtime bytecode hash {live_hash:#x}); refusing to sign against \
+                     unverified SeaDrop execution semantics -- see execution::seadrop_registry",
+                    request.seadrop_contract, request.chain.chain_id
+                ),
+            )));
+        }
+    }
+
     let inputs = PlanInputs {
         chain: request.chain.clone(),
         nft_contract: request.nft_contract,
@@ -264,8 +307,57 @@ pub async fn gather_unsigned_plan(
     }
 
     // Required balance check: the wallet must be able to cover the
-    // worst-case total spend this exact plan computed.
-    let worst_case_gas_cost = fees.worst_case_gas_cost(gas_limit);
+    // worst-case total spend this exact plan computed. On a chain with an
+    // OP Stack fee oracle configured (currently only Ink), the "gas
+    // cost" this bounds against is the COMPLETE three-component fee --
+    // L2 execution + L1 data/security + operator fee, per
+    // `execution::op_stack_fees`'s doc comment -- never just the L2
+    // component alone. `build_plan` above already validated
+    // `request.safety_caps` against the narrower L2-only figure (its
+    // dry-run-shared logic is unchanged for every chain, including Ink);
+    // this is an ADDITIONAL, stricter check specific to the live
+    // pre-sign path, so `max_gas_cost`/`max_total_spend` genuinely bound
+    // everything the transaction can incur before Kairox ever signs one.
+    let unsigned_tx_for_sizing = UnsignedEip1559Tx {
+        chain_id: request.chain.chain_id,
+        nonce,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas(),
+        max_fee_per_gas: fees.max_fee_per_gas(),
+        gas_limit,
+        to: request.seadrop_contract,
+        value: mint_value,
+        data: calldata.clone(),
+        access_list: Vec::new(),
+    };
+    let worst_case_gas_cost = match request.chain.op_stack_gas_price_oracle {
+        Some(gas_price_oracle) => {
+            let bound = bound_op_stack_fees(
+                client,
+                gas_price_oracle,
+                &unsigned_tx_for_sizing,
+                fees.max_fee_per_gas(),
+            )
+            .await
+            .map_err(|e| {
+                KairoxError::Session(SessionError::with_kind(
+                    SessionErrorKind::OpStackFeeBoundUnavailable,
+                    format!(
+                        "could not bound the complete OP Stack transaction fee before signing \
+                         ({e}); refusing to prepare a live transaction with an unbounded fee \
+                         exposure"
+                    ),
+                ))
+            })?;
+            let total_cost = bound.total();
+            request.safety_caps.check(
+                mint_value,
+                total_cost,
+                mint_value.saturating_add(total_cost),
+            )?;
+            total_cost
+        }
+        None => fees.worst_case_gas_cost(gas_limit),
+    };
     let worst_case_total = worst_case_total_spend(mint_value, worst_case_gas_cost);
     if balance < worst_case_total {
         return Err(KairoxError::Session(SessionError::with_kind(
@@ -363,7 +455,13 @@ pub async fn prepare_live_transaction(
     signer: &dyn Signer,
     request: &LiveMintRequest,
 ) -> Result<PreparedTransaction, KairoxError> {
-    let plan = gather_unsigned_plan(client, signer.address(), request).await?;
+    let plan = gather_unsigned_plan(
+        client,
+        signer.address(),
+        request,
+        crate::execution::seadrop_registry::BUILTIN_REGISTRY,
+    )
+    .await?;
     finalize_signed_transaction(signer, plan)
 }
 
@@ -565,9 +663,14 @@ mod tests {
         let req = request(signer.address());
 
         let started = std::time::Instant::now();
-        gather_unsigned_plan(&client, signer.address(), &req)
-            .await
-            .unwrap();
+        gather_unsigned_plan(
+            &client,
+            signer.address(),
+            &req,
+            crate::execution::seadrop_registry::BUILTIN_REGISTRY,
+        )
+        .await
+        .unwrap();
         let elapsed = started.elapsed();
 
         assert!(
@@ -611,9 +714,14 @@ mod tests {
         let client = connect(MockOpts::default(), EndpointRole::ReadOnly).await;
         let req = request(signer.address());
 
-        let plan = gather_unsigned_plan(&client, signer.address(), &req)
-            .await
-            .unwrap();
+        let plan = gather_unsigned_plan(
+            &client,
+            signer.address(),
+            &req,
+            crate::execution::seadrop_registry::BUILTIN_REGISTRY,
+        )
+        .await
+        .unwrap();
 
         let public_selector = seadrop::mintPublicCall::SELECTOR;
         let allow_list_selector = seadrop::mintAllowListCall::SELECTOR;
@@ -820,5 +928,315 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KairoxError::Session(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Ink (chain 57073): trusted SeaDrop fingerprint recheck + complete
+    // OP Stack fee bound. Every other test above uses chain 1 (Ethereum),
+    // which has `seadrop_requires_trusted_fingerprint: false` and
+    // `op_stack_gas_price_oracle: None` -- completely unaffected by any
+    // of this.
+    // -----------------------------------------------------------------
+
+    // Some fixed, arbitrary bytes used as the mocked "live runtime
+    // bytecode" for the SeaDrop contract in these tests -- what matters
+    // is only that its keccak256 either matches or does not match the
+    // registry entry under test, not that it resembles real SeaDrop
+    // bytecode.
+    const MOCK_SEADROP_CODE: &[u8] = b"mock-seadrop-runtime-bytecode-for-tests";
+
+    fn ink_request(wallet: Address) -> LiveMintRequest {
+        let mut req = request(wallet);
+        req.chain = crate::chain::registry::ChainRegistry::builtin()
+            .by_id(57073)
+            .unwrap()
+            .clone();
+        req
+    }
+
+    fn trusted_ink_registry(seadrop_hash: B256) -> Vec<TrustedSeaDropFingerprint> {
+        vec![TrustedSeaDropFingerprint {
+            name: "test-fixture",
+            chain_id: 57073,
+            address: SEADROP,
+            runtime_bytecode_hash: seadrop_hash,
+            protocol_version: "SeaDrop 1.0",
+            source_provenance: "test-fixture",
+        }]
+    }
+
+    /// Deliberately mirrors `build_transport` plus Ink-only routes,
+    /// rather than trying to bolt extra routes onto an already-built
+    /// `MockTransport`.
+    fn ink_transport(
+        opts: MockOpts,
+        seadrop_code: &[u8],
+        l1_fee_upper_bound: U256,
+        operator_fee: U256,
+    ) -> MockTransport {
+        let public_drop = seadrop::PublicDropAbi {
+            mintPrice: alloy_primitives::Uint::from(10_000_000_000_000_000u128),
+            startTime: alloy_primitives::Uint::from(opts.start_time as u64),
+            endTime: alloy_primitives::Uint::from(opts.end_time as u64),
+            maxTotalMintableByWallet: opts.max_total_mintable_by_wallet,
+            feeBps: 0,
+            restrictFeeRecipients: false,
+        };
+        let public_drop_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getPublicDropCall::abi_encode_returns(&public_drop))
+        );
+        let allowed_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getAllowedFeeRecipientsCall::abi_encode_returns(
+                &Vec::<Address>::new()
+            ))
+        );
+        let mint_stats_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getMintStatsCall::abi_encode_returns(
+                &seadrop::getMintStatsReturn {
+                    minterNumMinted: U256::from(opts.minter_num_minted),
+                    currentTotalSupply: U256::from(opts.current_total_supply),
+                    maxSupply: U256::from(opts.max_supply),
+                }
+            ))
+        );
+        let l1_fee_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::op_stack::getL1FeeUpperBoundCall::abi_encode_returns(
+                    &l1_fee_upper_bound
+                )
+            )
+        );
+        let operator_fee_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::op_stack::getOperatorFeeCall::abi_encode_returns(&operator_fee)
+            )
+        );
+
+        let mut builder = MockTransport::builder()
+            .respond("eth_chainId", json!("0xdef1"))
+            .respond_eth_call_selector(seadrop::getPublicDropCall::SELECTOR, json!(public_drop_hex))
+            .respond_eth_call_selector(
+                seadrop::getAllowedFeeRecipientsCall::SELECTOR,
+                json!(allowed_hex),
+            )
+            .respond_eth_call_selector(seadrop::getMintStatsCall::SELECTOR, json!(mint_stats_hex))
+            .respond_eth_call_selector(
+                crate::protocol::op_stack::getL1FeeUpperBoundCall::SELECTOR,
+                json!(l1_fee_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::op_stack::getOperatorFeeCall::SELECTOR,
+                json!(operator_fee_hex),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(seadrop_code))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": opts.base_fee_hex}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!(opts.priority_fee_hex))
+            .respond("eth_getTransactionCount", json!(opts.nonce_hex))
+            .respond("eth_getBalance", json!(opts.balance_hex));
+
+        builder = match opts.estimate_gas {
+            Ok(hex_value) => builder.respond("eth_estimateGas", json!(hex_value)),
+            Err((code, message)) => builder.error("eth_estimateGas", code, message),
+        };
+
+        builder.build()
+    }
+
+    async fn connect_ink(transport: MockTransport, role: EndpointRole) -> RpcClient {
+        RpcClient::connect(Box::new(transport), 57073, role, None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ink_trusted_seadrop_fingerprint_match_signs_successfully() {
+        let signer = signer();
+        let seadrop_hash = keccak256(MOCK_SEADROP_CODE);
+        let transport = ink_transport(
+            MockOpts::default(),
+            MOCK_SEADROP_CODE,
+            U256::from(2_000_000u64),
+            U256::ZERO,
+        );
+        let client = connect_ink(transport, EndpointRole::ReadOnly).await;
+        let req = ink_request(signer.address());
+        let registry = trusted_ink_registry(seadrop_hash);
+
+        let plan = gather_unsigned_plan(&client, signer.address(), &req, &registry)
+            .await
+            .unwrap();
+        assert!(plan.worst_case_total_spend > U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn ink_seadrop_bytecode_mismatch_fails_closed() {
+        let signer = signer();
+        // Registry expects a different hash than what the mock's
+        // eth_getCode actually returns.
+        let registry_hash = keccak256(b"a-completely-different-bytecode");
+        let transport = ink_transport(
+            MockOpts::default(),
+            MOCK_SEADROP_CODE,
+            U256::from(2_000_000u64),
+            U256::ZERO,
+        );
+        let client = connect_ink(transport, EndpointRole::ReadOnly).await;
+        let req = ink_request(signer.address());
+        let registry = trusted_ink_registry(registry_hash);
+
+        let err = gather_unsigned_plan(&client, signer.address(), &req, &registry)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::SeaDropProvenanceUnverified
+        );
+    }
+
+    #[tokio::test]
+    async fn ink_empty_registry_refuses_even_a_syntactically_valid_seadrop() {
+        let signer = signer();
+        let transport = ink_transport(
+            MockOpts::default(),
+            MOCK_SEADROP_CODE,
+            U256::from(2_000_000u64),
+            U256::ZERO,
+        );
+        let client = connect_ink(transport, EndpointRole::ReadOnly).await;
+        let req = ink_request(signer.address());
+
+        let err = gather_unsigned_plan(&client, signer.address(), &req, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::SeaDropProvenanceUnverified
+        );
+    }
+
+    #[tokio::test]
+    async fn ethereum_mainnet_never_consults_the_seadrop_registry_at_all() {
+        // Chain 1 has seadrop_requires_trusted_fingerprint: false -- an
+        // empty registry (which would refuse Ink outright) must have zero
+        // effect here; the existing Ethereum fixture's eth_getCode is
+        // never even mocked, proving the check is genuinely skipped, not
+        // merely lenient.
+        let signer = signer();
+        let client = connect(MockOpts::default(), EndpointRole::ReadOnly).await;
+        let req = request(signer.address());
+
+        gather_unsigned_plan(&client, signer.address(), &req, &[])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ink_operator_fee_is_included_and_causes_a_cap_rejection_when_it_pushes_over() {
+        let signer = signer();
+        let seadrop_hash = keccak256(MOCK_SEADROP_CODE);
+        // A gas cost cap tight enough that L2 execution alone fits, but
+        // adding a large operator fee pushes the total over -- proves the
+        // operator fee genuinely participates in the safety-cap check,
+        // not silently dropped.
+        let transport = ink_transport(
+            MockOpts::default(),
+            MOCK_SEADROP_CODE,
+            U256::from(1u64),
+            U256::from(999_999_999_999_999_999u128),
+        );
+        let client = connect_ink(transport, EndpointRole::ReadOnly).await;
+        let mut req = ink_request(signer.address());
+        req.safety_caps.max_gas_cost = U256::from(1_000_000_000_000_000u128);
+        req.safety_caps.max_total_spend = U256::from(2_000_000_000_000_000u128);
+        let registry = trusted_ink_registry(seadrop_hash);
+
+        let err = gather_unsigned_plan(&client, signer.address(), &req, &registry)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KairoxError::SafetyCap(_)));
+    }
+
+    #[tokio::test]
+    async fn ink_oracle_read_failure_fails_closed_before_signing() {
+        let signer = signer();
+        let seadrop_hash = keccak256(MOCK_SEADROP_CODE);
+        // A transport that mocks everything except the GasPriceOracle
+        // calls, which fall through to a blanket eth_call revert.
+        let public_drop = seadrop::PublicDropAbi {
+            mintPrice: alloy_primitives::Uint::from(10_000_000_000_000_000u128),
+            startTime: alloy_primitives::Uint::from(
+                datetime!(2020-01-01 00:00:00 UTC).unix_timestamp() as u64,
+            ),
+            endTime: alloy_primitives::Uint::from(
+                datetime!(2999-01-01 00:00:00 UTC).unix_timestamp() as u64,
+            ),
+            maxTotalMintableByWallet: 5,
+            feeBps: 0,
+            restrictFeeRecipients: false,
+        };
+        let public_drop_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getPublicDropCall::abi_encode_returns(&public_drop))
+        );
+        let allowed_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getAllowedFeeRecipientsCall::abi_encode_returns(
+                &Vec::<Address>::new()
+            ))
+        );
+        let mint_stats_hex = format!(
+            "0x{}",
+            hex::encode(seadrop::getMintStatsCall::abi_encode_returns(
+                &seadrop::getMintStatsReturn {
+                    minterNumMinted: U256::ZERO,
+                    currentTotalSupply: U256::ZERO,
+                    maxSupply: U256::from(1_000u64),
+                }
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0xdef1"))
+            .respond_eth_call_selector(seadrop::getPublicDropCall::SELECTOR, json!(public_drop_hex))
+            .respond_eth_call_selector(
+                seadrop::getAllowedFeeRecipientsCall::SELECTOR,
+                json!(allowed_hex),
+            )
+            .respond_eth_call_selector(seadrop::getMintStatsCall::SELECTOR, json!(mint_stats_hex))
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(MOCK_SEADROP_CODE))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect_ink(transport, EndpointRole::ReadOnly).await;
+        let req = ink_request(signer.address());
+        let registry = trusted_ink_registry(seadrop_hash);
+
+        let err = gather_unsigned_plan(&client, signer.address(), &req, &registry)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::OpStackFeeBoundUnavailable
+        );
     }
 }

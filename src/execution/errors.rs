@@ -170,6 +170,22 @@ pub enum SessionErrorKind {
     /// back to `kairox mint --send --yes` and observe the real outcome
     /// directly.
     ActiveStageEligibilityUnknown,
+    /// A SeaDrop mint attempt on a chain whose
+    /// [`crate::chain::registry::ChainInfo::seadrop_requires_trusted_fingerprint`]
+    /// is `true` (currently only Ink) targeted an address whose live
+    /// runtime bytecode does not exactly match any entry in
+    /// `execution::seadrop_registry`'s trusted registry -- wrong chain,
+    /// wrong address, an unrecognized deployment, or a runtime byte that
+    /// changed since the fingerprint was reviewed all produce this. Never
+    /// emitted on Ethereum/Base/Robinhood Chain, whose
+    /// `default_seadrop_address` trust is unaffected by this mechanism.
+    SeaDropProvenanceUnverified,
+    /// Ink's (or any `op_stack_gas_price_oracle`-configured chain's)
+    /// `GasPriceOracle` L1-data-fee/operator-fee read failed or returned
+    /// something Kairox could not decode -- the complete transaction fee
+    /// cannot be bounded, so preparation must fail closed rather than
+    /// proceed with only the L2 execution component.
+    OpStackFeeBoundUnavailable,
 }
 
 /// An error representing a state Kairox has explicitly decided must halt
@@ -274,6 +290,13 @@ pub enum KairoxErrorCode {
     /// A [`SessionError`] not otherwise classified (`SessionErrorKind::Generic`,
     /// `InvalidManifest`, or `SkippedSharedResourceFailure`).
     SessionAborted,
+    /// A SeaDrop deployment's live runtime bytecode does not match its
+    /// chain's trusted fingerprint registry entry (see
+    /// `execution::seadrop_registry`).
+    SeaDropProvenanceUnverified,
+    /// An OP Stack chain's complete transaction fee (L2 execution + L1
+    /// data + operator fee) could not be bounded before signing.
+    OpStackFeeBoundUnavailable,
 }
 
 impl std::fmt::Display for KairoxErrorCode {
@@ -306,6 +329,8 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::StageAlreadyLive => "STAGE_ALREADY_LIVE",
             Self::ActiveStageEligibilityUnknown => "ACTIVE_STAGE_ELIGIBILITY_UNKNOWN",
             Self::SessionAborted => "SESSION_ABORTED",
+            Self::SeaDropProvenanceUnverified => "SEADROP_PROVENANCE_UNVERIFIED",
+            Self::OpStackFeeBoundUnavailable => "OP_STACK_FEE_BOUND_UNAVAILABLE",
         };
         f.write_str(s)
     }
@@ -394,6 +419,12 @@ impl KairoxError {
                 SessionErrorKind::StageAlreadyLive => KairoxErrorCode::StageAlreadyLive,
                 SessionErrorKind::ActiveStageEligibilityUnknown => {
                     KairoxErrorCode::ActiveStageEligibilityUnknown
+                }
+                SessionErrorKind::SeaDropProvenanceUnverified => {
+                    KairoxErrorCode::SeaDropProvenanceUnverified
+                }
+                SessionErrorKind::OpStackFeeBoundUnavailable => {
+                    KairoxErrorCode::OpStackFeeBoundUnavailable
                 }
                 SessionErrorKind::Generic
                 | SessionErrorKind::InvalidManifest

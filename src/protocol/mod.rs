@@ -4,6 +4,7 @@
 pub mod erc_standards;
 pub mod logs;
 pub mod manifold;
+pub mod op_stack;
 pub mod seadrop;
 pub mod seadrop_crypto;
 pub mod thirdweb;

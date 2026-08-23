@@ -42,6 +42,16 @@ struct ChainReport {
     /// this as an opaque diagnostic array, not a field callers should
     /// parse structurally.
     endpoint_details: Vec<String>,
+    /// `None` for a chain with no `op_stack_gas_price_oracle` configured
+    /// (every chain except Ink today) -- never populated, never
+    /// misleadingly "checked: false". For Ink, a live, read-only,
+    /// best-effort summary of the `GasPriceOracle`'s reported upgrade
+    /// state (`isEcotone`/`isFjord`/`isIsthmus`/`isJovian`), or an
+    /// explicit failure message if the oracle could not be read -- never
+    /// silently omitted, since Kairox's fee-bounding logic depends on
+    /// exactly this state being genuinely live and current (see
+    /// `execution::op_stack_fees`).
+    op_stack_fee_oracle_status: Option<String>,
 }
 
 /// `--json` mode must emit ONLY the JSON object on stdout -- gathering is
@@ -122,6 +132,48 @@ fn print_human(report: &DoctorReport) {
     }
 }
 
+/// Read-only, best-effort summary of an OP Stack `GasPriceOracle`'s
+/// reported upgrade state -- purely diagnostic (never used to authorize
+/// anything; the actual pre-sign fee bound in
+/// `execution::op_stack_fees` always re-reads live, independent of this
+/// output). Requires `isFjord` specifically, since
+/// `getL1FeeUpperBound` (the method Kairox's fee bound uses) itself
+/// requires it and reverts otherwise -- surfacing that clearly here
+/// rather than only as an opaque failure deep in a live `mint --send`.
+async fn read_op_stack_fee_oracle_status(
+    client: &crate::chain::rpc::RpcClient,
+    oracle: alloy_primitives::Address,
+) -> Result<String, crate::chain::rpc::RpcError> {
+    use crate::protocol::op_stack;
+    use alloy_sol_types::SolCall;
+
+    let is_fjord_calldata: alloy_primitives::Bytes = op_stack::isFjordCall {}.abi_encode().into();
+    let is_isthmus_calldata: alloy_primitives::Bytes =
+        op_stack::isIsthmusCall {}.abi_encode().into();
+    let is_jovian_calldata: alloy_primitives::Bytes = op_stack::isJovianCall {}.abi_encode().into();
+    let (fjord_raw, isthmus_raw, jovian_raw) = tokio::try_join!(
+        client.eth_call(oracle, &is_fjord_calldata),
+        client.eth_call(oracle, &is_isthmus_calldata),
+        client.eth_call(oracle, &is_jovian_calldata),
+    )?;
+
+    let decode_bool = |raw: &[u8]| raw.last().copied().unwrap_or(0) != 0;
+    let is_fjord = decode_bool(&fjord_raw);
+    let is_isthmus = decode_bool(&isthmus_raw);
+    let is_jovian = decode_bool(&jovian_raw);
+
+    if !is_fjord {
+        return Ok(format!(
+            "WARN: isFjord=false -- Kairox's L1-data-fee bounding (getL1FeeUpperBound) requires \
+             Fjord; live send on this chain would fail closed at fee-bounding time \
+             (isIsthmus={is_isthmus}, isJovian={is_jovian})"
+        ));
+    }
+    Ok(format!(
+        "PASS (isFjord={is_fjord}, isIsthmus={is_isthmus}, isJovian={is_jovian})"
+    ))
+}
+
 async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
     let signing_key_configured =
         secret_env_var_present(&ProcessEnv, SIGNING_KEY_ENV_VAR).unwrap_or(false);
@@ -156,6 +208,7 @@ async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
                     read_capable_count: 0,
                     send_capable_count: 0,
                     endpoint_details: Vec::new(),
+                    op_stack_fee_oracle_status: None,
                 });
                 continue;
             }
@@ -171,6 +224,7 @@ async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
                 read_capable_count: 0,
                 send_capable_count: 0,
                 endpoint_details: Vec::new(),
+                op_stack_fee_oracle_status: None,
             });
             continue;
         }
@@ -202,6 +256,19 @@ async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
             "FAIL: no endpoint connected".to_string()
         };
 
+        let op_stack_fee_oracle_status = match chain.op_stack_gas_price_oracle {
+            None => None,
+            Some(oracle) => Some(match pool.preferred_read() {
+                None => "FAIL: no read-capable endpoint connected -- cannot verify OP Stack fee \
+                         oracle state"
+                    .to_string(),
+                Some(client) => match read_op_stack_fee_oracle_status(client, oracle).await {
+                    Ok(summary) => summary,
+                    Err(e) => format!("FAIL: could not read GasPriceOracle at {oracle:#x} ({e})"),
+                },
+            }),
+        };
+
         chains.push(ChainReport {
             name: chain.name.to_string(),
             chain_id: chain.chain_id,
@@ -211,6 +278,7 @@ async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
             read_capable_count: pool.read_capable().len(),
             send_capable_count: pool.send_capable().len(),
             endpoint_details,
+            op_stack_fee_oracle_status,
         });
     }
 
