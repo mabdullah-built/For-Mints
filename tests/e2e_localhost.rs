@@ -7134,3 +7134,239 @@ fn thirdweb_real_send_refuses_without_an_established_trusted_fingerprint() {
         "an unverified implementation must never be signed or broadcast against a real --send"
     );
 }
+
+// =======================================================================
+// v0.8: Manifold LazyPayableClaim engine, real CLI binary E2E. Mirrors
+// the thirdweb block above exactly -- exercises the actual
+// protocol::manifold ABI encode/decode and execution::manifold_engine
+// pipeline through a real localhost JSON-RPC server.
+// =======================================================================
+
+use kairox::protocol::manifold::{self as mf, ClaimAbi};
+
+const MANIFOLD_EXTENSION: Address = address!("00000000000000000000000000000000000e0e0e");
+const MANIFOLD_CREATOR: Address = address!("00000000000000000000000000000000007d40D0");
+
+fn manifold_public_claim_response(cost_wei: u128) -> Value {
+    let claim = ClaimAbi {
+        total: 3,
+        totalMax: 100,
+        walletMax: 2,
+        startDate: U256::from(1_700_000_000u64),
+        endDate: U256::from(1_800_000_000u64),
+        storageProtocol: 3,
+        contractVersion: 1,
+        identical: true,
+        merkleRoot: B256::ZERO,
+        location: "ipfs://abc".to_string(),
+        cost: U256::from(cost_wei),
+        paymentReceiver: MANIFOLD_CREATOR,
+        erc20: Address::ZERO,
+        signingAddress: Address::ZERO,
+    };
+    serde_json::json!(format!(
+        "0x{}",
+        hex::encode(mf::getClaimCall::abi_encode_returns(&claim))
+    ))
+}
+
+fn manifold_read_response(method: &str, params: &Value) -> Option<Behavior> {
+    match method {
+        "eth_chainId" => Some(rpc_ok(serde_json::json!("0x1"))),
+        "eth_call" => {
+            let data = params
+                .get(0)
+                .and_then(|c| c.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or("0x");
+            let claim_sel = format!("0x{}", hex::encode(mf::getClaimCall::SELECTOR));
+            let total_mints_sel = format!("0x{}", hex::encode(mf::getTotalMintsCall::SELECTOR));
+            let membership_sel = format!("0x{}", hex::encode(mf::MEMBERSHIP_ADDRESSCall::SELECTOR));
+            if data.starts_with(&claim_sel) {
+                return Some(rpc_ok(manifold_public_claim_response(
+                    10_000_000_000_000_000,
+                )));
+            }
+            if data.starts_with(&total_mints_sel) {
+                return Some(rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(mf::getTotalMintsCall::abi_encode_returns(&0u32))
+                ))));
+            }
+            if data.starts_with(&membership_sel) {
+                return Some(rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(mf::MEMBERSHIP_ADDRESSCall::abi_encode_returns(
+                        &Address::ZERO
+                    ))
+                ))));
+            }
+            None
+        }
+        "eth_blockNumber" => Some(rpc_ok(serde_json::json!("0x1"))),
+        "eth_getBlockByNumber" => Some(rpc_ok(serde_json::json!({
+            "number": "0x1",
+            "timestamp": "0x1",
+            "baseFeePerGas": "0x3b9aca00"
+        }))),
+        "eth_maxPriorityFeePerGas" => Some(rpc_ok(serde_json::json!("0x3b9aca00"))),
+        "eth_getTransactionCount" => Some(rpc_ok(serde_json::json!("0x1"))),
+        "eth_getBalance" => Some(rpc_ok(serde_json::json!("0xde0b6b3a7640000"))),
+        "eth_estimateGas" => Some(rpc_ok(serde_json::json!("0x2bf20"))),
+        // Provenance read (execution::manifold_engine::establish_provenance):
+        // arbitrary bytecode hashed directly (no proxy resolution for
+        // Manifold -- see execution::manifold_registry's doc comment).
+        // The real BUILTIN_REGISTRY ships empty, so no hash can ever
+        // match it; this only proves the read plumbing itself, never
+        // authorizes a live send.
+        "eth_getCode" => Some(rpc_ok(serde_json::json!("0x600160026003"))),
+        _ => None,
+    }
+}
+
+#[test]
+fn manifold_dry_run_prints_the_claim_state_read_only() {
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        manifold_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in manifold dry-run scenario: {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{MANIFOLD_CREATOR:#x}"),
+            "--wallet",
+            &format!("{:#x}", test_signer().address()),
+            "--engine",
+            "manifold",
+            "--manifold-extension",
+            &format!("{MANIFOLD_EXTENSION:#x}"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("selected engine: MANIFOLD"))
+        .stdout(predicates::str::contains("allowlist gated:          false"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "a dry run must never broadcast"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `--engine manifold --send`/`--rehearsal` must refuse to authorize a
+// live send against any extension contract whose bytecode is not a
+// manually-reviewed entry in execution::manifold_registry's
+// trusted-fingerprint registry -- mirrors the thirdweb correctness gate
+// exactly. The real production CLI uses BUILTIN_REGISTRY, which ships
+// empty by design, so both scenarios below refuse through the actual
+// compiled binary.
+// ---------------------------------------------------------------------
+
+#[test]
+fn manifold_rehearsal_refuses_without_an_established_trusted_fingerprint() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "must never be called: provenance is never established for this fixture"
+                .into(),
+        },
+        _ => manifold_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in manifold rehearsal scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{MANIFOLD_CREATOR:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "manifold",
+            "--manifold-extension",
+            &format!("{MANIFOLD_EXTENSION:#x}"),
+            "--rehearsal",
+            "--yes",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "no trusted implementation fingerprint",
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an unverified extension contract must never be signed or broadcast, rehearsal or not"
+    );
+}
+
+#[test]
+fn manifold_real_send_refuses_without_an_established_trusted_fingerprint() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "must never be called: provenance is never established for this fixture"
+                .into(),
+        },
+        _ => manifold_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in manifold send scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "mint",
+            &format!("{MANIFOLD_CREATOR:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "manifold",
+            "--manifold-extension",
+            &format!("{MANIFOLD_EXTENSION:#x}"),
+            "--send",
+            "--yes",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "no trusted implementation fingerprint",
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "an unverified extension contract must never be signed or broadcast against a real --send"
+    );
+}

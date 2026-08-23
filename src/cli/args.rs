@@ -149,6 +149,14 @@ pub enum EngineSelection {
     /// logic in one deployment). Explicit-only for now -- not yet part of
     /// `--engine auto`'s resolution.
     Thirdweb,
+    /// Manifold `LazyPayableClaim` extension engine only. Unlike every
+    /// other engine, a Manifold claim needs three identifiers, not one:
+    /// `--collection` is the creator (NFT) contract, `--manifold-extension`
+    /// is the shared `LazyPayableClaim` extension contract (the actual
+    /// `eth_call`/`eth_sendTransaction` target), and `--instance-id`
+    /// selects the specific claim on that creator contract. Explicit-only
+    /// -- not yet part of `--engine auto`'s resolution.
+    Manifold,
 }
 
 #[derive(Args, Debug)]
@@ -175,6 +183,17 @@ pub struct PlanArgs {
     /// docs/generic-engine.md.
     #[arg(long)]
     pub generic_schema: Option<std::path::PathBuf>,
+    /// The Manifold `LazyPayableClaim` extension contract address.
+    /// Required for --engine manifold; ignored otherwise. `--collection`
+    /// continues to mean the creator (NFT) contract, exactly as for every
+    /// other engine -- see `EngineSelection::Manifold`'s doc comment for
+    /// why Manifold needs this extra identifier.
+    #[arg(long)]
+    pub manifold_extension: Option<Address>,
+    /// The Manifold claim `instanceId` on the creator contract. Only
+    /// meaningful with --engine manifold.
+    #[arg(long, default_value = "0")]
+    pub instance_id: String,
     /// Wallet address to plan a mint for. A plain address only — never a private key (that is loaded separately via KAIROX_SIGNING_KEY or interactive prompt, only when --send is used). Required for `plan`, and for `mint` unless --wallet-manifest is used instead.
     #[arg(long)]
     pub wallet: Option<Address>,
@@ -301,6 +320,15 @@ pub struct MintArgs {
     /// given; ignored otherwise.
     #[arg(long, requires = "allowlist_proof")]
     pub allowlist_currency: Option<Address>,
+    /// The Manifold allowlist `mintIndex` this wallet's allowlist entry
+    /// was assigned when the allowlist was built. Only meaningful with
+    /// --engine manifold together with --allowlist-proof (Manifold's
+    /// merkle leaf is `keccak256(abi.encodePacked(wallet, mintIndex))` --
+    /// see `protocol::manifold::allowlist_leaf`'s doc comment; the other
+    /// --allowlist-* override flags above are thirdweb-specific and not
+    /// consulted for --engine manifold).
+    #[arg(long, requires = "allowlist_proof")]
+    pub manifold_mint_index: Option<u32>,
 }
 
 #[derive(Args, Debug)]

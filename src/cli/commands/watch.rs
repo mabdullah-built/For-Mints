@@ -69,6 +69,11 @@ impl WatchTarget {
             // The generic verified contract engine is not wired into
             // `watch` this pass -- see docs/generic-engine.md.
             generic_schema: None,
+            // Manifold is not wired into `watch` either (see the
+            // EngineSelection::Manifold match arm in resolve_watch_engine
+            // below) -- these fields are never consulted.
+            manifold_extension: None,
+            instance_id: "0".to_string(),
             wallet: Some(self.wallet),
             quantity: self.quantity,
             fee_recipient: self.fee_recipient,
@@ -572,6 +577,11 @@ async fn resolve_watch_engine(
         EngineSelection::Thirdweb => Err(KairoxError::Session(SessionError::new(
             "--engine thirdweb is not yet supported by watch; use kairox mint --engine thirdweb \
              --send directly against an already-live phase (v0.8 Phase B scope)"
+                .to_string(),
+        ))),
+        EngineSelection::Manifold => Err(KairoxError::Session(SessionError::new(
+            "--engine manifold is not yet supported by watch; use kairox mint --engine manifold \
+             --send directly against an already-live claim (v0.8 scope)"
                 .to_string(),
         ))),
         EngineSelection::Public => {

@@ -46,6 +46,13 @@ enum SelectedEngine {
     /// thirdweb Drop -- `args.plan_args.collection` doubles as the Drop
     /// contract address (see `EngineSelection::Thirdweb`'s doc comment).
     Thirdweb,
+    /// Manifold `LazyPayableClaim` -- see `EngineSelection::Manifold`'s
+    /// doc comment for why this needs `--manifold-extension`/
+    /// `--instance-id` in addition to `--collection`.
+    Manifold {
+        extension_contract: alloy_primitives::Address,
+        instance_id: alloy_primitives::U256,
+    },
 }
 
 /// Resolve `--engine`/`--slug` into exactly one concrete engine.
@@ -64,6 +71,18 @@ async fn select_engine(
     match args.plan_args.engine {
         EngineSelection::Public => Ok(SelectedEngine::Public),
         EngineSelection::Thirdweb => Ok(SelectedEngine::Thirdweb),
+        EngineSelection::Manifold => {
+            let extension_contract = args.plan_args.manifold_extension.ok_or_else(|| {
+                KairoxError::Session(SessionError::new(
+                    "--manifold-extension is required for --engine manifold",
+                ))
+            })?;
+            let instance_id = parse_wei("--instance-id", &args.plan_args.instance_id)?;
+            Ok(SelectedEngine::Manifold {
+                extension_contract,
+                instance_id,
+            })
+        }
         EngineSelection::Opensea => {
             let slug = args
                 .plan_args
@@ -419,6 +438,94 @@ async fn run_dry_run(
             }
             println!("--- (nothing above this line reflects wallet-specific eligibility) ---");
         }
+        SelectedEngine::Manifold {
+            extension_contract,
+            instance_id,
+        } => {
+            if json || output.is_some() {
+                return Err(KairoxError::Session(SessionError::new(
+                    "--json/--output for a dry run is only supported for the PUBLIC engine today",
+                )));
+            }
+            let registry = ChainRegistry::builtin();
+            let (resolved, runtime) =
+                resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
+            let client = crate::cli::context::connect_read_client(
+                &resolved.info,
+                args.plan_args.chain_args.rpc_url.as_ref(),
+                runtime.config.as_ref(),
+            )
+            .await?;
+            println!("selected engine: MANIFOLD (LazyPayableClaim)");
+            println!();
+            println!("extension contract:       {extension_contract}");
+            println!("creator contract:         {}", args.plan_args.collection);
+            println!("instance id:              {instance_id}");
+            println!(
+                "SUPPORTED:                V1 ERC721LazyPayableClaim, single-token mint(), native currency only"
+            );
+            println!(
+                "NOT YET SUPPORTED:        mintBatch/quantity>1, ERC-1155 claims, V2 updatable-fee extension, ERC-20 claims"
+            );
+
+            // Best-effort claim-state read -- read-only reporting ONLY,
+            // never authorizes a live send (see
+            // `execution::manifold_engine::probe_claim`'s doc comment;
+            // that authorization comes exclusively from
+            // `establish_provenance`'s trusted-fingerprint match, checked
+            // separately below).
+            match crate::execution::manifold_engine::probe_claim(
+                &client,
+                extension_contract,
+                args.plan_args.collection,
+                instance_id,
+            )
+            .await
+            {
+                Some(claim) => {
+                    println!(
+                        "start:                    {} (unix {})",
+                        format_unix(claim.start_date),
+                        claim.start_date
+                    );
+                    println!("cost:                     {} wei", claim.cost);
+                    println!("native currency:          {}", claim.is_native_currency());
+                    println!("supply remaining:         {}", claim.supply_remaining());
+                    println!("per-wallet limit:         {}", claim.wallet_max);
+                    println!("allowlist gated:          {}", claim.is_gated());
+                }
+                None => {
+                    println!(
+                        "claim state:              could not be read (this may be an ERC-1155 \
+                         claim, the V2 extension family, an uninitialized instanceId, or an \
+                         unrelated contract)"
+                    );
+                }
+            }
+
+            // Provenance -- whether --send/--rehearsal would actually be
+            // authorized right now. Reported for operator visibility
+            // only; a dry run never signs regardless of this outcome.
+            match crate::execution::manifold_engine::establish_provenance(
+                &client,
+                resolved.info.chain_id,
+                extension_contract,
+                crate::execution::manifold_registry::BUILTIN_REGISTRY,
+            )
+            .await
+            {
+                Ok(fingerprint) => println!(
+                    "live-send provenance:     VERIFIED ({}) -- --send/--rehearsal authorized",
+                    fingerprint.name
+                ),
+                Err(_) => println!(
+                    "live-send provenance:     NOT ESTABLISHED -- --send/--rehearsal will refuse \
+                     to sign until this extension contract is manually reviewed and added to the \
+                     trusted registry"
+                ),
+            }
+            println!("--- (nothing above this line reflects wallet-specific eligibility) ---");
+        }
     }
 
     println!();
@@ -470,6 +577,10 @@ async fn run_send(
             run_send_generic(args, target, config_path).await
         }
         SelectedEngine::Thirdweb => run_send_thirdweb(args, config_path).await,
+        SelectedEngine::Manifold {
+            extension_contract,
+            instance_id,
+        } => run_send_manifold(args, extension_contract, instance_id, config_path).await,
     }
 }
 
@@ -1070,6 +1181,183 @@ async fn run_send_thirdweb(
     Ok(())
 }
 
+/// Parse `--allowlist-proof`/`--manifold-mint-index` into an
+/// [`OperatorManifoldAllowlist`](crate::execution::manifold_engine::OperatorManifoldAllowlist),
+/// or `None` when no proof was supplied (a public, non-gated claim).
+/// Manifold's allowlist shape is simpler than thirdweb's -- just a
+/// `mintIndex` and a proof, no price/quantity override fields -- so only
+/// `--allowlist-proof` and `--manifold-mint-index` are consulted here; the
+/// other thirdweb-specific `--allowlist-*` override flags are ignored for
+/// this engine.
+fn parse_manifold_allowlist(
+    args: &MintArgs,
+) -> Result<Option<crate::execution::manifold_engine::OperatorManifoldAllowlist>, KairoxError> {
+    if args.allowlist_proof.is_empty() {
+        return Ok(None);
+    }
+    let merkle_proof = args
+        .allowlist_proof
+        .iter()
+        .map(|entry| parse_b256_hex("--allowlist-proof", entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mint_index = args.manifold_mint_index.ok_or_else(|| {
+        KairoxError::Session(SessionError::new(
+            "--manifold-mint-index is required together with --allowlist-proof for --engine \
+             manifold",
+        ))
+    })?;
+    Ok(Some(
+        crate::execution::manifold_engine::OperatorManifoldAllowlist {
+            mint_index,
+            merkle_proof,
+        },
+    ))
+}
+
+/// `kairox mint --engine manifold --send` -- public and allowlist-gated
+/// (via --allowlist-proof/--manifold-mint-index) single-token,
+/// native-currency Manifold claims; see `execution::manifold_engine`'s
+/// module doc comment for the exact scope.
+async fn run_send_manifold(
+    args: MintArgs,
+    extension_contract: alloy_primitives::Address,
+    instance_id: alloy_primitives::U256,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), KairoxError> {
+    let wallet = args.plan_args.wallet.ok_or_else(|| {
+        KairoxError::Session(SessionError::new(
+            "--wallet is required (or use --wallet-manifest for a multi-wallet session)",
+        ))
+    })?;
+    let registry = ChainRegistry::builtin();
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &args.plan_args.chain_args, config_path)?;
+
+    let pool = connect_send_pool(
+        &resolved,
+        args.plan_args.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
+
+    // Preview read for the confirmation summary only -- purely
+    // informational here; the actual transaction that gets signed is
+    // built fresh, strictly, by `run_manifold_mint` below.
+    let preview_client = pool.preferred_read().ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available",
+        ))
+    })?;
+    // Best-effort, informational only -- see
+    // `execution::manifold_engine::probe_claim`'s doc comment. The real
+    // actionability gate (`establish_provenance`'s trusted-fingerprint
+    // match) is enforced inside `run_manifold_mint` below regardless of
+    // what this preview shows.
+    let preview_claim = crate::execution::manifold_engine::probe_claim(
+        preview_client,
+        extension_contract,
+        args.plan_args.collection,
+        instance_id,
+    )
+    .await;
+
+    eprintln!("selected engine: MANIFOLD (LazyPayableClaim)");
+    eprintln!("=================================================");
+    if args.rehearsal {
+        eprintln!(" REHEARSAL CONFIRMATION (no transaction will be broadcast)");
+    } else {
+        eprintln!(" LIVE SEND CONFIRMATION");
+    }
+    eprintln!("=================================================");
+    eprintln!(
+        "chain:                {} (chain id {})",
+        resolved.info.name, resolved.info.chain_id
+    );
+    eprintln!("wallet:                {}", wallet);
+    eprintln!("extension contract:    {extension_contract}");
+    eprintln!("creator contract:      {}", args.plan_args.collection);
+    eprintln!("instance id:           {instance_id}");
+    match &preview_claim {
+        Some(claim) => {
+            eprintln!("cost:                  {} wei", claim.cost);
+            eprintln!("allowlist gated:       {}", claim.is_gated());
+        }
+        None => eprintln!(
+            "claim state:           could not be read (this may still succeed if the real \
+             prepare pipeline resolves it differently)"
+        ),
+    }
+    eprintln!("send-capable endpoints:{}", pool.send_capable().len());
+    eprintln!("=================================================");
+
+    if !confirmation_satisfied(args.yes, read_stdin_confirmation) {
+        eprintln!(
+            "Aborted: confirmation not received. Nothing was signed, prepared, or broadcast."
+        );
+        return Ok(());
+    }
+
+    let signer = load_signing_key(&ProcessEnv, true).map_err(|e| {
+        KairoxError::Session(SessionError::new(format!(
+            "failed to load signing key: {e}"
+        )))
+    })?;
+    if signer.address() != wallet {
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::WalletKeyMismatch,
+            format!(
+                "loaded signing key resolves to {}, but --wallet was {}; refusing to proceed",
+                signer.address(),
+                wallet
+            ),
+        )));
+    }
+
+    let safety_caps = SafetyCaps {
+        max_mint_value: parse_wei("--max-mint-value-wei", &args.plan_args.max_mint_value_wei)?,
+        max_gas_cost: parse_wei("--max-gas-cost-wei", &args.plan_args.max_gas_cost_wei)?,
+        max_total_spend: parse_wei("--max-total-spend-wei", &args.plan_args.max_total_spend_wei)?,
+    };
+
+    let allowlist = parse_manifold_allowlist(&args)?;
+
+    let request = crate::execution::manifold_engine::ManifoldMintRequest {
+        chain: resolved.info.clone(),
+        extension_contract,
+        creator_contract: args.plan_args.collection,
+        instance_id,
+        wallet,
+        gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
+        safety_caps,
+        allowlist,
+    };
+
+    let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
+    let outcome = crate::execution::manifold_engine::run_manifold_mint(
+        &pool,
+        &signer,
+        &request,
+        crate::execution::manifold_registry::BUILTIN_REGISTRY,
+        &profile.health_policy,
+        profile.receipt_poll_interval,
+        profile.receipt_timeout,
+        args.rehearsal,
+    )
+    .await?;
+
+    print_broadcast_result(
+        outcome.prepared.tx_hash,
+        &outcome.broadcast_results,
+        &outcome.broadcast_summary,
+        &outcome.receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
+        args.rehearsal,
+    );
+
+    Ok(())
+}
+
 async fn run_send_opensea(
     args: MintArgs,
     slug: String,
@@ -1585,5 +1873,38 @@ mod tests {
     fn malformed_allowlist_proof_hex_fails_closed() {
         let args = parse_mint_args(&["--allowlist-proof", "0xnothex"]);
         assert!(parse_thirdweb_allowlist_proof(&args).is_err());
+    }
+
+    #[test]
+    fn manifold_no_allowlist_flags_yields_no_allowlist() {
+        let args = parse_mint_args(&[]);
+        assert!(parse_manifold_allowlist(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn manifold_allowlist_proof_without_mint_index_is_rejected() {
+        let hex_entry = format!("0x{}", "ab".repeat(32));
+        let args = parse_mint_args(&["--allowlist-proof", &hex_entry]);
+        assert!(parse_manifold_allowlist(&args).is_err());
+    }
+
+    #[test]
+    fn manifold_allowlist_proof_with_mint_index_parses() {
+        let a = format!("0x{}", "11".repeat(32));
+        let b = format!("0x{}", "22".repeat(32));
+        let args = parse_mint_args(&[
+            "--allowlist-proof",
+            &a,
+            "--allowlist-proof",
+            &b,
+            "--manifold-mint-index",
+            "7",
+        ]);
+        let allowlist = parse_manifold_allowlist(&args).unwrap().unwrap();
+        assert_eq!(allowlist.mint_index, 7);
+        assert_eq!(
+            allowlist.merkle_proof,
+            vec![B256::from([0x11u8; 32]), B256::from([0x22u8; 32])]
+        );
     }
 }

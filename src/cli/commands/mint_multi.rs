@@ -57,6 +57,11 @@ pub async fn run_manifest(
                 "--engine thirdweb is not yet supported with --wallet-manifest; use a single --wallet",
             )));
         }
+        EngineSelection::Manifold => {
+            return Err(KairoxError::Session(SessionError::new(
+                "--engine manifold is not yet supported with --wallet-manifest; use a single --wallet",
+            )));
+        }
     };
 
     if args.send {
