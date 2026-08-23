@@ -441,4 +441,21 @@ pub struct WatchArgs {
     /// about both.
     #[arg(long)]
     pub rehearsal: bool,
+    /// See `MintArgs::allowlist_proof`'s doc comment -- identical
+    /// meaning, applied to a gated thirdweb condition or Manifold claim
+    /// this `watch` invocation is armed against.
+    #[arg(long = "allowlist-proof")]
+    pub allowlist_proof: Vec<String>,
+    /// See `MintArgs::allowlist_quantity_limit_per_wallet`'s doc comment.
+    #[arg(long, requires = "allowlist_proof", default_value = "0")]
+    pub allowlist_quantity_limit_per_wallet: String,
+    /// See `MintArgs::allowlist_price_per_token_wei`'s doc comment.
+    #[arg(long, requires_all = ["allowlist_proof", "allowlist_currency"])]
+    pub allowlist_price_per_token_wei: Option<String>,
+    /// See `MintArgs::allowlist_currency`'s doc comment.
+    #[arg(long, requires = "allowlist_proof")]
+    pub allowlist_currency: Option<Address>,
+    /// See `MintArgs::manifold_mint_index`'s doc comment.
+    #[arg(long, requires = "allowlist_proof")]
+    pub manifold_mint_index: Option<u32>,
 }

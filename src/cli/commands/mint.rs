@@ -1067,23 +1067,44 @@ async fn run_send_public(
 fn parse_thirdweb_allowlist_proof(
     args: &MintArgs,
 ) -> Result<Option<crate::execution::thirdweb_engine::OperatorAllowlistProof>, KairoxError> {
-    if args.allowlist_proof.is_empty() {
+    parse_thirdweb_allowlist_proof_from(
+        &args.allowlist_proof,
+        &args.allowlist_quantity_limit_per_wallet,
+        args.allowlist_price_per_token_wei.as_deref(),
+        args.allowlist_currency,
+    )
+}
+
+/// The field-level core of [`parse_thirdweb_allowlist_proof`], reused by
+/// `watch` (whose `WatchArgs` carries the same four flags but is a
+/// distinct type from `MintArgs`) so the parsing logic exists exactly
+/// once. `clap`'s `requires` constraints on both `MintArgs` and
+/// `WatchArgs` already guarantee `allowlist_price_per_token_wei` implies
+/// `allowlist_currency`, and both imply a nonempty `allowlist_proof`;
+/// nothing here re-derives or brute-forces a proof -- only what the
+/// operator explicitly passed is used.
+pub(crate) fn parse_thirdweb_allowlist_proof_from(
+    allowlist_proof: &[String],
+    allowlist_quantity_limit_per_wallet: &str,
+    allowlist_price_per_token_wei: Option<&str>,
+    allowlist_currency: Option<alloy_primitives::Address>,
+) -> Result<Option<crate::execution::thirdweb_engine::OperatorAllowlistProof>, KairoxError> {
+    if allowlist_proof.is_empty() {
         return Ok(None);
     }
-    let proof = args
-        .allowlist_proof
+    let proof = allowlist_proof
         .iter()
         .map(|entry| parse_b256_hex("--allowlist-proof", entry))
         .collect::<Result<Vec<_>, _>>()?;
     let quantity_limit_per_wallet = parse_wei(
         "--allowlist-quantity-limit-per-wallet",
-        &args.allowlist_quantity_limit_per_wallet,
+        allowlist_quantity_limit_per_wallet,
     )?;
-    let price_per_token = match &args.allowlist_price_per_token_wei {
+    let price_per_token = match allowlist_price_per_token_wei {
         Some(value) => parse_wei("--allowlist-price-per-token-wei", value)?,
         None => crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
     };
-    let currency = args.allowlist_currency.unwrap_or_default();
+    let currency = allowlist_currency.unwrap_or_default();
     Ok(Some(
         crate::execution::thirdweb_engine::OperatorAllowlistProof {
             proof,
@@ -1249,15 +1270,24 @@ async fn run_send_thirdweb(
 fn parse_manifold_allowlist(
     args: &MintArgs,
 ) -> Result<Option<crate::execution::manifold_engine::OperatorManifoldAllowlist>, KairoxError> {
-    if args.allowlist_proof.is_empty() {
+    parse_manifold_allowlist_from(&args.allowlist_proof, args.manifold_mint_index)
+}
+
+/// The field-level core of [`parse_manifold_allowlist`], reused by
+/// `watch` -- see [`parse_thirdweb_allowlist_proof_from`]'s doc comment
+/// for why this split exists.
+pub(crate) fn parse_manifold_allowlist_from(
+    allowlist_proof: &[String],
+    manifold_mint_index: Option<u32>,
+) -> Result<Option<crate::execution::manifold_engine::OperatorManifoldAllowlist>, KairoxError> {
+    if allowlist_proof.is_empty() {
         return Ok(None);
     }
-    let merkle_proof = args
-        .allowlist_proof
+    let merkle_proof = allowlist_proof
         .iter()
         .map(|entry| parse_b256_hex("--allowlist-proof", entry))
         .collect::<Result<Vec<_>, _>>()?;
-    let mint_index = args.manifold_mint_index.ok_or_else(|| {
+    let mint_index = manifold_mint_index.ok_or_else(|| {
         KairoxError::Session(SessionError::new(
             "--manifold-mint-index is required together with --allowlist-proof for --engine \
              manifold",

@@ -59,6 +59,16 @@ struct WatchTarget {
     max_gas_cost_wei: String,
     max_total_spend_wei: String,
     gas_buffer_multiplier: f64,
+    /// Operator-supplied allowlist inputs -- see `MintArgs`'s
+    /// `allowlist_*`/`manifold_mint_index` fields for the exact meaning
+    /// of each. Never derived, forged, or brute-forced; empty
+    /// `allowlist_proof` means "no proof supplied" (a public,
+    /// non-gated stage).
+    allowlist_proof: Vec<String>,
+    allowlist_quantity_limit_per_wallet: String,
+    allowlist_price_per_token_wei: Option<String>,
+    allowlist_currency: Option<Address>,
+    manifold_mint_index: Option<u32>,
 }
 
 impl WatchTarget {
@@ -179,6 +189,11 @@ pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), Kair
                 .clone()
                 .expect("checked by require_explicit_caps above"),
             gas_buffer_multiplier: args.gas_buffer_multiplier,
+            allowlist_proof: args.allowlist_proof.clone(),
+            allowlist_quantity_limit_per_wallet: args.allowlist_quantity_limit_per_wallet.clone(),
+            allowlist_price_per_token_wei: args.allowlist_price_per_token_wei.clone(),
+            allowlist_currency: args.allowlist_currency,
+            manifold_mint_index: args.manifold_mint_index,
         }]
     };
 
@@ -2106,6 +2121,18 @@ async fn run_thirdweb_watch(
         }
     };
 
+    // Reuses the exact same parsing as `mint --engine thirdweb --send`
+    // (see `parse_thirdweb_allowlist_proof_from`'s doc comment) -- never
+    // derives, forges, or brute-forces a proof; a genuinely gated
+    // condition with no proof supplied still fails closed inside
+    // `run_thirdweb_mint`, exactly as before.
+    let allowlist_proof = crate::cli::commands::mint::parse_thirdweb_allowlist_proof_from(
+        &target.allowlist_proof,
+        &target.allowlist_quantity_limit_per_wallet,
+        target.allowlist_price_per_token_wei.as_deref(),
+        target.allowlist_currency,
+    )?;
+
     let request = crate::execution::thirdweb_engine::ThirdwebMintRequest {
         chain: resolved.info.clone(),
         drop_contract,
@@ -2114,13 +2141,7 @@ async fn run_thirdweb_watch(
         gas_buffer_multiplier: target.gas_buffer_multiplier,
         safety_caps,
         expected_stage,
-        // Allowlist-gated thirdweb conditions are not yet wired into
-        // watch (mirrors `mint --engine thirdweb --send`'s own current
-        // CLI surface, which has no --allowlist-proof plumbed through
-        // this path either) -- a genuinely gated condition fails closed
-        // inside `run_thirdweb_mint` with a clear error, never silently
-        // attempted with no proof.
-        allowlist_proof: None,
+        allowlist_proof,
     };
 
     let outcome = crate::execution::thirdweb_engine::run_thirdweb_mint(
@@ -2229,6 +2250,13 @@ async fn run_manifold_watch(
     wait_for_stage(&probe, poll_config, |state| reporter.emit(state)).await?;
     reporter.emit(WatchState::Arming);
 
+    // Reuses the exact same parsing as `mint --engine manifold --send`
+    // (see `parse_manifold_allowlist_from`'s doc comment).
+    let allowlist = crate::cli::commands::mint::parse_manifold_allowlist_from(
+        &target.allowlist_proof,
+        target.manifold_mint_index,
+    )?;
+
     let request = crate::execution::manifold_engine::ManifoldMintRequest {
         chain: resolved.info.clone(),
         extension_contract,
@@ -2237,9 +2265,7 @@ async fn run_manifold_watch(
         wallet: target.wallet,
         gas_buffer_multiplier: target.gas_buffer_multiplier,
         safety_caps,
-        // Same rationale as ThirdwebMintRequest above -- allowlist-gated
-        // claims are not yet wired into watch.
-        allowlist: None,
+        allowlist,
         expected_stage: Some(expected_stage),
     };
 
@@ -2419,6 +2445,13 @@ fn load_manifest(path: &Path) -> Result<Vec<WatchTarget>, KairoxError> {
                     .max_total_spend_wei
                     .expect("checked by require_explicit_caps above"),
                 gas_buffer_multiplier: entry.gas_buffer_multiplier,
+                // Same rationale as manifold_extension above -- the
+                // watchlist manifest schema has no allowlist fields yet.
+                allowlist_proof: Vec::new(),
+                allowlist_quantity_limit_per_wallet: "0".to_string(),
+                allowlist_price_per_token_wei: None,
+                allowlist_currency: None,
+                manifold_mint_index: None,
             })
         })
         .collect()
@@ -2948,6 +2981,11 @@ mod auto_watch_thirdweb_manifold_routing_tests {
             max_gas_cost_wei: "1000000000000000000".to_string(),
             max_total_spend_wei: "2000000000000000000".to_string(),
             gas_buffer_multiplier: 1.25,
+            allowlist_proof: Vec::new(),
+            allowlist_quantity_limit_per_wallet: "0".to_string(),
+            allowlist_price_per_token_wei: None,
+            allowlist_currency: None,
+            manifold_mint_index: None,
         }
     }
 
