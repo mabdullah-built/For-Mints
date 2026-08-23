@@ -118,23 +118,56 @@ pub async fn probe_flavor(
     client: &RpcClient,
     drop_contract: Address,
 ) -> Option<(ThirdwebFlavor, ClaimCondition)> {
-    if let Ok(condition_id) =
-        crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, drop_contract).await
-        && let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
-            client,
-            drop_contract,
-            condition_id,
-        )
-        .await
-    {
-        return Some((ThirdwebFlavor::DropMultiPhase721, condition));
+    // **CORRECTION**: an earlier version of this function anchored
+    // multi-phase detection on `getActiveClaimConditionId()`, which
+    // reverts (`DropNoActiveCondition`) until at least one configured
+    // phase has started -- exactly the same gap this had in
+    // `discover_thirdweb_stages` before it was fixed to read
+    // `claimCondition()`'s own `(currentStartId, count)` list metadata
+    // directly. A future-only multi-phase drop (no active phase yet)
+    // must still be reported as multi-phase-shaped LOW evidence, not
+    // silently treated as "nothing responded at all".
+    match crate::cli::gather::fetch_thirdweb_claim_condition_or_list(client, drop_contract).await {
+        Ok(crate::cli::gather::ThirdwebClaimConditionShape::SinglePhase(condition)) => {
+            Some((ThirdwebFlavor::DropSinglePhase721, condition))
+        }
+        Ok(crate::cli::gather::ThirdwebClaimConditionShape::MultiPhaseList(
+            current_start_id,
+            count,
+        )) => {
+            if count.is_zero() {
+                return None;
+            }
+            // Prefer the real active condition when one exists (matches
+            // the pre-correction behavior for the common case); fall
+            // back to the list's first configured condition
+            // (`currentStartId`) -- a real, authoritative on-chain read,
+            // never a guess -- when none has started yet.
+            if let Ok(active_id) =
+                crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, drop_contract)
+                    .await
+                && let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+                    client,
+                    drop_contract,
+                    active_id,
+                )
+                .await
+            {
+                return Some((ThirdwebFlavor::DropMultiPhase721, condition));
+            }
+            if let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+                client,
+                drop_contract,
+                current_start_id,
+            )
+            .await
+            {
+                return Some((ThirdwebFlavor::DropMultiPhase721, condition));
+            }
+            None
+        }
+        Err(_) => None,
     }
-    if let Ok(condition) =
-        crate::cli::gather::fetch_thirdweb_claim_condition_single_phase(client, drop_contract).await
-    {
-        return Some((ThirdwebFlavor::DropSinglePhase721, condition));
-    }
-    None
 }
 
 /// Flavor-aware read of the active claim condition and this wallet's

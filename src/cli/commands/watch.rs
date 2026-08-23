@@ -339,6 +339,8 @@ async fn run_single_target(
             &excluded_stage_ids,
             safety_caps,
             rehearsal,
+            crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+            crate::execution::manifold_registry::BUILTIN_REGISTRY,
         )
         .await?;
 
@@ -611,6 +613,7 @@ const MAX_LIVE_CHECK_ATTEMPTS: u32 = 4;
 /// specifically-selected route being already `Active` and positively
 /// actionable always means `STAGE_ALREADY_LIVE`, never a silent
 /// immediate execution through `watch`.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_watch_engine(
     target: &WatchTarget,
     plan_args: &PlanArgs,
@@ -629,6 +632,18 @@ async fn resolve_watch_engine(
     // opens, racing against (and potentially beating) `wait_for_stage`'s
     // own correct handoff.
     allow_already_live: bool,
+    // Production call sites always pass
+    // `thirdweb_registry::BUILTIN_REGISTRY`/`manifold_registry::BUILTIN_REGISTRY`
+    // -- there is no CLI flag or environment variable that can override
+    // this. These parameters exist purely so tests can inject their own
+    // trusted-fingerprint fixtures to exercise the Auto-arm HIGH-confidence
+    // routing below without needing a real, authenticated deployment.
+    // Only consumed by the `EngineSelection::Auto` arm's thirdweb/Manifold
+    // fallback -- the explicit `Thirdweb`/`Manifold` arms never establish
+    // provenance at resolution time at all (that happens later, inside
+    // `run_thirdweb_mint`/`run_manifold_mint`), so they ignore these.
+    thirdweb_trusted_registry: &[crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint],
+    manifold_trusted_registry: &[crate::execution::manifold_registry::ManifoldTrustedFingerprint],
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
         EngineSelection::Thirdweb => {
@@ -877,13 +892,31 @@ async fn resolve_watch_engine(
                     crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
                         reason,
                     } => {
-                        return Err(KairoxError::Session(SessionError::with_kind(
-                            SessionErrorKind::UnsupportedProtocol,
-                            format!(
-                                "no supported stage (active or future) found for this \
-                                 collection: {reason}"
-                            ),
-                        )));
+                        // No native SeaDrop/OpenSea stage at all -- try
+                        // thirdweb/Manifold as a fallback tier, subject to
+                        // the identical HIGH-confidence-only arming
+                        // discipline `mint --engine auto` already applies
+                        // via `ThirdwebAdapter`/`ManifoldAdapter`. See
+                        // `resolve_thirdweb_manifold_auto_watch`'s doc
+                        // comment.
+                        return resolve_thirdweb_manifold_auto_watch(
+                            target,
+                            plan_args,
+                            config_path,
+                            allow_already_live,
+                            thirdweb_trusted_registry,
+                            manifold_trusted_registry,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            KairoxError::Session(SessionError::with_kind(
+                                SessionErrorKind::UnsupportedProtocol,
+                                format!(
+                                    "no supported stage (active or future) found for this \
+                                     collection: {reason}"
+                                ),
+                            ))
+                        });
                     }
                 };
 
@@ -979,6 +1012,231 @@ async fn resolve_watch_engine(
                     target.collection
                 ),
             )))
+        }
+    }
+}
+
+/// The `--engine auto` fallback tier for `watch`, tried only once native
+/// SeaDrop/OpenSea stage discovery finds nothing at all -- mirrors
+/// `mint --engine auto`'s own tier system
+/// (`cli::commands::resolver_adapters::ThirdwebAdapter`/`ManifoldAdapter`,
+/// priority 1, only tried once `NormalizedStageAdapter` finds no
+/// candidate). Applies the identical HIGH-confidence-only arming
+/// discipline: selector/ABI-shape compatibility alone is never enough to
+/// arm a live-send-capable watch, only an exact match against
+/// `thirdweb_trusted_registry`/`manifold_trusted_registry` is (see
+/// `execution::thirdweb_engine::establish_provenance`'s doc comment for
+/// the full rationale -- a custom contract can inherit a thirdweb/
+/// Manifold base and override execution-affecting hooks Kairox cannot
+/// verify from selector compatibility alone).
+///
+/// Returns `Ok(None)` when neither protocol produces even LOW evidence
+/// (the caller then reports its own combined "no supported stage" error).
+/// A `HIGH` match on exactly one protocol resolves to that engine,
+/// exactly like an explicit `--engine thirdweb`/`--engine manifold`
+/// invocation would (subject to `allow_already_live`/`STAGE_ALREADY_LIVE`,
+/// same as every other engine). `HIGH` matches on *both* protocols is
+/// refused as `AMBIGUOUS_PROTOCOL` -- Kairox never guesses between two
+/// simultaneously-verified routes. A lone `LOW` match (selector-shaped
+/// but no trusted fingerprint) is reported as `UNSUPPORTED_PROTOCOL`
+/// evidence, never silently armed -- this is what makes production safe
+/// by construction: both `BUILTIN_REGISTRY`s ship empty, so this
+/// function can never resolve `Some(..)` in production until a real
+/// fingerprint is manually reviewed and added.
+async fn resolve_thirdweb_manifold_auto_watch(
+    target: &WatchTarget,
+    plan_args: &PlanArgs,
+    config_path: Option<&Path>,
+    allow_already_live: bool,
+    thirdweb_trusted_registry: &[crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint],
+    manifold_trusted_registry: &[crate::execution::manifold_registry::ManifoldTrustedFingerprint],
+) -> Result<Option<ResolvedWatchEngine>, KairoxError> {
+    let registry = ChainRegistry::builtin();
+    let (resolved, runtime) =
+        resolve_chain_and_runtime(&registry, &target.chain_args, config_path)?;
+    let client = crate::cli::context::connect_read_client(
+        &resolved.info,
+        target.chain_args.rpc_url.as_ref(),
+        runtime.config.as_ref(),
+    )
+    .await?;
+    resolve_thirdweb_manifold_auto_watch_with_client(
+        &client,
+        resolved.info.chain_id,
+        target,
+        plan_args,
+        allow_already_live,
+        thirdweb_trusted_registry,
+        manifold_trusted_registry,
+    )
+    .await
+}
+
+/// The pure decision core of [`resolve_thirdweb_manifold_auto_watch`],
+/// split out to take an already-connected client -- lets tests inject a
+/// `MockTransport`-backed `RpcClient` and a synthetic trusted-registry
+/// slice directly, without needing a real chain-config/HTTP resolution
+/// path.
+async fn resolve_thirdweb_manifold_auto_watch_with_client(
+    client: &crate::chain::rpc::RpcClient,
+    chain_id: crate::chain::registry::ChainId,
+    target: &WatchTarget,
+    plan_args: &PlanArgs,
+    allow_already_live: bool,
+    thirdweb_trusted_registry: &[crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint],
+    manifold_trusted_registry: &[crate::execution::manifold_registry::ManifoldTrustedFingerprint],
+) -> Result<Option<ResolvedWatchEngine>, KairoxError> {
+    // THIRDWEB: `target.collection` doubles as the candidate Drop
+    // contract, exactly as for explicit `--engine thirdweb`.
+    let thirdweb_high = crate::execution::thirdweb_engine::establish_provenance(
+        client,
+        chain_id,
+        target.collection,
+        thirdweb_trusted_registry,
+    )
+    .await
+    .is_ok();
+    // Best-effort, evidence-only -- never authorizes anything; only used
+    // below to make the "nothing at all responded" vs "something
+    // responded but isn't trusted" distinction in the final error.
+    let thirdweb_low = !thirdweb_high
+        && crate::execution::thirdweb_engine::probe_flavor(client, target.collection)
+            .await
+            .is_some();
+
+    // MANIFOLD: only attempted when the operator already supplied
+    // --manifold-extension, or `getExtensions()` on `target.collection`
+    // (treated as the creator contract, --instance-id as usual)
+    // identifies exactly one candidate extension -- see
+    // `execution::manifold_engine::discover_manifold_extension`'s doc
+    // comment for why zero or multiple candidates both refuse rather
+    // than guess. This is read-only discovery, never itself a HIGH
+    // signal.
+    let instance_id =
+        crate::cli::format::parse_wei("--instance-id", &plan_args.instance_id).unwrap_or_default();
+    let manifold_extension = if let Some(extension) = plan_args.manifold_extension {
+        Some(extension)
+    } else {
+        crate::execution::manifold_engine::discover_manifold_extension(
+            client,
+            target.collection,
+            instance_id,
+        )
+        .await
+        .ok()
+    };
+    let manifold_high = if let Some(extension) = manifold_extension {
+        crate::execution::manifold_engine::establish_provenance(
+            client,
+            chain_id,
+            extension,
+            manifold_trusted_registry,
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    let manifold_low = !manifold_high && manifold_extension.is_some();
+
+    match (thirdweb_high, manifold_high) {
+        (true, true) => Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::AmbiguousProtocol,
+            format!(
+                "both thirdweb and Manifold trusted-registry fingerprints matched for {:#x}; \
+                 refusing to guess which is authoritative",
+                target.collection
+            ),
+        ))),
+        (true, false) => {
+            let stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+                client,
+                target.collection,
+                target.wallet,
+            )
+            .await
+            .map_err(|e| KairoxError::Session(SessionError::new(e.to_string())))?;
+            match crate::execution::stage_resolver::select_for_watch(
+                &stages,
+                OffsetDateTime::now_utc(),
+            ) {
+                crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(stage) => {
+                    if allow_already_live {
+                        Ok(Some(ResolvedWatchEngine::Thirdweb {
+                            drop_contract: target.collection,
+                            stage_id: stage.id,
+                        }))
+                    } else {
+                        Err(stage_already_live_error(target.collection))
+                    }
+                }
+                crate::execution::stage_resolver::WatchStageDecision::WaitFor(stage) => {
+                    Ok(Some(ResolvedWatchEngine::Thirdweb {
+                        drop_contract: target.collection,
+                        stage_id: stage.id,
+                    }))
+                }
+                crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
+                    ..
+                } => Ok(None),
+            }
+        }
+        (false, true) => {
+            let extension_contract =
+                manifold_extension.expect("manifold_high implies manifold_extension is Some");
+            let Some(stage) = crate::cli::commands::resolver_adapters::discover_manifold_stage(
+                client,
+                extension_contract,
+                target.collection,
+                instance_id,
+                target.wallet,
+            )
+            .await
+            else {
+                return Ok(None);
+            };
+            match crate::execution::stage_resolver::select_for_watch(
+                std::slice::from_ref(&stage),
+                OffsetDateTime::now_utc(),
+            ) {
+                crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(_) => {
+                    if allow_already_live {
+                        Ok(Some(ResolvedWatchEngine::Manifold {
+                            extension_contract,
+                            creator_contract: target.collection,
+                            instance_id,
+                        }))
+                    } else {
+                        Err(stage_already_live_error(target.collection))
+                    }
+                }
+                crate::execution::stage_resolver::WatchStageDecision::WaitFor(_) => {
+                    Ok(Some(ResolvedWatchEngine::Manifold {
+                        extension_contract,
+                        creator_contract: target.collection,
+                        instance_id,
+                    }))
+                }
+                crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
+                    ..
+                } => Ok(None),
+            }
+        }
+        (false, false) => {
+            if thirdweb_low || manifold_low {
+                Err(KairoxError::Session(SessionError::with_kind(
+                    SessionErrorKind::UnsupportedProtocol,
+                    format!(
+                        "selector/ABI-shaped evidence was found for {:#x} (thirdweb: {}, \
+                         Manifold: {}), but no trusted-registry fingerprint confirms unmodified \
+                         execution semantics; refusing to arm a live-send-capable watch on \
+                         unconfirmed evidence",
+                        target.collection, thirdweb_low, manifold_low
+                    ),
+                )))
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -1090,6 +1348,8 @@ async fn wait_for_stage_with_reresolution(
                 excluded_stage_ids,
                 safety_caps,
                 true,
+                crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+                crate::execution::manifold_registry::BUILTIN_REGISTRY,
             )
             .await?;
             if &fresh != currently_selected {
@@ -2647,5 +2907,445 @@ mod telemetry_probe_critical_path_tests {
         let result = probe.probe().await.unwrap();
         assert!(matches!(result.status, StageStatus::NotStarted { .. }));
         holder.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod auto_watch_thirdweb_manifold_routing_tests {
+    use super::*;
+    use crate::chain::endpoint::EndpointRole;
+    use crate::chain::mock::MockTransport;
+    use crate::chain::rpc::RpcClient;
+    use crate::execution::manifold_registry::ManifoldTrustedFingerprint;
+    use crate::execution::thirdweb_registry::{ThirdwebFlavor, ThirdwebTrustedFingerprint};
+    use crate::protocol::manifold::ClaimAbi;
+    use crate::protocol::thirdweb::{self as tw, ClaimConditionAbi};
+    use alloy_primitives::{address, keccak256};
+    use alloy_sol_types::SolCall;
+    use serde_json::json;
+
+    const DROP: Address = address!("00000000000000000000000000000000000c0DE0");
+    const WALLET: Address = address!("1111111111111111111111111111111111111111");
+    const EXTENSION: Address = address!("2222222222222222222222222222222222222222");
+    const CREATOR: Address = address!("00000000000000000000000000000000000c0DE0");
+
+    fn target(collection: Address) -> WatchTarget {
+        WatchTarget {
+            chain_args: ChainArgs {
+                chain: None,
+                rpc_url: None,
+                seadrop_contract: None,
+            },
+            collection,
+            wallet: WALLET,
+            slug: None,
+            manifold_extension: None,
+            instance_id: "0".to_string(),
+            quantity: 1,
+            engine: EngineSelection::Auto,
+            fee_recipient: None,
+            max_mint_value_wei: "1000000000000000000".to_string(),
+            max_gas_cost_wei: "1000000000000000000".to_string(),
+            max_total_spend_wei: "2000000000000000000".to_string(),
+            gas_buffer_multiplier: 1.25,
+        }
+    }
+
+    fn mock_implementation_bytecode() -> Vec<u8> {
+        vec![
+            0x60, 0x80, 0x60, 0x40, 0x52, 0x34, 0x80, 0x15, 0x61, 0x00, 0x10,
+        ]
+    }
+
+    fn thirdweb_fingerprint() -> ThirdwebTrustedFingerprint {
+        ThirdwebTrustedFingerprint {
+            name: "test-fixture",
+            chain_id: 1,
+            implementation_bytecode_hash: keccak256(mock_implementation_bytecode()),
+            flavor: ThirdwebFlavor::DropMultiPhase721,
+        }
+    }
+
+    fn manifold_fingerprint() -> ManifoldTrustedFingerprint {
+        ManifoldTrustedFingerprint {
+            name: "test-fixture",
+            chain_id: 1,
+            extension_bytecode_hash: keccak256(mock_implementation_bytecode()),
+        }
+    }
+
+    async fn connect(transport: MockTransport) -> RpcClient {
+        RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+            .await
+            .unwrap()
+    }
+
+    fn future_condition_abi() -> ClaimConditionAbi {
+        ClaimConditionAbi {
+            startTimestamp: alloy_primitives::U256::from(4_000_000_000u64),
+            maxClaimableSupply: alloy_primitives::U256::from(1_000u64),
+            supplyClaimed: alloy_primitives::U256::ZERO,
+            quantityLimitPerWallet: alloy_primitives::U256::from(5u64),
+            merkleRoot: alloy_primitives::B256::ZERO,
+            pricePerToken: alloy_primitives::U256::from(10_000_000_000_000_000u64),
+            currency: tw::NATIVE_TOKEN,
+            metadata: String::new(),
+        }
+    }
+
+    /// A transport that behaves like a genuine, trusted-fingerprint-
+    /// matching thirdweb multi-phase drop with exactly one future
+    /// condition -- no active phase yet.
+    fn thirdweb_high_transport() -> MockTransport {
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &future_condition_abi()
+            ))
+        );
+        MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getClaimConditionByIdCall::SELECTOR,
+                json!(condition_hex),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
+    fn manifold_claim_abi() -> ClaimAbi {
+        ClaimAbi {
+            total: 0,
+            totalMax: 100,
+            walletMax: 2,
+            startDate: alloy_primitives::U256::from(4_000_000_000u64),
+            endDate: alloy_primitives::U256::from(4_100_000_000u64),
+            storageProtocol: 3,
+            contractVersion: 1,
+            identical: true,
+            merkleRoot: alloy_primitives::B256::ZERO,
+            location: "ipfs://abc".to_string(),
+            cost: alloy_primitives::U256::from(1_000_000_000_000_000u64),
+            paymentReceiver: CREATOR,
+            erc20: Address::ZERO,
+            signingAddress: Address::ZERO,
+        }
+    }
+
+    /// A transport that behaves like a genuine, trusted-fingerprint-
+    /// matching Manifold extension: `getExtensions()` on the creator
+    /// finds exactly one candidate, and it responds to `getClaim` with a
+    /// future, readable claim.
+    fn manifold_high_transport() -> MockTransport {
+        let extensions_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::manifold::getExtensionsCall::abi_encode_returns(&vec![EXTENSION])
+            )
+        );
+        let claim_hex = format!(
+            "0x{}",
+            hex::encode(crate::protocol::manifold::getClaimCall::abi_encode_returns(
+                &manifold_claim_abi()
+            ))
+        );
+        MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getExtensionsCall::SELECTOR,
+                json!(extensions_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getClaimCall::SELECTOR,
+                json!(claim_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getTotalMintsCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::getTotalMintsCall::abi_encode_returns(&0u32)
+                    )
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
+    #[tokio::test]
+    async fn trusted_thirdweb_alone_auto_selects_the_thirdweb_route() {
+        let client = connect(thirdweb_high_transport()).await;
+        let t = target(DROP);
+        let plan_args = t.to_plan_args();
+        let resolved = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[thirdweb_fingerprint()],
+            &[],
+        )
+        .await
+        .unwrap();
+        match resolved {
+            Some(ResolvedWatchEngine::Thirdweb { drop_contract, .. }) => {
+                assert_eq!(drop_contract, DROP);
+            }
+            other => panic!("expected Some(ResolvedWatchEngine::Thirdweb), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_manifold_alone_auto_selects_the_manifold_route() {
+        let client = connect(manifold_high_transport()).await;
+        let t = target(CREATOR);
+        let plan_args = t.to_plan_args();
+        let resolved = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap();
+        match resolved {
+            Some(ResolvedWatchEngine::Manifold {
+                extension_contract, ..
+            }) => {
+                assert_eq!(extension_contract, EXTENSION);
+            }
+            other => panic!("expected Some(ResolvedWatchEngine::Manifold), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn low_selector_shaped_evidence_alone_never_arms() {
+        // thirdweb-shaped responses, but the registry has no matching
+        // entry -- must be reported as unsupported, never armed.
+        let client = connect(thirdweb_high_transport()).await;
+        let t = target(DROP);
+        let plan_args = t.to_plan_args();
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[], // empty registry -- no trusted match possible
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::UnsupportedProtocol
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_chain_registry_entry_never_arms() {
+        let client = connect(thirdweb_high_transport()).await;
+        let t = target(DROP);
+        let plan_args = t.to_plan_args();
+        let mut wrong_chain = thirdweb_fingerprint();
+        wrong_chain.chain_id = 999;
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[wrong_chain],
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::UnsupportedProtocol
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_runtime_hash_never_arms() {
+        let client = connect(thirdweb_high_transport()).await;
+        let t = target(DROP);
+        let plan_args = t.to_plan_args();
+        let mut wrong_hash = thirdweb_fingerprint();
+        wrong_hash.implementation_bytecode_hash = alloy_primitives::B256::repeat_byte(0xEE);
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[wrong_hash],
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::UnsupportedProtocol
+        );
+    }
+
+    #[tokio::test]
+    async fn production_empty_registries_never_arm_either_protocol() {
+        let client = connect(thirdweb_high_transport()).await;
+        let t = target(DROP);
+        let plan_args = t.to_plan_args();
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+            crate::execution::manifold_registry::BUILTIN_REGISTRY,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::UnsupportedProtocol
+        );
+    }
+
+    #[tokio::test]
+    async fn two_high_confidence_candidates_is_ambiguous_never_a_silent_pick() {
+        // A single target address that is simultaneously trusted-
+        // fingerprint-verified as both a thirdweb Drop AND a Manifold
+        // creator contract (with a discoverable, trusted extension) --
+        // an artificial but structurally real scenario the resolver must
+        // still refuse to guess between.
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &future_condition_abi()
+            ))
+        );
+        let extensions_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::manifold::getExtensionsCall::abi_encode_returns(&vec![EXTENSION])
+            )
+        );
+        let claim_hex = format!(
+            "0x{}",
+            hex::encode(crate::protocol::manifold::getClaimCall::abi_encode_returns(
+                &manifold_claim_abi()
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getClaimConditionByIdCall::SELECTOR,
+                json!(condition_hex),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getExtensionsCall::SELECTOR,
+                json!(extensions_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getClaimCall::SELECTOR,
+                json!(claim_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getTotalMintsCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::getTotalMintsCall::abi_encode_returns(&0u32)
+                    )
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+        let t = target(DROP); // DROP == CREATOR
+        let plan_args = t.to_plan_args();
+
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[thirdweb_fingerprint()],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::AmbiguousProtocol
+        );
     }
 }
