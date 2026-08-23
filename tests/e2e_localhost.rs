@@ -7035,6 +7035,28 @@ fn thirdweb_read_response(method: &str, params: &Value) -> Option<Behavior> {
                 "0x{}",
                 hex::encode(tw::getSupplyClaimedByWalletCall::SELECTOR)
             );
+            let claim_condition_sel =
+                format!("0x{}", hex::encode(tw::claimConditionCall::SELECTOR));
+            if data.starts_with(&claim_condition_sel) {
+                // Models a genuine multi-phase deployment: exactly one
+                // configured condition (id 0), matching the single
+                // active condition getActiveClaimConditionId/
+                // getClaimConditionById below model. Used by
+                // discover_thirdweb_stages's watch-path enumeration; the
+                // dry-run/mint --send paths never call claimCondition()
+                // for a multi-phase contract at all.
+                return Some(rpc_ok(serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                            &tw::multi_phase_list::claimConditionReturn {
+                                currentStartId: U256::ZERO,
+                                count: U256::from(1u64),
+                            }
+                        )
+                    )
+                ))));
+            }
             if data.starts_with(&active_id_sel) {
                 return Some(rpc_ok(serde_json::json!(format!(
                     "0x{}",

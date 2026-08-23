@@ -16,7 +16,7 @@ use std::time::Duration as StdDuration;
 use alloy_primitives::Address;
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
 use crate::chain::config::ProcessEnv;
 use crate::chain::registry::ChainRegistry;
@@ -1338,7 +1338,7 @@ impl StageProbe for OpenSeaStageProbe<'_> {
         let status = match end_time {
             Some(end) if now >= end => StageStatus::Ended,
             _ if now >= stage_start => StageStatus::Active {
-                ends_in: end_time.map(|e| e - now).unwrap_or(Duration::ZERO),
+                ends_in: end_time.map(|e| e - now),
             },
             _ => StageStatus::NotStarted {
                 starts_in: stage_start - now,
@@ -2252,6 +2252,7 @@ mod telemetry_probe_critical_path_tests {
     use crate::domain::timing::StageStatus;
     use std::sync::Mutex;
     use std::time::Duration as StdDuration;
+    use time::Duration;
 
     /// Always reports the stage as already active (`stage_start` in the
     /// past) -- exactly the result that must hand off to execution
@@ -2264,7 +2265,7 @@ mod telemetry_probe_critical_path_tests {
             Ok(StageSnapshot {
                 stage_start: OffsetDateTime::now_utc() - Duration::seconds(5),
                 status: StageStatus::Active {
-                    ends_in: Duration::seconds(3600),
+                    ends_in: Some(Duration::seconds(3600)),
                 },
             })
         }

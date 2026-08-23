@@ -6,11 +6,15 @@
 
 use time::{Duration, OffsetDateTime};
 
-/// A mint stage's `[start, end)` window, in UTC.
+/// A mint stage's `[start, end)` window, in UTC. `end: None` means the
+/// protocol itself supplies no authoritative end -- never a placeholder
+/// for "assume it ends eventually" or any invented timestamp (e.g. a
+/// thirdweb Drop's last configured multi-phase condition, or any
+/// single-phase condition, genuinely has no on-chain end field at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhaseWindow {
     pub start: OffsetDateTime,
-    pub end: OffsetDateTime,
+    pub end: Option<OffsetDateTime>,
 }
 
 /// Where `now` sits relative to a [`PhaseWindow`].
@@ -18,9 +22,13 @@ pub struct PhaseWindow {
 pub enum StageStatus {
     /// Stage has not opened yet; `starts_in` is always positive.
     NotStarted { starts_in: Duration },
-    /// Stage is currently open; `ends_in` is always positive.
-    Active { ends_in: Duration },
-    /// Stage has closed.
+    /// Stage is currently open. `ends_in` is `Some` (always positive)
+    /// only when the window has a known end; `None` means genuinely
+    /// open-ended -- never a large-but-finite stand-in duration.
+    Active { ends_in: Option<Duration> },
+    /// Stage has closed. Only reachable when the window has a known,
+    /// already-passed end -- an open-ended window (`end: None`) can
+    /// never become `Ended`.
     Ended,
 }
 
@@ -28,15 +36,16 @@ impl PhaseWindow {
     /// Classify `now` against this window.
     pub fn status(&self, now: OffsetDateTime) -> StageStatus {
         if now < self.start {
-            StageStatus::NotStarted {
+            return StageStatus::NotStarted {
                 starts_in: self.start - now,
-            }
-        } else if now < self.end {
-            StageStatus::Active {
-                ends_in: self.end - now,
-            }
-        } else {
-            StageStatus::Ended
+            };
+        }
+        match self.end {
+            Some(end) if now >= end => StageStatus::Ended,
+            Some(end) => StageStatus::Active {
+                ends_in: Some(end - now),
+            },
+            None => StageStatus::Active { ends_in: None },
         }
     }
 }
@@ -104,7 +113,7 @@ mod tests {
     fn window() -> PhaseWindow {
         PhaseWindow {
             start: datetime!(2026-08-16 12:00:00 UTC),
-            end: datetime!(2026-08-16 13:00:00 UTC),
+            end: Some(datetime!(2026-08-16 13:00:00 UTC)),
         }
     }
 
@@ -125,7 +134,7 @@ mod tests {
         assert_eq!(
             status,
             StageStatus::Active {
-                ends_in: Duration::hours(1)
+                ends_in: Some(Duration::hours(1))
             }
         );
     }
@@ -136,7 +145,7 @@ mod tests {
         assert_eq!(
             status,
             StageStatus::Active {
-                ends_in: Duration::minutes(30)
+                ends_in: Some(Duration::minutes(30))
             }
         );
     }
@@ -145,6 +154,24 @@ mod tests {
     fn status_ended_at_end_boundary() {
         let status = window().status(datetime!(2026-08-16 13:00:00 UTC));
         assert_eq!(status, StageStatus::Ended);
+    }
+
+    #[test]
+    fn status_open_ended_window_is_active_forever_with_no_ends_in() {
+        let open = PhaseWindow {
+            start: datetime!(2026-08-16 12:00:00 UTC),
+            end: None,
+        };
+        assert_eq!(
+            open.status(datetime!(2026-08-16 12:30:00 UTC)),
+            StageStatus::Active { ends_in: None }
+        );
+        assert_eq!(
+            open.status(datetime!(2099-01-01 00:00:00 UTC)),
+            StageStatus::Active { ends_in: None },
+            "an open-ended window must never transition to Ended, no matter how far in the \
+             future -- there is no synthetic far-future end to cross"
+        );
     }
 
     #[test]

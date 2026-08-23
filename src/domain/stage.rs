@@ -82,23 +82,30 @@ pub enum StageId {
     /// condition. `condition_id` is the exact on-chain condition id this
     /// stage represents -- authoritative, never invented (see
     /// `cli::commands::resolver_adapters::discover_thirdweb_stages`'s
-    /// doc comment for how it's resolved). Two different condition ids
-    /// are two different stages, even on the same `drop_contract`, so
-    /// watch's re-resolution can correctly detect "the specific
-    /// condition being watched changed identity" (e.g. the creator
-    /// reconfigured conditions) rather than silently treating a
-    /// different condition as the same stage.
+    /// doc comment for how it's resolved). `config_fingerprint` is
+    /// `protocol::thirdweb::ClaimCondition::config_fingerprint()` --
+    /// thirdweb's `updateClaimConditions` can rewrite a condition's
+    /// material terms (price, supply cap, merkle root, ...) in place
+    /// without changing its id when eligibility is not reset, so
+    /// `condition_id` alone is not a stable identity for a long-running
+    /// `watch` -- two stages with the same id but a different
+    /// fingerprint are two different configurations and must never be
+    /// silently treated as the same stage.
     ThirdwebMultiPhase {
         drop_contract: alloy_primitives::Address,
         condition_id: alloy_primitives::U256,
+        config_fingerprint: alloy_primitives::B256,
     },
     /// A thirdweb single-phase (`DropSinglePhase`) claim condition. No
     /// condition id exists in this flavor's ABI at all (see
     /// `protocol::thirdweb`'s module doc comment) -- `drop_contract`
-    /// alone is the whole identity, since a single-phase contract has
-    /// exactly one condition, ever.
+    /// plus `config_fingerprint` (same rationale as
+    /// `ThirdwebMultiPhase`'s) together are the whole identity, since a
+    /// single-phase contract's one condition can itself be replaced in
+    /// place.
     ThirdwebSinglePhase {
         drop_contract: alloy_primitives::Address,
+        config_fingerprint: alloy_primitives::B256,
     },
     /// A Manifold `LazyPayableClaim` claim instance. All three
     /// identifiers are required -- see `protocol::manifold`'s module doc
@@ -212,7 +219,7 @@ mod tests {
     fn window() -> PhaseWindow {
         PhaseWindow {
             start: datetime!(2026-08-16 12:00:00 UTC),
-            end: datetime!(2026-08-16 13:00:00 UTC),
+            end: Some(datetime!(2026-08-16 13:00:00 UTC)),
         }
     }
 

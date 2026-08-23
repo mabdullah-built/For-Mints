@@ -170,7 +170,7 @@ pub struct ClaimCondition {
 }
 
 impl ClaimCondition {
-    fn from_abi(abi: ClaimConditionAbi) -> Result<Self, ThirdwebError> {
+    pub(crate) fn from_abi(abi: ClaimConditionAbi) -> Result<Self, ThirdwebError> {
         Ok(Self {
             start_timestamp: abi
                 .startTimestamp
@@ -205,6 +205,31 @@ impl ClaimCondition {
     pub fn supply_remaining(&self) -> U256 {
         self.max_claimable_supply
             .saturating_sub(self.supply_claimed)
+    }
+
+    /// A stable fingerprint of this condition's execution-affecting
+    /// configuration -- `start_timestamp`, `max_claimable_supply`,
+    /// `quantity_limit_per_wallet`, `merkle_root`, `price_per_token`,
+    /// `currency`. Deliberately EXCLUDES `supply_claimed`, which
+    /// increments with every mint and is never grounds for treating a
+    /// watched condition as "changed" -- only the operator-configured
+    /// terms matter here. Two reads of a condition that returns the same
+    /// fingerprint were configured identically, regardless of how many
+    /// tokens were claimed in between; a changed fingerprint means the
+    /// creator materially reconfigured this condition id (thirdweb's
+    /// `updateClaimConditions` can rewrite a condition's terms in place
+    /// without changing its id when eligibility is not reset) and a
+    /// `watch` attempt targeting it must stop rather than sign against
+    /// silently different terms.
+    pub fn config_fingerprint(&self) -> B256 {
+        let mut buf = Vec::with_capacity(32 * 6);
+        buf.extend_from_slice(&self.start_timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.max_claimable_supply.to_be_bytes::<32>());
+        buf.extend_from_slice(&self.quantity_limit_per_wallet.to_be_bytes::<32>());
+        buf.extend_from_slice(self.merkle_root.as_slice());
+        buf.extend_from_slice(&self.price_per_token.to_be_bytes::<32>());
+        buf.extend_from_slice(self.currency.as_slice());
+        keccak256(buf)
     }
 }
 
@@ -269,6 +294,71 @@ pub fn decode_claim_condition_single_phase(data: &[u8]) -> Result<ClaimCondition
     let decoded = claimConditionCall::abi_decode_returns(data)
         .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))?;
     ClaimCondition::from_abi(decoded)
+}
+
+/// **CORRECTION**: `claimCondition()` is not single-phase-exclusive.
+/// `Drop.sol` (multi-phase) *also* declares `ClaimConditionList public
+/// claimCondition;` -- verified against
+/// `contracts/extension/interface/IDrop.sol`'s real struct:
+/// ```solidity
+/// struct ClaimConditionList {
+///     uint256 currentStartId;
+///     uint256 count;
+///     mapping(uint256 => ClaimCondition) conditions;
+///     mapping(uint256 => mapping(address => uint256)) supplyClaimedByWallet;
+/// }
+/// ```
+/// Solidity's auto-generated public getter for a struct silently omits
+/// mapping fields, so the multi-phase contract's `claimCondition()`
+/// returns only `(uint256 currentStartId, uint256 count)` -- the exact
+/// same selector as the single-phase getter above, but a genuinely
+/// different, much shorter return shape. An earlier version of this
+/// module used `getActiveClaimConditionId()`/`active_id + 1` as the
+/// multi-phase enumeration anchor; that is insufficient (it reverts
+/// before any phase has started, exactly when discovering an
+/// upcoming multi-phase drop for `watch` matters most) and has been
+/// replaced by reading this authoritative `(currentStartId, count)`
+/// pair directly -- see `decode_claim_condition_list`.
+pub mod multi_phase_list {
+    use alloy_sol_types::sol;
+
+    sol! {
+        function claimCondition() external view returns (uint256 currentStartId, uint256 count);
+    }
+}
+
+/// Build the calldata for the multi-phase `claimCondition()` list-metadata
+/// getter. Byte-identical to [`encode_claim_condition_single_phase`]'s
+/// output (same selector, no arguments) -- reused directly rather than
+/// duplicated, since the *calldata* is truly the same; only the
+/// interpretation of the *response* differs by flavor.
+pub fn encode_claim_condition_list() -> Bytes {
+    encode_claim_condition_single_phase()
+}
+
+/// Decode the return data of the multi-phase `claimCondition()` getter as
+/// `(currentStartId, count)`.
+///
+/// **Safety-critical decode order**: callers MUST attempt
+/// [`decode_claim_condition_single_phase`] (the longer, ≥320-byte shape)
+/// FIRST and only fall back to this function if that decode fails.
+/// Verified empirically: `alloy_sol_types`'s ABI decoder does NOT reject
+/// trailing bytes -- decoding a genuine single-phase `ClaimCondition`
+/// response (which is always ≥320 bytes, even with empty `metadata`) as
+/// this 64-byte 2-word shape SILENTLY SUCCEEDS, reading only the first
+/// two words and discarding the rest, which would misidentify a
+/// single-phase deployment as multi-phase with nonsensical
+/// `currentStartId`/`count` values derived from unrelated fields
+/// (`startTimestamp`/`maxClaimableSupply`). The reverse direction is
+/// safe: decoding a genuine 64-byte multi-phase response as the ≥320-byte
+/// single-phase shape correctly fails with a buffer-overrun error, since
+/// there aren't enough bytes to satisfy it. This function must never be
+/// called as the first/only decode attempt against calldata whose flavor
+/// is not yet known.
+pub fn decode_claim_condition_list(data: &[u8]) -> Result<(U256, U256), ThirdwebError> {
+    let decoded = multi_phase_list::claimConditionCall::abi_decode_returns(data)
+        .map_err(|e| ThirdwebError::AbiDecode(e.to_string()))?;
+    Ok((decoded.currentStartId, decoded.count))
 }
 
 /// Build the calldata for `getSupplyClaimedByWallet(address)` -- the

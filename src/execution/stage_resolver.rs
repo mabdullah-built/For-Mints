@@ -175,21 +175,21 @@ mod tests {
     fn active_window() -> crate::domain::timing::PhaseWindow {
         crate::domain::timing::PhaseWindow {
             start: NOW - Duration::minutes(10),
-            end: NOW + Duration::hours(1),
+            end: Some(NOW + Duration::hours(1)),
         }
     }
 
     fn future_window(starts_in: Duration) -> crate::domain::timing::PhaseWindow {
         crate::domain::timing::PhaseWindow {
             start: NOW + starts_in,
-            end: NOW + starts_in + Duration::hours(1),
+            end: Some(NOW + starts_in + Duration::hours(1)),
         }
     }
 
     fn ended_window() -> crate::domain::timing::PhaseWindow {
         crate::domain::timing::PhaseWindow {
             start: NOW - Duration::hours(2),
-            end: NOW - Duration::hours(1),
+            end: Some(NOW - Duration::hours(1)),
         }
     }
 

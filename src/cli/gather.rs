@@ -99,10 +99,18 @@ pub async fn fetch_thirdweb_supply_claimed_by_wallet(
 /// contract (`DropSinglePhase.sol`) -- a no-argument public
 /// state-variable getter, genuinely different from
 /// `getClaimConditionById` (see `protocol::thirdweb`'s module doc
-/// comment for the full flavor distinction). Never call this against a
-/// multi-phase `Drop` contract and assume the result is meaningful --
-/// the selector is different, so it would simply fail to decode/revert
-/// against one.
+/// comment for the full flavor distinction). **CORRECTION**: an earlier
+/// version of this doc comment claimed calling this against a
+/// multi-phase `Drop` contract "would simply fail to decode/revert" --
+/// verified false. Multi-phase `Drop.sol` exposes `claimCondition()`
+/// too (a different, much shorter return shape -- see
+/// `protocol::thirdweb::multi_phase_list`'s doc comment), and
+/// `alloy_sol_types` does not reject trailing bytes, so decoding a
+/// genuine multi-phase response with this function's (longer) expected
+/// shape is the *safe* direction (it fails closed on insufficient
+/// bytes) but must never be assumed to prove single-phase on its own --
+/// see [`fetch_thirdweb_claim_condition_or_list`], which performs the
+/// one safe disambiguating read.
 pub async fn fetch_thirdweb_claim_condition_single_phase(
     client: &RpcClient,
     drop_contract: Address,
@@ -110,6 +118,43 @@ pub async fn fetch_thirdweb_claim_condition_single_phase(
     let calldata = thirdweb::encode_claim_condition_single_phase();
     let result = client.eth_call(drop_contract, &calldata).await?;
     Ok(thirdweb::decode_claim_condition_single_phase(&result)?)
+}
+
+/// Which shape a `claimCondition()` response turned out to be -- see
+/// [`fetch_thirdweb_claim_condition_or_list`].
+pub enum ThirdwebClaimConditionShape {
+    SinglePhase(ClaimCondition),
+    /// `(currentStartId, count)` -- the multi-phase list's own
+    /// authoritative bounds. Valid condition ids are
+    /// `[currentStartId, currentStartId + count)`.
+    MultiPhaseList(U256, U256),
+}
+
+/// The **one safe way** to call `claimCondition()` against a thirdweb
+/// Drop contract of unknown flavor. Makes exactly one `eth_call`, then
+/// tries decoding the response as the longer single-phase
+/// `ClaimCondition` shape FIRST; only if that fails (insufficient
+/// bytes -- the safe failure direction) does it try the shorter
+/// multi-phase `(currentStartId, count)` shape. Never the reverse order
+/// -- see `protocol::thirdweb::decode_claim_condition_list`'s doc
+/// comment for the empirically-verified reason (a short buffer
+/// decoded against a long shape correctly errors; a long buffer
+/// decoded against a short shape silently truncates and succeeds with
+/// garbage).
+pub async fn fetch_thirdweb_claim_condition_or_list(
+    client: &RpcClient,
+    drop_contract: Address,
+) -> Result<ThirdwebClaimConditionShape, KairoxError> {
+    let calldata = thirdweb::encode_claim_condition_list();
+    let result = client.eth_call(drop_contract, &calldata).await?;
+    if let Ok(condition) = thirdweb::decode_claim_condition_single_phase(&result) {
+        return Ok(ThirdwebClaimConditionShape::SinglePhase(condition));
+    }
+    let (current_start_id, count) = thirdweb::decode_claim_condition_list(&result)?;
+    Ok(ThirdwebClaimConditionShape::MultiPhaseList(
+        current_start_id,
+        count,
+    ))
 }
 
 /// Fetch the single-phase flavor's `getSupplyClaimedByWallet(address)`

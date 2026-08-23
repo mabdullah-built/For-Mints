@@ -138,7 +138,7 @@ pub fn build_plan(inputs: PlanInputs) -> Result<MintPlan, KairoxError> {
     let stage_end = unix_timestamp(inputs.public_drop.end_time, "public drop endTime")?;
     let stage_status = PhaseWindow {
         start: stage_start,
-        end: stage_end,
+        end: Some(stage_end),
     }
     .status(inputs.now);
 
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(
             plan.stage_status,
             StageStatus::Active {
-                ends_in: time::Duration::minutes(30)
+                ends_in: Some(time::Duration::minutes(30))
             }
         );
         assert_eq!(&plan.calldata[0..4], plan.calldata_selector);

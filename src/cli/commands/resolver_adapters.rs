@@ -89,7 +89,7 @@ pub(crate) async fn discover_public_stage(
         label: None,
         window: PhaseWindow {
             start: plan.stage_start,
-            end: plan.stage_end,
+            end: Some(plan.stage_end),
         },
         price_per_token_wei: Some(price_per_token),
         // MintPlan already reports *remaining* allocation/supply rather
@@ -249,7 +249,10 @@ async fn discover_opensea_stages(
                 },
                 protocol,
                 label: stage.label.clone(),
-                window: PhaseWindow { start, end },
+                window: PhaseWindow {
+                    start,
+                    end: Some(end),
+                },
                 // See opensea_display_price_provenance_unavailable's doc
                 // comment -- never spend-authorization-grade.
                 price_per_token_wei: opensea_display_price_provenance_unavailable(&stage.price),
@@ -1109,16 +1112,13 @@ impl MintAdapter for ManifoldAdapter<'_> {
     }
 }
 
-/// Sentinel used only when a stage's real effective end genuinely cannot
-/// be read from the chain (see [`discover_thirdweb_stages`]'s doc
-/// comment) -- never a guess at a real value. Deliberately implausible
-/// (no real claim condition will still be open in the year 2999) so it
-/// can never be mistaken for authoritative data downstream; `PhaseWindow`
-/// itself has no `Option<end>` representation, so an explicit,
-/// obviously-synthetic constant is the least-guessy way to satisfy its
-/// shape (mirrors the existing test fixtures' identical use of
-/// `2999-01-01` as a "does not meaningfully end" placeholder).
-const NO_KNOWN_END: OffsetDateTime = time::macros::datetime!(2999-01-01 00:00:00 UTC);
+/// Bounded maximum number of multi-phase conditions
+/// [`discover_thirdweb_stages`] will ever enumerate/read in one call --
+/// see that function's doc comment. Real drops configure a handful of
+/// phases; this exists purely as a corruption/DoS backstop (an
+/// unreasonable `count` value never turns into an unbounded read loop),
+/// not a claim that no real drop could ever exceed it.
+const MAX_THIRDWEB_PHASES: u64 = 20;
 
 /// Discovers thirdweb Drop claim condition(s) for `drop_contract` as
 /// [`NormalizedStage`] entries, for `--engine thirdweb`'s `watch`
@@ -1127,44 +1127,56 @@ const NO_KNOWN_END: OffsetDateTime = time::macros::datetime!(2999-01-01 00:00:00
 /// [`crate::execution::thirdweb_engine::establish_provenance`]'s job
 /// alone, applied unconditionally afterward by the caller.
 ///
-/// **Multi-phase**: reads the active condition via
-/// `getActiveClaimConditionId`/`getClaimConditionById` (both
-/// authoritative on-chain reads), then probes exactly **one** condition
-/// id ahead (`active_id + 1`) as a bounded, non-guessing check for a
-/// configured future phase -- verified against `Drop.sol`'s real
-/// `setClaimConditions` source: conditions are assigned strictly
-/// sequential ids starting from a base index, so `active_id + 1` is
-/// genuinely "the next condition, if the creator has configured one",
-/// not an assumption about how many phases exist in total. If that read
-/// succeeds, its own real `startTimestamp` becomes both the active
-/// condition's effective end (verified against `getActiveClaimConditionId`'s
+/// **Flavor disambiguation**: makes exactly one `claimCondition()` call
+/// via [`crate::cli::gather::fetch_thirdweb_claim_condition_or_list`],
+/// which decodes the response using the one safe order (see that
+/// function's doc comment) -- never infers flavor from selector
+/// existence alone.
+///
+/// **Multi-phase**: **CORRECTION** -- an earlier version of this
+/// function used `getActiveClaimConditionId()`/`active_id + 1` as its
+/// enumeration anchor. That is insufficient: `getActiveClaimConditionId()`
+/// *reverts* (`DropNoActiveCondition`, verified against `Drop.sol`
+/// source) until at least one configured phase has started, which means
+/// a multi-phase drop configured entirely in the future -- exactly the
+/// case `watch` exists for -- was undiscoverable. Replaced with reading
+/// the list's own authoritative `(currentStartId, count)` metadata
+/// directly (via `claimCondition()`'s auto-generated getter, which
+/// exposes only the non-mapping fields of the real `ClaimConditionList`
+/// struct -- verified against `IDrop.sol` source), then enumerating
+/// every id in `[currentStartId, currentStartId + min(count,
+/// MAX_THIRDWEB_PHASES))` via `getClaimConditionById`. Each condition's
+/// `StageId` carries its exact id plus a
+/// [`crate::protocol::thirdweb::ClaimCondition::config_fingerprint`], and
+/// each condition's effective end is the *real* `startTimestamp` of the
+/// next enumerated condition (verified against `getActiveClaimConditionId`'s
 /// own backward-iterating "first condition whose startTimestamp has
 /// passed" logic -- a later condition's start genuinely does end the
-/// previous one for "active" purposes) and a second, separate
-/// [`StageId::ThirdwebMultiPhase`] stage in its own right (watchable if
-/// it hasn't started yet). No id beyond `active_id + 1` is ever probed --
-/// this function does not claim to enumerate every future phase, only
-/// the immediately next one.
+/// previous one for "active" purposes) -- the last enumerated condition
+/// gets `end: None` (genuinely open/unknown), never an invented
+/// timestamp.
 ///
-/// **Single-phase**: only attempted if no multi-phase condition was
-/// found (mirrors [`crate::execution::thirdweb_engine::probe_flavor`]'s
-/// precedence). Uses `claimCondition()`/`getSupplyClaimedByWallet(address)`
-/// -- no condition id exists in this flavor's ABI at all, so its
-/// [`StageId::ThirdwebSinglePhase`] identity carries only the contract
-/// address; there is no "next condition" concept to probe for at all
-/// (see `protocol::thirdweb`'s module doc comment).
+/// **Single-phase**: `claimCondition()`'s own long-shape decode success
+/// already proves the flavor (see disambiguation above) -- no
+/// condition id exists in this flavor's ABI at all, so its
+/// [`StageId::ThirdwebSinglePhase`] identity carries the contract
+/// address plus a config fingerprint (a single-phase condition can be
+/// replaced in place -- see `StageId::ThirdwebSinglePhase`'s doc
+/// comment); `end` is always `None` (this protocol supplies no end
+/// field for this flavor at all).
 pub(crate) async fn discover_thirdweb_stages(
     client: &crate::chain::rpc::RpcClient,
     drop_contract: alloy_primitives::Address,
     wallet: alloy_primitives::Address,
 ) -> Vec<NormalizedStage> {
+    use crate::cli::gather::ThirdwebClaimConditionShape;
     use crate::protocol::thirdweb::ClaimCondition;
 
     fn to_stage(
         drop_contract: alloy_primitives::Address,
         condition_id: alloy_primitives::U256,
         condition: &ClaimCondition,
-        end: OffsetDateTime,
+        end: Option<OffsetDateTime>,
         wallet_claimed: Option<alloy_primitives::U256>,
     ) -> Option<NormalizedStage> {
         let start = crate::execution::plan::unix_timestamp(
@@ -1176,6 +1188,7 @@ pub(crate) async fn discover_thirdweb_stages(
             id: StageId::ThirdwebMultiPhase {
                 drop_contract,
                 condition_id,
+                config_fingerprint: condition.config_fingerprint(),
             },
             execution: StageExecutionRef::Thirdweb { drop_contract },
             protocol: StageProtocol::ThirdwebClaim,
@@ -1205,88 +1218,37 @@ pub(crate) async fn discover_thirdweb_stages(
         })
     }
 
-    let mut stages = Vec::new();
+    let Ok(shape) =
+        crate::cli::gather::fetch_thirdweb_claim_condition_or_list(client, drop_contract).await
+    else {
+        return Vec::new();
+    };
 
-    if let Ok(active_id) =
-        crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, drop_contract).await
-        && let Ok(active_condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
-            client,
-            drop_contract,
-            active_id,
-        )
-        .await
-    {
-        let wallet_claimed = crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet(
-            client,
-            drop_contract,
-            active_id,
-            wallet,
-        )
-        .await
-        .ok();
-
-        let next_id = active_id.saturating_add(alloy_primitives::U256::from(1));
-        let next_condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
-            client,
-            drop_contract,
-            next_id,
-        )
-        .await
-        .ok();
-
-        let active_end = match &next_condition {
-            Some(next) => crate::execution::plan::unix_timestamp(
-                next.start_timestamp,
-                "thirdweb next claim condition startTimestamp",
-            )
-            .unwrap_or(NO_KNOWN_END),
-            None => NO_KNOWN_END,
-        };
-
-        if let Some(stage) = to_stage(
-            drop_contract,
-            active_id,
-            &active_condition,
-            active_end,
-            wallet_claimed,
-        ) {
-            stages.push(stage);
-        }
-
-        if let Some(next_condition) = next_condition
-            && let Some(stage) =
-                to_stage(drop_contract, next_id, &next_condition, NO_KNOWN_END, None)
-        {
-            stages.push(stage);
-        }
-    }
-
-    if stages.is_empty()
-        && let Ok(condition) =
-            crate::cli::gather::fetch_thirdweb_claim_condition_single_phase(client, drop_contract)
+    match shape {
+        ThirdwebClaimConditionShape::SinglePhase(condition) => {
+            let wallet_claimed =
+                crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet_single_phase(
+                    client,
+                    drop_contract,
+                    wallet,
+                )
                 .await
-    {
-        let wallet_claimed =
-            crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet_single_phase(
-                client,
-                drop_contract,
-                wallet,
-            )
-            .await
-            .ok();
-        if let Ok(start) = crate::execution::plan::unix_timestamp(
-            condition.start_timestamp,
-            "thirdweb single-phase claimCondition startTimestamp",
-        ) {
-            stages.push(NormalizedStage {
-                id: StageId::ThirdwebSinglePhase { drop_contract },
+                .ok();
+            let Ok(start) = crate::execution::plan::unix_timestamp(
+                condition.start_timestamp,
+                "thirdweb single-phase claimCondition startTimestamp",
+            ) else {
+                return Vec::new();
+            };
+            vec![NormalizedStage {
+                id: StageId::ThirdwebSinglePhase {
+                    drop_contract,
+                    config_fingerprint: condition.config_fingerprint(),
+                },
                 execution: StageExecutionRef::Thirdweb { drop_contract },
                 protocol: StageProtocol::ThirdwebClaim,
                 label: None,
-                window: PhaseWindow {
-                    start,
-                    end: NO_KNOWN_END,
-                },
+                window: PhaseWindow { start, end: None },
                 price_per_token_wei: if condition.is_native_currency() {
                     Some(condition.price_per_token)
                 } else {
@@ -1305,11 +1267,55 @@ pub(crate) async fn discover_thirdweb_stages(
                      (startTimestamp {}, merkleRoot {:#x})",
                     condition.start_timestamp, condition.merkle_root
                 ),
-            });
+            }]
+        }
+        ThirdwebClaimConditionShape::MultiPhaseList(current_start_id, count) => {
+            let bounded_count = count.min(alloy_primitives::U256::from(MAX_THIRDWEB_PHASES));
+            let mut conditions: Vec<(alloy_primitives::U256, ClaimCondition)> = Vec::new();
+            let mut id = current_start_id;
+            let mut read = alloy_primitives::U256::ZERO;
+            while read < bounded_count {
+                if let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+                    client,
+                    drop_contract,
+                    id,
+                )
+                .await
+                {
+                    conditions.push((id, condition));
+                }
+                id = id.saturating_add(alloy_primitives::U256::from(1));
+                read = read.saturating_add(alloy_primitives::U256::from(1));
+            }
+
+            let mut stages = Vec::with_capacity(conditions.len());
+            for i in 0..conditions.len() {
+                let (condition_id, condition) = &conditions[i];
+                let end = match conditions.get(i + 1) {
+                    Some((_, next)) => crate::execution::plan::unix_timestamp(
+                        next.start_timestamp,
+                        "thirdweb next claim condition startTimestamp",
+                    )
+                    .ok(),
+                    None => None,
+                };
+                let wallet_claimed = crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet(
+                    client,
+                    drop_contract,
+                    *condition_id,
+                    wallet,
+                )
+                .await
+                .ok();
+                if let Some(stage) =
+                    to_stage(drop_contract, *condition_id, condition, end, wallet_claimed)
+                {
+                    stages.push(stage);
+                }
+            }
+            stages
         }
     }
-
-    stages
 }
 
 /// Discovers the Manifold `LazyPayableClaim` claim at
@@ -1363,7 +1369,10 @@ pub(crate) async fn discover_manifold_stage(
         },
         protocol: StageProtocol::ManifoldClaim,
         label: None,
-        window: PhaseWindow { start, end },
+        window: PhaseWindow {
+            start,
+            end: Some(end),
+        },
         price_per_token_wei: if claim.is_native_currency() {
             Some(claim.cost)
         } else {
@@ -1397,7 +1406,7 @@ mod stage_identity_tests {
     fn window() -> PhaseWindow {
         PhaseWindow {
             start: datetime!(2020-01-01 00:00:00 UTC),
-            end: datetime!(2999-01-01 00:00:00 UTC),
+            end: Some(datetime!(2999-01-01 00:00:00 UTC)),
         }
     }
 
@@ -1569,42 +1578,38 @@ mod thirdweb_manifold_stage_discovery_tests {
         format!("0x{}", hex::encode(selector))
     }
 
-    #[tokio::test]
-    async fn multi_phase_active_only_with_no_next_condition_is_open_ended() {
-        let active_id_hex = format!(
+    fn id_suffix(id: u64) -> String {
+        format!("{id:064x}")
+    }
+
+    fn list_metadata_hex(current_start_id: u64, count: u64) -> String {
+        format!(
             "0x{}",
-            hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
-                &alloy_primitives::U256::from(3u64)
-            ))
-        );
-        let condition_3_hex = format!(
-            "0x{}",
-            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
-                &condition_abi(1_700_000_000, alloy_primitives::B256::ZERO)
-            ))
-        );
-        let condition_by_id_prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
-        // The condition id is the sole (padded to 32 bytes) argument
-        // right after the 4-byte selector.
-        let id_3_suffix = format!("{:064x}", 3u64);
-        let transport = MockTransport::builder()
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::from(current_start_id),
+                        count: alloy_primitives::U256::from(count),
+                    }
+                )
+            )
+        )
+    }
+
+    /// Mocks a multi-phase drop responding to `claimCondition()` with the
+    /// list-metadata shape (`currentStartId`, `count`) and to
+    /// `getClaimConditionById(id)` for each id in
+    /// `[start_id, start_id + conditions.len())` with the given
+    /// `(startTimestamp, merkleRoot)` pairs, in order. Also mocks
+    /// `getSupplyClaimedByWallet` for every id to return zero.
+    fn multi_phase_transport(
+        start_id: u64,
+        conditions: &[(u64, alloy_primitives::B256)],
+    ) -> MockTransport {
+        let list_hex = list_metadata_hex(start_id, conditions.len() as u64);
+        let mut builder = MockTransport::builder()
             .respond("eth_chainId", json!("0x1"))
-            .respond_eth_call_selector(
-                tw::getActiveClaimConditionIdCall::SELECTOR,
-                json!(active_id_hex),
-            )
-            .respond_matching(
-                "eth_call",
-                move |params| {
-                    let data = eth_call_data(params);
-                    data.starts_with(&condition_by_id_prefix) && data.ends_with(&id_3_suffix)
-                },
-                json!(condition_3_hex),
-            )
-            // Any other getClaimConditionById id (the id+1 probe for id
-            // 4) falls through to this blanket eth_call error -- exactly
-            // as a real contract would revert for an unconfigured
-            // future phase.
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
             .respond_eth_call_selector(
                 tw::getSupplyClaimedByWalletCall::SELECTOR,
                 json!(format!(
@@ -1613,113 +1618,196 @@ mod thirdweb_manifold_stage_discovery_tests {
                         &alloy_primitives::U256::ZERO
                     ))
                 )),
-            )
+            );
+        let condition_by_id_prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
+        for (offset, (start_ts, merkle_root)) in conditions.iter().enumerate() {
+            let id = start_id + offset as u64;
+            let condition_hex = format!(
+                "0x{}",
+                hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                    &condition_abi(*start_ts, *merkle_root)
+                ))
+            );
+            let suffix = id_suffix(id);
+            let prefix = condition_by_id_prefix.clone();
+            builder = builder.respond_matching(
+                "eth_call",
+                move |params| {
+                    let data = eth_call_data(params);
+                    data.starts_with(&prefix) && data.ends_with(&suffix)
+                },
+                json!(condition_hex),
+            );
+        }
+        builder
             .error("eth_call", -32000, "execution reverted")
-            .build();
+            .build()
+    }
+
+    #[tokio::test]
+    async fn multi_phase_single_configured_condition_has_no_known_end() {
+        let transport = multi_phase_transport(0, &[(1_700_000_000, alloy_primitives::B256::ZERO)]);
         let client = connect(transport).await;
 
         let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
         assert_eq!(stages.len(), 1);
-        assert_eq!(
-            stages[0].id,
-            StageId::ThirdwebMultiPhase {
-                drop_contract: DROP,
-                condition_id: alloy_primitives::U256::from(3u64),
-            }
-        );
-        assert_eq!(stages[0].window.end, NO_KNOWN_END);
-    }
-
-    #[tokio::test]
-    async fn multi_phase_active_plus_a_real_next_condition_yields_two_stages_with_a_shared_boundary()
-     {
-        let active_id_hex = format!(
-            "0x{}",
-            hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
-                &alloy_primitives::U256::from(0u64)
-            ))
-        );
-        let condition_0 = condition_abi(1_700_000_000, alloy_primitives::B256::ZERO);
-        let condition_1 = condition_abi(1_800_000_000, alloy_primitives::B256::ZERO);
-        let condition_0_hex = format!(
-            "0x{}",
-            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
-                &condition_0
-            ))
-        );
-        let condition_1_hex = format!(
-            "0x{}",
-            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
-                &condition_1
-            ))
-        );
-        let condition_by_id_prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
-        let id_0_suffix = format!("{:064x}", 0u64);
-        let id_1_suffix = format!("{:064x}", 1u64);
-        let transport = MockTransport::builder()
-            .respond("eth_chainId", json!("0x1"))
-            .respond_eth_call_selector(
-                tw::getActiveClaimConditionIdCall::SELECTOR,
-                json!(active_id_hex),
-            )
-            .respond_matching(
-                "eth_call",
-                move |params| {
-                    let data = eth_call_data(params);
-                    data.starts_with(&condition_by_id_prefix) && data.ends_with(&id_0_suffix)
-                },
-                json!(condition_0_hex),
-            )
-            .respond_matching(
-                "eth_call",
-                {
-                    let prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
-                    move |params| {
-                        let data = eth_call_data(params);
-                        data.starts_with(&prefix) && data.ends_with(&id_1_suffix)
-                    }
-                },
-                json!(condition_1_hex),
-            )
-            .respond_eth_call_selector(
-                tw::getSupplyClaimedByWalletCall::SELECTOR,
-                json!(format!(
-                    "0x{}",
-                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
-                        &alloy_primitives::U256::ZERO
-                    ))
-                )),
-            )
-            .error("eth_call", -32000, "execution reverted")
-            .build();
-        let client = connect(transport).await;
-
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
-        assert_eq!(stages.len(), 2);
+        let expected_fingerprint = crate::protocol::thirdweb::ClaimCondition::from_abi(
+            condition_abi(1_700_000_000, alloy_primitives::B256::ZERO),
+        )
+        .unwrap()
+        .config_fingerprint();
         assert_eq!(
             stages[0].id,
             StageId::ThirdwebMultiPhase {
                 drop_contract: DROP,
                 condition_id: alloy_primitives::U256::from(0u64),
+                config_fingerprint: expected_fingerprint,
             }
         );
         assert_eq!(
-            stages[1].id,
-            StageId::ThirdwebMultiPhase {
-                drop_contract: DROP,
-                condition_id: alloy_primitives::U256::from(1u64),
-            }
+            stages[0].window.end, None,
+            "no invented far-future end -- the last (only) configured condition's real end is \
+             genuinely unknown"
         );
-        assert_eq!(
-            stages[0].window.end, stages[1].window.start,
-            "the active condition's effective end must be exactly the next condition's real \
-             startTimestamp -- verified against Drop.sol's getActiveClaimConditionId semantics"
-        );
-        assert_eq!(stages[1].window.end, NO_KNOWN_END);
     }
 
     #[tokio::test]
-    async fn single_phase_stage_is_discovered_when_no_multi_phase_condition_exists() {
+    async fn multi_phase_before_first_phase_starts_all_configured_phases_still_discovered() {
+        // Section 8's mandatory regression test: getActiveClaimConditionId
+        // would revert here (no condition has started yet), but
+        // claimCondition()'s list metadata is read regardless of whether
+        // any phase is active -- discovery must not depend on
+        // getActiveClaimConditionId at all.
+        let transport = multi_phase_transport(
+            7,
+            &[
+                (4_000_000_000, alloy_primitives::B256::ZERO), // far future T1
+                (4_100_000_000, alloy_primitives::B256::ZERO), // T2
+                (4_200_000_000, alloy_primitives::B256::ZERO), // T3
+            ],
+        );
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert_eq!(
+            stages.len(),
+            3,
+            "all 3 configured future phases must be discovered"
+        );
+        match &stages[0].id {
+            StageId::ThirdwebMultiPhase {
+                drop_contract,
+                condition_id,
+                ..
+            } => {
+                assert_eq!(*drop_contract, DROP);
+                assert_eq!(*condition_id, alloy_primitives::U256::from(7u64));
+            }
+            other => panic!("expected ThirdwebMultiPhase, got {other:?}"),
+        }
+        for stage in &stages {
+            assert_eq!(
+                stage.eligibility,
+                EligibilityState::Eligible,
+                "a public (merkleRoot == 0) future phase is eligible, not blocked by its own \
+                 not-yet-started status (StageStatus, not EligibilityState, encodes timing)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_phase_nonzero_current_start_id_is_never_assumed_to_start_at_zero() {
+        let transport = multi_phase_transport(
+            20,
+            &[
+                (1_700_000_000, alloy_primitives::B256::ZERO),
+                (1_800_000_000, alloy_primitives::B256::ZERO),
+                (1_900_000_000, alloy_primitives::B256::ZERO),
+            ],
+        );
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert_eq!(stages.len(), 3);
+        for (offset, stage) in stages.iter().enumerate() {
+            match &stage.id {
+                StageId::ThirdwebMultiPhase { condition_id, .. } => {
+                    assert_eq!(
+                        *condition_id,
+                        alloy_primitives::U256::from(20 + offset as u64)
+                    );
+                }
+                other => panic!("expected ThirdwebMultiPhase, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_phase_effective_end_is_exactly_the_next_configured_starttimestamp() {
+        let transport = multi_phase_transport(
+            0,
+            &[
+                (1_700_000_000, alloy_primitives::B256::ZERO),
+                (1_800_000_000, alloy_primitives::B256::ZERO),
+            ],
+        );
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert_eq!(stages.len(), 2);
+        assert_eq!(
+            stages[0].window.end,
+            Some(stages[1].window.start),
+            "the first condition's effective end must be exactly the second condition's real \
+             startTimestamp -- verified against Drop.sol's getActiveClaimConditionId semantics"
+        );
+        assert_eq!(
+            stages[1].window.end, None,
+            "the last configured condition has no known end -- never an invented far-future \
+             timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_phase_config_change_on_same_condition_id_produces_a_different_fingerprint() {
+        let unchanged = crate::protocol::thirdweb::ClaimCondition::from_abi(condition_abi(
+            1_700_000_000,
+            alloy_primitives::B256::ZERO,
+        ))
+        .unwrap();
+        let reconfigured_price = {
+            let mut abi = condition_abi(1_700_000_000, alloy_primitives::B256::ZERO);
+            abi.pricePerToken = alloy_primitives::U256::from(999_000_000_000_000u64);
+            crate::protocol::thirdweb::ClaimCondition::from_abi(abi).unwrap()
+        };
+        assert_ne!(
+            unchanged.config_fingerprint(),
+            reconfigured_price.config_fingerprint(),
+            "a price change on the same condition id must change the fingerprint -- a watch \
+             attempt must be able to detect this and stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_phase_supply_claimed_alone_never_changes_the_fingerprint() {
+        let a = crate::protocol::thirdweb::ClaimCondition::from_abi(condition_abi(
+            1_700_000_000,
+            alloy_primitives::B256::ZERO,
+        ))
+        .unwrap();
+        let mut abi_b = condition_abi(1_700_000_000, alloy_primitives::B256::ZERO);
+        abi_b.supplyClaimed = alloy_primitives::U256::from(999u64);
+        let b = crate::protocol::thirdweb::ClaimCondition::from_abi(abi_b).unwrap();
+        assert_eq!(
+            a.config_fingerprint(),
+            b.config_fingerprint(),
+            "supplyClaimed is a naturally-changing counter, never grounds for treating a \
+             watched condition as materially changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_phase_stage_is_discovered_when_claim_condition_decodes_as_the_long_shape() {
         let condition_hex = format!(
             "0x{}",
             hex::encode(tw::claimConditionCall::abi_encode_returns(&condition_abi(
@@ -1741,28 +1829,39 @@ mod thirdweb_manifold_stage_discovery_tests {
                     )
                 )),
             )
-            // getActiveClaimConditionId (and every other unmatched
-            // eth_call) reverts -- this is a genuine single-phase-only
-            // deployment.
             .error("eth_call", -32000, "execution reverted")
             .build();
         let client = connect(transport).await;
 
         let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
         assert_eq!(stages.len(), 1);
-        assert_eq!(
-            stages[0].id,
-            StageId::ThirdwebSinglePhase {
-                drop_contract: DROP
+        match &stages[0].id {
+            StageId::ThirdwebSinglePhase { drop_contract, .. } => {
+                assert_eq!(*drop_contract, DROP);
             }
+            other => panic!("expected ThirdwebSinglePhase, got {other:?}"),
+        }
+        assert_eq!(
+            stages[0].window.end, None,
+            "single-phase thirdweb has no end field at all -- never an invented one"
         );
+    }
+
+    #[tokio::test]
+    async fn single_phase_config_change_produces_a_different_fingerprint() {
+        let a = crate::protocol::thirdweb::ClaimCondition::from_abi(condition_abi(
+            1_700_000_000,
+            alloy_primitives::B256::ZERO,
+        ))
+        .unwrap();
+        let mut abi_b = condition_abi(1_700_000_000, alloy_primitives::B256::ZERO);
+        abi_b.quantityLimitPerWallet = alloy_primitives::U256::from(999u64);
+        let b = crate::protocol::thirdweb::ClaimCondition::from_abi(abi_b).unwrap();
         assert_ne!(
-            stages[0].id,
-            StageId::ThirdwebMultiPhase {
-                drop_contract: DROP,
-                condition_id: alloy_primitives::U256::ZERO,
-            },
-            "single-phase stage identity must never collide with a multi-phase identity"
+            a.config_fingerprint(),
+            b.config_fingerprint(),
+            "replacing a single-phase condition's terms in place must be detectable via its \
+             fingerprint"
         );
     }
 
