@@ -51,7 +51,7 @@ use super::thirdweb_registry::{ThirdwebFlavor, ThirdwebTrustedFingerprint, find_
 /// upgradeable deployment), otherwise the target's own address (not a
 /// recognized proxy pattern at all). Returns the resolved address and
 /// `keccak256` of its runtime bytecode.
-async fn resolve_thirdweb_implementation_and_code_hash(
+pub(crate) async fn resolve_thirdweb_implementation_and_code_hash(
     client: &RpcClient,
     target: Address,
 ) -> Result<(Address, B256), KairoxError> {

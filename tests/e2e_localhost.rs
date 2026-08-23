@@ -4586,6 +4586,98 @@ fn auto_engine_unrecognized_contract_fails_closed_as_unsupported_protocol() {
 }
 
 #[test]
+fn auto_engine_thirdweb_shaped_contract_without_registry_match_is_unsupported() {
+    // A target that responds correctly to thirdweb's Drop selectors, but
+    // is not SeaDrop-shaped (getPublicDrop reverts) and no --slug was
+    // given. execution::thirdweb_registry::BUILTIN_REGISTRY ships empty
+    // by design, so ThirdwebAdapter can find selector-level evidence but
+    // never a trusted-registry match -- proving `--engine auto` engages
+    // thirdweb detection at all, and correctly refuses to auto-select it
+    // on selector compatibility alone.
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| {
+        if method == "eth_call" {
+            // Only thirdweb-shaped selectors succeed (via the shared
+            // helper); anything else -- SeaDrop's getPublicDrop included
+            // -- reverts, exactly as a real non-SeaDrop contract would.
+            return thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+                code: -32000,
+                message: "execution reverted".into(),
+            });
+        }
+        thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in auto-thirdweb scenario: {method}"),
+        })
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{THIRDWEB_DROP:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"))
+        .stderr(predicates::str::contains("ThirdwebAdapter"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "selector-only thirdweb evidence must never authorize a live send"
+    );
+}
+
+#[test]
+fn auto_engine_ignores_manifold_entirely_without_manifold_extension_flag() {
+    // ManifoldAdapter must never attempt any read, let alone match,
+    // unless --manifold-extension was explicitly supplied -- there is no
+    // verified way to auto-discover a Manifold claim's three identifiers
+    // from a bare collection address. This proves `--engine auto`
+    // against an otherwise-unrecognized contract behaves identically
+    // whether or not ManifoldAdapter is registered.
+    let wallet = test_signer().address();
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| match method {
+        "eth_chainId" => rpc_ok(serde_json::json!("0x1")),
+        "eth_call" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "execution reverted".into(),
+        },
+        "eth_getStorageAt" => rpc_ok(serde_json::json!(format!("0x{}", "0".repeat(64)))),
+        "eth_getCode" => rpc_ok(serde_json::json!("0x6080604052")),
+        _ => Behavior::JsonRpcError {
+            code: -32601,
+            message: "method not found".into(),
+        },
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .args([
+            "mint",
+            &format!("{NFT:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "auto",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("UNSUPPORTED_PROTOCOL"))
+        // ManifoldAdapter is still listed among "adapters tried" (it was
+        // asked, and correctly declined instantly) -- what must never
+        // appear is any evidence implying it actually read/matched
+        // anything, since no --manifold-extension was given.
+        .stderr(predicates::str::contains("Manifold claim").not())
+        .stderr(predicates::str::contains("trusted-registry fingerprint match").not());
+}
+
+#[test]
 fn watchlist_concurrency_never_exceeds_the_configured_bound() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

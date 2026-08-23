@@ -45,7 +45,7 @@ use super::prepared::PreparedTransaction;
 /// module's and `execution::manifold_registry`'s doc comments for why no
 /// proxy resolution step exists here (unlike thirdweb's per-collection
 /// proxy). Returns `keccak256` of its runtime bytecode.
-async fn resolve_manifold_extension_code_hash(
+pub(crate) async fn resolve_manifold_extension_code_hash(
     client: &RpcClient,
     extension_contract: Address,
 ) -> Result<B256, KairoxError> {

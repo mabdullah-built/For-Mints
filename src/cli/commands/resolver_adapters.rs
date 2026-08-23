@@ -836,6 +836,241 @@ impl MintAdapter for GenericVerifiedContractAdapter<'_> {
     }
 }
 
+/// Auto-discovery for thirdweb Drop claims. `--collection` is the
+/// candidate Drop contract, exactly as for explicit `--engine thirdweb`.
+/// Mirrors [`GenericVerifiedContractAdapter`]'s registry-match discipline
+/// exactly: selector/`eth_call` compatibility is never sufficient on its
+/// own (a custom contract can inherit thirdweb's Drop base extension and
+/// override its execution-affecting hooks -- see
+/// `execution::thirdweb_engine::establish_provenance`'s doc comment).
+/// Only an exact, manually-reviewed
+/// [`crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint`]
+/// match produces `Confidence::High`; a selector-shaped-but-unverified
+/// match is reported as `Confidence::Low` (purely for operator-visible
+/// evidence in an `UNSUPPORTED_PROTOCOL` error -- the resolver already
+/// refuses to auto-select a lone `Low` match, see
+/// `execution::resolver::AdapterRegistry::resolve`).
+///
+/// Same priority tier as [`GenericVerifiedContractAdapter`] (1): both are
+/// bytecode/registry-based resolutions, fundamentally different from
+/// [`NormalizedStageAdapter`]'s stage-timing model, and if a target
+/// somehow matched both a generic *and* a thirdweb trusted fingerprint
+/// that would be a genuine ambiguity worth surfacing, not something to
+/// silently prefer one over the other.
+pub struct ThirdwebAdapter<'a> {
+    pub plan_args: &'a PlanArgs,
+    pub config_path: Option<&'a Path>,
+    pub trusted_registry: &'a [crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint],
+}
+
+#[async_trait::async_trait]
+impl MintAdapter for ThirdwebAdapter<'_> {
+    fn name(&self) -> &'static str {
+        "ThirdwebAdapter"
+    }
+
+    fn priority(&self) -> u8 {
+        1
+    }
+
+    async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
+        let registry = crate::chain::registry::ChainRegistry::builtin();
+        let (resolved, runtime) =
+            resolve_chain_and_runtime(&registry, &self.plan_args.chain_args, self.config_path)?;
+        let client = connect_read_client(
+            &resolved.info,
+            self.plan_args.chain_args.rpc_url.as_ref(),
+            runtime.config.as_ref(),
+        )
+        .await?;
+
+        let (_implementation, bytecode_hash) =
+            crate::execution::thirdweb_engine::resolve_thirdweb_implementation_and_code_hash(
+                &client,
+                self.plan_args.collection,
+            )
+            .await?;
+
+        if let Some(fingerprint) = crate::execution::thirdweb_registry::find_fingerprint(
+            self.trusted_registry,
+            resolved.info.chain_id,
+            bytecode_hash,
+        ) {
+            return Ok(Some(Detection {
+                engine: ResolvedEngine::Thirdweb {
+                    drop_contract: self.plan_args.collection,
+                },
+                evidence: ProtocolEvidence {
+                    source: format!(
+                        "exact trusted-registry fingerprint match {:?} (flavor {:?}, bytecode \
+                         hash {bytecode_hash})",
+                        fingerprint.name, fingerprint.flavor
+                    ),
+                    confidence: Confidence::High,
+                    adapter: "ThirdwebAdapter",
+                    matched_interfaces: vec![],
+                    matched_selectors: vec![],
+                },
+            }));
+        }
+
+        // No registry match -- best-effort selector probing purely for
+        // operator-visible evidence. Never authorizes anything on its own
+        // (Confidence::Low); Ok(None) if the target isn't even
+        // thirdweb-shaped at all.
+        match crate::execution::thirdweb_engine::probe_flavor(&client, self.plan_args.collection)
+            .await
+        {
+            Some((flavor, _condition)) => Ok(Some(Detection {
+                engine: ResolvedEngine::Thirdweb {
+                    drop_contract: self.plan_args.collection,
+                },
+                evidence: ProtocolEvidence {
+                    source: format!(
+                        "selectors matching thirdweb flavor {flavor:?} responded, but no \
+                         trusted-registry fingerprint confirms this is unmodified thirdweb \
+                         execution semantics (bytecode hash {bytecode_hash}); refusing to arm a \
+                         live-send path on unconfirmed evidence"
+                    ),
+                    confidence: Confidence::Low,
+                    adapter: "ThirdwebAdapter",
+                    matched_interfaces: vec![],
+                    matched_selectors: vec![],
+                },
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Auto-discovery for Manifold `LazyPayableClaim` claims. **Deliberately
+/// never attempts full auto-discovery** -- a claim needs three
+/// identifiers (extension contract, creator contract, instance id), and
+/// there is no verified on-chain enumeration of "which
+/// `LazyPayableClaim` extensions are registered against this creator
+/// contract" (Manifold's creator-contract extension registry was not
+/// read/verified this pass -- see `protocol::manifold`'s module doc
+/// comment for what was and wasn't verified). Inventing a discovery
+/// heuristic here would repeat exactly the mistake this codebase already
+/// corrected once for thirdweb: treating unverified compatibility as
+/// proof.
+///
+/// This adapter only ever matches when the operator has *already*
+/// supplied `--manifold-extension` (and, implicitly, `--collection` as
+/// the creator contract, `--instance-id` as usual) alongside
+/// `--engine auto` -- at that point every identifier is already known
+/// exactly as it would be for explicit `--engine manifold`, and this
+/// adapter's only remaining job is the same registry-provenance check
+/// [`ThirdwebAdapter`] performs. Without `--manifold-extension`,
+/// `detect()` returns `Ok(None)` unconditionally, every time -- never a
+/// guess.
+pub struct ManifoldAdapter<'a> {
+    pub plan_args: &'a PlanArgs,
+    pub config_path: Option<&'a Path>,
+    pub trusted_registry: &'a [crate::execution::manifold_registry::ManifoldTrustedFingerprint],
+}
+
+#[async_trait::async_trait]
+impl MintAdapter for ManifoldAdapter<'_> {
+    fn name(&self) -> &'static str {
+        "ManifoldAdapter"
+    }
+
+    fn priority(&self) -> u8 {
+        1
+    }
+
+    async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
+        let Some(extension_contract) = self.plan_args.manifold_extension else {
+            return Ok(None);
+        };
+        let instance_id =
+            crate::cli::format::parse_wei("--instance-id", &self.plan_args.instance_id)?;
+
+        let registry = crate::chain::registry::ChainRegistry::builtin();
+        let (resolved, runtime) =
+            resolve_chain_and_runtime(&registry, &self.plan_args.chain_args, self.config_path)?;
+        let client = connect_read_client(
+            &resolved.info,
+            self.plan_args.chain_args.rpc_url.as_ref(),
+            runtime.config.as_ref(),
+        )
+        .await?;
+
+        let bytecode_hash =
+            crate::execution::manifold_engine::resolve_manifold_extension_code_hash(
+                &client,
+                extension_contract,
+            )
+            .await?;
+
+        if let Some(fingerprint) = crate::execution::manifold_registry::find_fingerprint(
+            self.trusted_registry,
+            resolved.info.chain_id,
+            bytecode_hash,
+        ) {
+            return Ok(Some(Detection {
+                engine: ResolvedEngine::Manifold {
+                    extension_contract,
+                    creator_contract: self.plan_args.collection,
+                    instance_id,
+                },
+                evidence: ProtocolEvidence {
+                    source: format!(
+                        "exact trusted-registry fingerprint match {:?} for Manifold extension {} \
+                         (bytecode hash {bytecode_hash})",
+                        fingerprint.name, extension_contract
+                    ),
+                    confidence: Confidence::High,
+                    adapter: "ManifoldAdapter",
+                    matched_interfaces: vec![],
+                    matched_selectors: vec![],
+                },
+            }));
+        }
+
+        // No registry match -- best-effort claim read purely for
+        // operator-visible evidence, never authorizing anything on its
+        // own.
+        let evidence_source = match crate::execution::manifold_engine::probe_claim(
+            &client,
+            extension_contract,
+            self.plan_args.collection,
+            instance_id,
+        )
+        .await
+        {
+            Some(_claim) => format!(
+                "a Manifold claim was readable at extension {extension_contract} / creator {} / \
+                 instance {instance_id}, but no trusted-registry fingerprint confirms this is an \
+                 unmodified Manifold extension deployment (bytecode hash {bytecode_hash}); \
+                 refusing to arm a live-send path on unconfirmed evidence",
+                self.plan_args.collection
+            ),
+            None => format!(
+                "no readable Manifold claim at extension {extension_contract} / creator {} / \
+                 instance {instance_id}, and no trusted-registry fingerprint match either \
+                 (bytecode hash {bytecode_hash})",
+                self.plan_args.collection
+            ),
+        };
+        Ok(Some(Detection {
+            engine: ResolvedEngine::Manifold {
+                extension_contract,
+                creator_contract: self.plan_args.collection,
+                instance_id,
+            },
+            evidence: ProtocolEvidence {
+                source: evidence_source,
+                confidence: Confidence::Low,
+                adapter: "ManifoldAdapter",
+                matched_interfaces: vec![],
+                matched_selectors: vec![],
+            },
+        }))
+    }
+}
+
 #[cfg(test)]
 mod stage_identity_tests {
     use super::*;

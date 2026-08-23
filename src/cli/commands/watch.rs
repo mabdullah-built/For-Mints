@@ -798,6 +798,20 @@ async fn resolve_watch_engine(
                              candidates, never a Generic-engine target"
                         )
                     }
+                    crate::execution::resolver::ResolvedEngine::Thirdweb { .. } => {
+                        unreachable!(
+                            "resolve_watch_stage_decision only ever discovers NormalizedStage \
+                             candidates, never a Thirdweb-engine target -- watch --engine auto \
+                             does not consider thirdweb at all, exactly like Generic above"
+                        )
+                    }
+                    crate::execution::resolver::ResolvedEngine::Manifold { .. } => {
+                        unreachable!(
+                            "resolve_watch_stage_decision only ever discovers NormalizedStage \
+                             candidates, never a Manifold-engine target -- watch --engine auto \
+                             does not consider Manifold at all, exactly like Generic above"
+                        )
+                    }
                 };
             }
 

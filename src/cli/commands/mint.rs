@@ -102,6 +102,17 @@ async fn select_engine(
                 crate::execution::resolver::ResolvedEngine::Generic { target } => {
                     SelectedEngine::Generic { target }
                 }
+                crate::execution::resolver::ResolvedEngine::Thirdweb { .. } => {
+                    SelectedEngine::Thirdweb
+                }
+                crate::execution::resolver::ResolvedEngine::Manifold {
+                    extension_contract,
+                    instance_id,
+                    ..
+                } => SelectedEngine::Manifold {
+                    extension_contract,
+                    instance_id,
+                },
             })
         }
     }
@@ -121,7 +132,7 @@ pub(crate) async fn resolve_auto_engine(
     excluded_stage_ids: &[crate::domain::stage::StageId],
 ) -> Result<crate::execution::resolver::Detection, KairoxError> {
     use crate::cli::commands::resolver_adapters::{
-        GenericVerifiedContractAdapter, NormalizedStageAdapter,
+        GenericVerifiedContractAdapter, ManifoldAdapter, NormalizedStageAdapter, ThirdwebAdapter,
     };
     use crate::execution::resolver::{AdapterRegistry, MintAdapter};
 
@@ -171,6 +182,16 @@ pub(crate) async fn resolve_auto_engine(
             schema: generic_schema.as_ref(),
             trusted_registry: crate::execution::generic_registry::BUILTIN_REGISTRY,
             metadata_provider: metadata_provider.as_deref(),
+        }) as Box<dyn MintAdapter>,
+        Box::new(ThirdwebAdapter {
+            plan_args,
+            config_path,
+            trusted_registry: crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+        }) as Box<dyn MintAdapter>,
+        Box::new(ManifoldAdapter {
+            plan_args,
+            config_path,
+            trusted_registry: crate::execution::manifold_registry::BUILTIN_REGISTRY,
         }) as Box<dyn MintAdapter>,
     ]);
     registry.resolve().await

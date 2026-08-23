@@ -80,6 +80,25 @@ pub enum ResolvedEngine {
     Generic {
         target: super::generic_engine::ResolvedGenericTarget,
     },
+    /// A thirdweb Drop claim -- only ever produced when the resolved
+    /// implementation's runtime bytecode exactly matched a
+    /// manually-reviewed
+    /// [`super::thirdweb_registry::ThirdwebTrustedFingerprint`]. Selector
+    /// compatibility alone never produces this variant -- see
+    /// `cli::commands::resolver_adapters::ThirdwebAdapter`.
+    Thirdweb {
+        drop_contract: alloy_primitives::Address,
+    },
+    /// A Manifold `LazyPayableClaim` claim -- only ever produced when the
+    /// extension contract's own runtime bytecode exactly matched a
+    /// manually-reviewed
+    /// [`super::manifold_registry::ManifoldTrustedFingerprint`]. See
+    /// `cli::commands::resolver_adapters::ManifoldAdapter`.
+    Manifold {
+        extension_contract: alloy_primitives::Address,
+        creator_contract: alloy_primitives::Address,
+        instance_id: alloy_primitives::U256,
+    },
 }
 
 #[derive(Debug, Clone)]
