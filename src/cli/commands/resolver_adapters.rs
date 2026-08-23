@@ -1182,6 +1182,28 @@ pub(crate) enum ThirdwebDiscoveryError {
         count: alloy_primitives::U256,
         max: u64,
     },
+    /// `getClaimConditionById(id)` failed (reverted, transport error, or
+    /// decode failure) for an id that the list metadata's own
+    /// `[currentStartId, currentStartId + count)` range declares
+    /// authoritatively configured. Enumeration is all-or-nothing: an
+    /// earlier version of this function silently skipped a failed read
+    /// and kept going, which could both hide a real configured phase
+    /// from `watch` and corrupt neighboring phases' effective-end
+    /// derivation (a later phase's start incorrectly attributed as the
+    /// end of an *earlier* phase than the one actually preceding it, if
+    /// a phase in between silently vanished). Refuse outright instead --
+    /// never a partial `Vec`.
+    #[error(
+        "thirdweb Drop at {drop_contract} declares condition id {condition_id} as configured \
+         (within its own [currentStartId, currentStartId + count) range), but reading it via \
+         getClaimConditionById failed ({reason}); refusing to return an incomplete/incorrectly-\
+         bounded stage list"
+    )]
+    ConditionReadFailed {
+        drop_contract: alloy_primitives::Address,
+        condition_id: alloy_primitives::U256,
+        reason: String,
+    },
 }
 
 pub(crate) async fn discover_thirdweb_stages(
@@ -1297,19 +1319,26 @@ pub(crate) async fn discover_thirdweb_stages(
                     max: MAX_THIRDWEB_PHASES,
                 });
             }
+            // ALL-OR-NOTHING: every id in the authoritative
+            // [currentStartId, currentStartId + count) range must read
+            // successfully, or the whole enumeration is refused -- see
+            // ThirdwebDiscoveryError::ConditionReadFailed's doc comment.
             let mut conditions: Vec<(alloy_primitives::U256, ClaimCondition)> = Vec::new();
             let mut id = current_start_id;
             let mut read = alloy_primitives::U256::ZERO;
             while read < count {
-                if let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+                let condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
                     client,
                     drop_contract,
                     id,
                 )
                 .await
-                {
-                    conditions.push((id, condition));
-                }
+                .map_err(|e| ThirdwebDiscoveryError::ConditionReadFailed {
+                    drop_contract,
+                    condition_id: id,
+                    reason: e.to_string(),
+                })?;
+                conditions.push((id, condition));
                 id = id.saturating_add(alloy_primitives::U256::from(1));
                 read = read.saturating_add(alloy_primitives::U256::from(1));
             }
@@ -1668,6 +1697,113 @@ mod thirdweb_manifold_stage_discovery_tests {
         builder
             .error("eth_call", -32000, "execution reverted")
             .build()
+    }
+
+    /// Like [`multi_phase_transport`], but the list metadata declares
+    /// `declared_count` while only the ids in `mocked` (a sparse
+    /// `(id, startTimestamp, merkleRoot)` set) actually have a
+    /// `getClaimConditionById` response registered -- any other id in
+    /// the declared range falls through to a genuine revert, letting
+    /// tests prove all-or-nothing enumeration against a middle or final
+    /// read failure.
+    fn multi_phase_transport_sparse(
+        start_id: u64,
+        declared_count: u64,
+        mocked: &[(u64, u64, alloy_primitives::B256)],
+    ) -> MockTransport {
+        let list_hex = list_metadata_hex(start_id, declared_count);
+        let mut builder = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            );
+        let condition_by_id_prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
+        for (id, start_ts, merkle_root) in mocked {
+            let condition_hex = format!(
+                "0x{}",
+                hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                    &condition_abi(*start_ts, *merkle_root)
+                ))
+            );
+            let suffix = id_suffix(*id);
+            let prefix = condition_by_id_prefix.clone();
+            builder = builder.respond_matching(
+                "eth_call",
+                move |params| {
+                    let data = eth_call_data(params);
+                    data.starts_with(&prefix) && data.ends_with(&suffix)
+                },
+                json!(condition_hex),
+            );
+        }
+        builder
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
+    #[tokio::test]
+    async fn multi_phase_middle_condition_read_failure_fails_closed_with_zero_stages() {
+        // currentStartId = 10, count = 3: id 10 reads, id 11 fails
+        // (no mock registered -- genuinely reverts), id 12 would read if
+        // reached. Enumeration must stop at the first failure and return
+        // zero stages -- id 10 must never be returned with id 12
+        // incorrectly treated as its next boundary.
+        let transport = multi_phase_transport_sparse(
+            10,
+            3,
+            &[
+                (10, 1_700_000_000, alloy_primitives::B256::ZERO),
+                (12, 1_900_000_000, alloy_primitives::B256::ZERO),
+            ],
+        );
+        let client = connect(transport).await;
+
+        let err = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .expect_err("a failed middle condition must fail the whole enumeration closed");
+        match err {
+            ThirdwebDiscoveryError::ConditionReadFailed {
+                drop_contract,
+                condition_id,
+                ..
+            } => {
+                assert_eq!(drop_contract, DROP);
+                assert_eq!(condition_id, alloy_primitives::U256::from(11u64));
+            }
+            other => panic!("expected ConditionReadFailed for id 11, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_phase_final_condition_read_failure_fails_closed_with_zero_stages() {
+        // currentStartId = 10, count = 3: ids 10 and 11 read, id 12
+        // (the last in the declared range) fails.
+        let transport = multi_phase_transport_sparse(
+            10,
+            3,
+            &[
+                (10, 1_700_000_000, alloy_primitives::B256::ZERO),
+                (11, 1_800_000_000, alloy_primitives::B256::ZERO),
+            ],
+        );
+        let client = connect(transport).await;
+
+        let err = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .expect_err("a failed final condition must fail the whole enumeration closed");
+        match err {
+            ThirdwebDiscoveryError::ConditionReadFailed { condition_id, .. } => {
+                assert_eq!(condition_id, alloy_primitives::U256::from(12u64));
+            }
+            other => panic!("expected ConditionReadFailed for id 12, got {other:?}"),
+        }
     }
 
     #[tokio::test]

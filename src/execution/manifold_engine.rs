@@ -111,19 +111,69 @@ pub async fn probe_claim(
 /// -- zero candidates, or more than one, both refuse rather than guess.
 /// `instance_id` must already be known (it is always an explicit,
 /// required operator input -- this function never discovers it).
+/// A typed classification of why [`discover_manifold_extension`] didn't
+/// return exactly one candidate -- distinguishing these states matters:
+/// an RPC/read failure is a genuine infrastructure problem (never
+/// silently treated as "this creator contract has no Manifold claim"),
+/// zero candidates is a real "not applicable here" negative, and
+/// multiple candidates is a genuine ambiguity Kairox must never guess
+/// through. An earlier version of this function collapsed all three into
+/// one untyped `KairoxError::Session`, indistinguishable except by
+/// parsing its message string -- callers that need to react differently
+/// per state (e.g. `watch --engine auto`'s fallback tier) now match on
+/// this enum directly instead.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifoldExtensionDiscoveryError {
+    /// `ICreatorCore::getExtensions()` itself failed (transport error,
+    /// revert, or decode failure) -- not evidence of anything about
+    /// whether this is a genuine Manifold creator contract, just that
+    /// the read could not be completed.
+    #[error(
+        "could not enumerate extensions registered on creator contract {creator_contract} via \
+         ICreatorCore::getExtensions() -- is this a genuine Manifold creator contract? ({reason})"
+    )]
+    ExtensionsReadFailed {
+        creator_contract: Address,
+        reason: String,
+    },
+    /// No registered extension responded like a `LazyPayableClaim`
+    /// extension for this instance id -- either none are registered at
+    /// all, or none matched this specific instance id.
+    #[error(
+        "no extension registered on creator contract {creator_contract} responded like a \
+         LazyPayableClaim extension for instance id {instance_id} (either none are registered \
+         at all, or none matched this instance id); pass --manifold-extension explicitly"
+    )]
+    NoCandidates {
+        creator_contract: Address,
+        instance_id: U256,
+    },
+    /// More than one registered extension responded like a
+    /// `LazyPayableClaim` extension for this instance id -- refusing to
+    /// guess which one is authoritative.
+    #[error(
+        "{} registered extensions on creator contract {creator_contract} all responded like a \
+         LazyPayableClaim extension for instance id {instance_id} ({candidates:?}); refusing to \
+         guess which one -- pass --manifold-extension explicitly",
+        candidates.len()
+    )]
+    AmbiguousCandidates {
+        creator_contract: Address,
+        instance_id: U256,
+        candidates: Vec<Address>,
+    },
+}
+
 pub async fn discover_manifold_extension(
     client: &RpcClient,
     creator_contract: Address,
     instance_id: U256,
-) -> Result<Address, KairoxError> {
+) -> Result<Address, ManifoldExtensionDiscoveryError> {
     let extensions = crate::cli::gather::fetch_manifold_extensions(client, creator_contract)
         .await
-        .map_err(|e| {
-            KairoxError::Session(SessionError::new(format!(
-                "could not enumerate extensions registered on creator contract {creator_contract} \
-                 via ICreatorCore::getExtensions() -- is this a genuine Manifold creator contract? \
-                 ({e})"
-            )))
+        .map_err(|e| ManifoldExtensionDiscoveryError::ExtensionsReadFailed {
+            creator_contract,
+            reason: e.to_string(),
         })?;
 
     let mut candidates = Vec::new();
@@ -138,16 +188,15 @@ pub async fn discover_manifold_extension(
 
     match candidates.len() {
         1 => Ok(candidates[0]),
-        0 => Err(KairoxError::Session(SessionError::new(format!(
-            "no extension registered on creator contract {creator_contract} responded like a \
-             LazyPayableClaim extension for instance id {instance_id} (either none are registered \
-             at all, or none matched this instance id); pass --manifold-extension explicitly"
-        )))),
-        n => Err(KairoxError::Session(SessionError::new(format!(
-            "{n} registered extensions on creator contract {creator_contract} all responded like \
-             a LazyPayableClaim extension for instance id {instance_id} ({candidates:?}); refusing \
-             to guess which one -- pass --manifold-extension explicitly"
-        )))),
+        0 => Err(ManifoldExtensionDiscoveryError::NoCandidates {
+            creator_contract,
+            instance_id,
+        }),
+        _ => Err(ManifoldExtensionDiscoveryError::AmbiguousCandidates {
+            creator_contract,
+            instance_id,
+            candidates,
+        }),
     }
 }
 

@@ -1107,6 +1107,13 @@ async fn resolve_thirdweb_manifold_auto_watch_with_client(
     thirdweb_trusted_registry: &[crate::execution::thirdweb_registry::ThirdwebTrustedFingerprint],
     manifold_trusted_registry: &[crate::execution::manifold_registry::ManifoldTrustedFingerprint],
 ) -> Result<Option<ResolvedWatchEngine>, KairoxError> {
+    // Validate --instance-id before issuing *any* on-chain read (thirdweb
+    // included) -- an explicitly invalid value must stop resolution
+    // outright, not be treated as if the operator had asked for instance
+    // 0, and must never be preceded by a provenance probe that then gets
+    // discarded once the parse failure surfaces.
+    let instance_id = crate::cli::format::parse_wei("--instance-id", &plan_args.instance_id)?;
+
     // THIRDWEB: `target.collection` doubles as the candidate Drop
     // contract, exactly as for explicit `--engine thirdweb`.
     let thirdweb_high = crate::execution::thirdweb_engine::establish_provenance(
@@ -1132,19 +1139,61 @@ async fn resolve_thirdweb_manifold_auto_watch_with_client(
     // `execution::manifold_engine::discover_manifold_extension`'s doc
     // comment for why zero or multiple candidates both refuse rather
     // than guess. This is read-only discovery, never itself a HIGH
-    // signal.
-    let instance_id =
-        crate::cli::format::parse_wei("--instance-id", &plan_args.instance_id).unwrap_or_default();
+    // signal. (instance_id was already validated above, before any
+    // on-chain read.)
+    // Deferred rather than returned immediately: a genuine Manifold-side
+    // discovery problem (RPC/read failure, or raw discovery-level
+    // ambiguity) must never override an already-established thirdweb
+    // answer -- calling `getExtensions()` against a genuine thirdweb Drop
+    // contract that doesn't implement `ICreatorCore` reverts every time,
+    // which is indistinguishable at the RPC layer from a real transport
+    // failure. Surfaced as a hard error only in the branch where nothing
+    // else (not even low-confidence thirdweb evidence) explains the
+    // target -- see the `(false, false)` arm below.
+    let mut manifold_discovery_error: Option<KairoxError> = None;
     let manifold_extension = if let Some(extension) = plan_args.manifold_extension {
         Some(extension)
     } else {
-        crate::execution::manifold_engine::discover_manifold_extension(
+        match crate::execution::manifold_engine::discover_manifold_extension(
             client,
             target.collection,
             instance_id,
         )
         .await
-        .ok()
+        {
+            Ok(extension) => Some(extension),
+            Err(
+                crate::execution::manifold_engine::ManifoldExtensionDiscoveryError::NoCandidates {
+                    ..
+                },
+            ) => None,
+            Err(
+                err @ crate::execution::manifold_engine::ManifoldExtensionDiscoveryError::AmbiguousCandidates {
+                    ..
+                },
+            ) => {
+                manifold_discovery_error = Some(KairoxError::Session(SessionError::with_kind(
+                    SessionErrorKind::AmbiguousProtocol,
+                    format!(
+                        "Manifold extension discovery on creator contract {:#x} was itself \
+                         ambiguous: {err}",
+                        target.collection
+                    ),
+                )));
+                None
+            }
+            Err(
+                err @ crate::execution::manifold_engine::ManifoldExtensionDiscoveryError::ExtensionsReadFailed {
+                    ..
+                },
+            ) => {
+                manifold_discovery_error = Some(KairoxError::Session(SessionError::new(format!(
+                    "could not resolve Manifold extension for creator contract {:#x}: {err}",
+                    target.collection
+                ))));
+                None
+            }
+        }
     };
     let manifold_high = if let Some(extension) = manifold_extension {
         crate::execution::manifold_engine::establish_provenance(
@@ -1244,6 +1293,18 @@ async fn resolve_thirdweb_manifold_auto_watch_with_client(
             }
         }
         (false, false) => {
+            // Only surface Manifold's own discovery-level problem as a
+            // hard error when there is truly no other explanation for
+            // this target -- not even low-confidence thirdweb evidence.
+            // When thirdweb_low is true, the target is already
+            // adequately explained (thirdweb-shaped but untrusted) and
+            // reported as such below; a failed, unrelated Manifold probe
+            // against the same address adds no new information.
+            if let Some(err) = manifold_discovery_error
+                && !thirdweb_low
+            {
+                return Err(err);
+            }
             if thirdweb_low || manifold_low {
                 Err(KairoxError::Session(SessionError::with_kind(
                     SessionErrorKind::UnsupportedProtocol,
@@ -3382,6 +3443,216 @@ mod auto_watch_thirdweb_manifold_routing_tests {
         );
     }
 
+    /// Micro-gate item 2: an explicitly invalid --instance-id must never
+    /// silently become U256::ZERO -- it must stop resolution outright,
+    /// before any extension discovery, provenance probe, or signing is
+    /// attempted.
+    #[tokio::test]
+    async fn invalid_instance_id_stops_resolution_before_any_discovery() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let mut t = target(CREATOR);
+        t.instance_id = "not-a-number".to_string();
+        let plan_args = t.to_plan_args();
+
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[thirdweb_fingerprint()],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("instance-id"));
+        assert!(
+            capture.calls_for("eth_call").is_empty(),
+            "an invalid --instance-id must stop resolution before any on-chain read is attempted, \
+             got eth_call: {:?}",
+            capture.calls_for("eth_call")
+        );
+    }
+
+    /// Micro-gate item 3, zero-candidates case: `getExtensions()` finds
+    /// nothing that responds like a `LazyPayableClaim` for this instance
+    /// id, and thirdweb evidence is entirely absent too -- this must
+    /// fall through to `Ok(None)` (a real "not applicable" negative),
+    /// never an error, and never a false "ambiguous"/"unsupported".
+    #[tokio::test]
+    async fn manifold_zero_candidates_is_not_applicable_not_an_error() {
+        let no_extensions_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::manifold::getExtensionsCall::abi_encode_returns(
+                    &Vec::<Address>::new()
+                )
+            )
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getExtensionsCall::SELECTOR,
+                json!(no_extensions_hex),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+        let t = target(CREATOR);
+        let plan_args = t.to_plan_args();
+
+        let resolved = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[thirdweb_fingerprint()],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// Micro-gate item 3, one-candidate case: exactly one extension
+    /// responds like a `LazyPayableClaim` for this instance id --
+    /// discovery must continue on to trusted-provenance establishment
+    /// (not stop, not error) exactly as before.
+    #[tokio::test]
+    async fn manifold_one_candidate_continues_to_trusted_provenance() {
+        let client = connect(manifold_high_transport()).await;
+        let t = target(CREATOR);
+        let plan_args = t.to_plan_args();
+        let resolved = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap();
+        match resolved {
+            Some(ResolvedWatchEngine::Manifold {
+                extension_contract, ..
+            }) => assert_eq!(extension_contract, EXTENSION),
+            other => panic!("expected Some(ResolvedWatchEngine::Manifold), got {other:?}"),
+        }
+    }
+
+    /// Micro-gate item 3, multiple-candidates case: more than one
+    /// extension registered on the creator contract responds like a
+    /// `LazyPayableClaim` for this instance id -- discovery itself is
+    /// ambiguous, and this must fail closed with `AmbiguousProtocol`
+    /// immediately, independent of whatever thirdweb evidence (or lack
+    /// of it) exists for the same address.
+    #[tokio::test]
+    async fn manifold_multiple_candidates_is_ambiguous_protocol() {
+        const EXTENSION_B: Address = address!("3333333333333333333333333333333333333333");
+        let extensions_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::manifold::getExtensionsCall::abi_encode_returns(&vec![
+                    EXTENSION,
+                    EXTENSION_B
+                ])
+            )
+        );
+        let claim_hex = format!(
+            "0x{}",
+            hex::encode(crate::protocol::manifold::getClaimCall::abi_encode_returns(
+                &manifold_claim_abi()
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getExtensionsCall::SELECTOR,
+                json!(extensions_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getClaimCall::SELECTOR,
+                json!(claim_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getTotalMintsCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::getTotalMintsCall::abi_encode_returns(&0u32)
+                    )
+                )),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+        let t = target(CREATOR);
+        let plan_args = t.to_plan_args();
+
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[thirdweb_fingerprint()],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::AmbiguousProtocol
+        );
+    }
+
+    /// Micro-gate item 3, RPC/read-failure case: `getExtensions()`
+    /// itself fails -- this must propagate as an explicit read/
+    /// resolution error, never be silently swallowed into
+    /// "unsupported"/`Ok(None)`.
+    #[tokio::test]
+    async fn manifold_extensions_read_failure_is_an_explicit_error() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+        let t = target(CREATOR);
+        let plan_args = t.to_plan_args();
+
+        let err = resolve_thirdweb_manifold_auto_watch_with_client(
+            &client,
+            1,
+            &t,
+            &plan_args,
+            true,
+            &[],
+            &[manifold_fingerprint()],
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("could not resolve Manifold extension")
+                || message.contains("could not enumerate extensions"),
+            "expected an explicit read-failure error, got: {message}"
+        );
+        assert_ne!(
+            err.code(),
+            crate::execution::errors::KairoxErrorCode::UnsupportedProtocol,
+            "an RPC/read failure must never be reported as if it were simply unsupported"
+        );
+    }
+
     #[tokio::test]
     async fn two_high_confidence_candidates_is_ambiguous_never_a_silent_pick() {
         // A single target address that is simultaneously trusted-
@@ -3637,6 +3908,183 @@ mod auto_watch_thirdweb_manifold_routing_tests {
             .build()
     }
 
+    /// Like [`thirdweb_rehearsal_transport`], but the single mocked
+    /// condition is caller-supplied -- lets allowlist-focused tests set
+    /// a nonzero `merkleRoot` (a gated stage) while reusing every other
+    /// mocked read unchanged.
+    fn gated_thirdweb_transport(condition: ClaimConditionAbi) -> MockTransport {
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition
+            ))
+        );
+        MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getClaimConditionByIdCall::SELECTOR,
+                json!(condition_hex),
+            )
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
+    /// Like [`gated_thirdweb_transport`], but the mocked condition's
+    /// `merkleRoot` genuinely changes partway through the call sequence:
+    /// the first two `getClaimConditionById` reads (the pre-wait
+    /// "still discoverable" confirmation in `run_thirdweb_watch_with_pool`,
+    /// then `wait_for_stage`'s own arm-time probe -- empirically confirmed
+    /// call counts, see the sibling non-dynamic full-watch rehearsal
+    /// tests) return `root_at_arm`; every read from the third call onward
+    /// (the fresh T0 signing-time read inside
+    /// `execution::thirdweb_engine::prepare_thirdweb_transaction`) returns
+    /// `root_at_t0` instead. Proves a merkle root that changes between
+    /// arm and T0 is caught by the real T0 re-verification path, not
+    /// merely the earlier "is this stage still discoverable" check.
+    fn gated_thirdweb_transport_root_changes_before_t0(
+        root_at_arm: alloy_primitives::B256,
+        root_at_t0: alloy_primitives::B256,
+    ) -> MockTransport {
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let mut condition_at_arm = active_condition_abi();
+        condition_at_arm.merkleRoot = root_at_arm;
+        let mut condition_at_t0 = active_condition_abi();
+        condition_at_t0.merkleRoot = root_at_t0;
+        let condition_at_arm_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition_at_arm
+            ))
+        );
+        let condition_at_t0_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition_at_t0
+            ))
+        );
+        let get_condition_by_id_calls = std::sync::atomic::AtomicUsize::new(0);
+        let selector_prefix = format!("0x{}", hex::encode(tw::getClaimConditionByIdCall::SELECTOR));
+        let list_prefix = format!("0x{}", hex::encode(tw::claimConditionCall::SELECTOR));
+        let active_id_prefix = format!(
+            "0x{}",
+            hex::encode(tw::getActiveClaimConditionIdCall::SELECTOR)
+        );
+        let supply_prefix = format!(
+            "0x{}",
+            hex::encode(tw::getSupplyClaimedByWalletCall::SELECTOR)
+        );
+        MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_dynamic("eth_call", move |params| {
+                let data = params
+                    .get(0)
+                    .and_then(|c| c.get("data"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if data.starts_with(&list_prefix) {
+                    json!(list_hex)
+                } else if data.starts_with(&selector_prefix) {
+                    let idx =
+                        get_condition_by_id_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if idx < 2 {
+                        json!(condition_at_arm_hex)
+                    } else {
+                        json!(condition_at_t0_hex)
+                    }
+                } else if data.starts_with(&active_id_prefix) {
+                    json!(format!(
+                        "0x{}",
+                        hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                            &alloy_primitives::U256::ZERO
+                        ))
+                    ))
+                } else if data.starts_with(&supply_prefix) {
+                    json!(format!(
+                        "0x{}",
+                        hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                            &alloy_primitives::U256::ZERO
+                        ))
+                    ))
+                } else {
+                    json!(null)
+                }
+            })
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build()
+    }
+
     fn test_signer() -> crate::signing::signer::LocalSigner {
         crate::signing::signer::LocalSigner::from_bytes(
             keccak256(b"kairox-watch-full-pipeline-test-key").0,
@@ -3748,6 +4196,331 @@ mod auto_watch_thirdweb_manifold_routing_tests {
         );
     }
 
+    /// Micro-gate item 4, THIRDWEB: the prior full-watch rehearsal tests
+    /// above use an already-active `startTimestamp`, which never actually
+    /// exercises the waiting loop -- "future" in name only. This test
+    /// mocks a condition whose `startTimestamp` is genuinely in the
+    /// future (a real few hundred ms ahead of wall-clock `now`) and uses
+    /// a short `poll_interval`/`arm_threshold` so the test completes
+    /// quickly while still forcing `wait_for_stage` to actually block.
+    /// Proof the transition is real, not assumed: an independent
+    /// `discover_thirdweb_stages` read taken *before* the watch call
+    /// starts shows `NotStarted` (real `now` is provably still short of
+    /// the mocked start); `wait_for_stage`'s own first-iteration check
+    /// (`remaining > arm_threshold` given the ~250ms gap set up here,
+    /// which is far larger than the 5ms `arm_threshold`) can only take
+    /// its `Waiting`+sleep branch, which is reachable only while the
+    /// stage has not yet reached the arm threshold, i.e. is still
+    /// `NotStarted` at that first poll; and a second independent
+    /// `discover_thirdweb_stages` read taken *after* the watch call
+    /// returns shows `Active` -- proving real wall-clock time provably
+    /// crossed the mocked T0 while the wait was in progress. Continues
+    /// on through fresh T0 reads, trusted provenance, sign/serialize,
+    /// and rehearsal completion with zero broadcast, exactly like the
+    /// already-active variant above.
+    #[tokio::test]
+    async fn thirdweb_full_watch_genuinely_observes_not_started_then_active_before_signing() {
+        let signer = test_signer();
+        // Integer-second on-chain timestamps can't express sub-second
+        // offsets -- add 2 whole seconds to `now`'s truncated unix
+        // timestamp so the mocked start is guaranteed to still be in the
+        // future (by at least ~1s, at most ~2s) after truncation, not
+        // rounded down into the past or the current second.
+        let start =
+            OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + 2)
+                .unwrap();
+        let mut condition = active_condition_abi();
+        condition.startTimestamp = alloy_primitives::U256::from(start.unix_timestamp() as u64);
+
+        let list_hex = format!(
+            "0x{}",
+            hex::encode(
+                tw::multi_phase_list::claimConditionCall::abi_encode_returns(
+                    &tw::multi_phase_list::claimConditionReturn {
+                        currentStartId: alloy_primitives::U256::ZERO,
+                        count: alloy_primitives::U256::from(1u64),
+                    }
+                )
+            )
+        );
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .respond_eth_call_selector(
+                tw::getClaimConditionByIdCall::SELECTOR,
+                json!(condition_hex),
+            )
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getStorageAt",
+                json!(format!("0x{}", hex::encode([0u8; 32]))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+
+        let pre_stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+            &client,
+            DROP,
+            signer.address(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pre_stages.len(), 1);
+        assert!(
+            matches!(
+                pre_stages[0].status(OffsetDateTime::now_utc()),
+                StageStatus::NotStarted { .. }
+            ),
+            "test setup bug: the mocked condition must genuinely not have started yet at the \
+             point the watch call begins"
+        );
+
+        let stage_id = crate::domain::stage::StageId::ThirdwebMultiPhase {
+            drop_contract: DROP,
+            condition_id: alloy_primitives::U256::ZERO,
+            config_fingerprint: crate::protocol::thirdweb::ClaimCondition::from_abi(condition)
+                .unwrap()
+                .config_fingerprint(),
+        };
+        let mut t = target(DROP);
+        t.wallet = signer.address();
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+        let poll_config = WatchPollConfig {
+            poll_interval: StdDuration::from_millis(100),
+            arm_threshold: time::Duration::milliseconds(200),
+            max_consecutive_retryable_errors: 20,
+        };
+
+        let outcome = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &poll_config,
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.broadcast_summary,
+            crate::execution::broadcast::BroadcastSummary::NotSent
+        );
+        assert!(outcome.receipt_state.is_none());
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "rehearsal must never call eth_sendRawTransaction"
+        );
+
+        let read_client = pool.preferred_read().unwrap();
+        let post_stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+            read_client,
+            DROP,
+            signer.address(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(post_stages.len(), 1);
+        assert!(
+            matches!(
+                post_stages[0].status(OffsetDateTime::now_utc()),
+                StageStatus::Active { .. }
+            ),
+            "real wall-clock time must have genuinely crossed the mocked T0 while the watch call \
+             was waiting -- the same fixed mocked startTimestamp now reads as Active"
+        );
+    }
+
+    /// Same requirement and proof structure, Manifold.
+    #[tokio::test]
+    async fn manifold_full_watch_genuinely_observes_not_started_then_active_before_signing() {
+        let signer = test_signer();
+        // Integer-second on-chain timestamps can't express sub-second
+        // offsets -- add 2 whole seconds to `now`'s truncated unix
+        // timestamp so the mocked start is guaranteed to still be in the
+        // future (by at least ~1s, at most ~2s) after truncation, not
+        // rounded down into the past or the current second.
+        let start =
+            OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + 2)
+                .unwrap();
+        let extensions_hex = format!(
+            "0x{}",
+            hex::encode(
+                crate::protocol::manifold::getExtensionsCall::abi_encode_returns(&vec![EXTENSION])
+            )
+        );
+        let mut claim = manifold_claim_abi();
+        claim.startDate = alloy_primitives::U256::from(start.unix_timestamp() as u64);
+        claim.endDate = alloy_primitives::U256::from(start.unix_timestamp() as u64 + 200_000_000);
+        let claim_hex = format!(
+            "0x{}",
+            hex::encode(crate::protocol::manifold::getClaimCall::abi_encode_returns(
+                &claim
+            ))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getExtensionsCall::SELECTOR,
+                json!(extensions_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getClaimCall::SELECTOR,
+                json!(claim_hex),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::getTotalMintsCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::getTotalMintsCall::abi_encode_returns(&0u32)
+                    )
+                )),
+            )
+            .respond_eth_call_selector(
+                crate::protocol::manifold::MEMBERSHIP_ADDRESSCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        crate::protocol::manifold::MEMBERSHIP_ADDRESSCall::abi_encode_returns(
+                            &Address::ZERO
+                        )
+                    )
+                )),
+            )
+            .respond(
+                "eth_getCode",
+                json!(format!("0x{}", hex::encode(mock_implementation_bytecode()))),
+            )
+            .respond(
+                "eth_getBlockByNumber",
+                json!({"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x3b9aca00"}),
+            )
+            .respond("eth_maxPriorityFeePerGas", json!("0x3b9aca00"))
+            .respond("eth_getTransactionCount", json!("0x1"))
+            .respond("eth_getBalance", json!("0xde0b6b3a7640000"))
+            .respond("eth_estimateGas", json!("0x2bf20"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+
+        let pre_stage = crate::cli::commands::resolver_adapters::discover_manifold_stage(
+            &client,
+            EXTENSION,
+            CREATOR,
+            alloy_primitives::U256::ZERO,
+            signer.address(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                pre_stage.status(OffsetDateTime::now_utc()),
+                StageStatus::NotStarted { .. }
+            ),
+            "test setup bug: the mocked claim must genuinely not have started yet at the point \
+             the watch call begins"
+        );
+
+        let mut t = target(CREATOR);
+        t.wallet = signer.address();
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+        let poll_config = WatchPollConfig {
+            poll_interval: StdDuration::from_millis(100),
+            arm_threshold: time::Duration::milliseconds(200),
+            max_consecutive_retryable_errors: 20,
+        };
+
+        let outcome = run_manifold_watch_with_pool(
+            &pool,
+            &t,
+            EXTENSION,
+            CREATOR,
+            alloy_primitives::U256::ZERO,
+            &poll_config,
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[manifold_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.broadcast_summary,
+            crate::execution::broadcast::BroadcastSummary::NotSent
+        );
+        assert!(outcome.receipt_state.is_none());
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "rehearsal must never call eth_sendRawTransaction"
+        );
+
+        let read_client = pool.preferred_read().unwrap();
+        let post_stage = crate::cli::commands::resolver_adapters::discover_manifold_stage(
+            read_client,
+            EXTENSION,
+            CREATOR,
+            alloy_primitives::U256::ZERO,
+            signer.address(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                post_stage.status(OffsetDateTime::now_utc()),
+                StageStatus::Active { .. }
+            ),
+            "real wall-clock time must have genuinely crossed the mocked T0 while the watch call \
+             was waiting -- the same fixed mocked startDate now reads as Active"
+        );
+    }
+
     /// Section 6: AUTO + trusted protocol + future GATED stage +
     /// legitimate operator-supplied allowlist proof + wait + T0
     /// revalidation + signing + rehearsal + zero broadcast, exercising
@@ -3770,8 +4543,18 @@ mod auto_watch_thirdweb_manifold_routing_tests {
         );
         let sibling = alloy_primitives::B256::repeat_byte(0x42);
         let root = crate::protocol::seadrop_crypto::commutative_keccak256(leaf, sibling);
+        // Genuinely future, not the already-active fixture the other
+        // composition-level tests use -- this test's whole point (micro-
+        // gate item 4) is proving AUTO + allowlist rehearses successfully
+        // across a real NotStarted -> Active transition, not merely an
+        // already-open gated stage.
+        let start =
+            OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + 2)
+                .unwrap();
         let mut gated_condition = active_condition_abi();
         gated_condition.merkleRoot = root;
+        gated_condition.startTimestamp =
+            alloy_primitives::U256::from(start.unix_timestamp() as u64);
 
         let list_hex = format!(
             "0x{}",
@@ -3864,13 +4647,36 @@ mod auto_watch_thirdweb_manifold_routing_tests {
             other => panic!("expected Some(ResolvedWatchEngine::Thirdweb), got {other:?}"),
         };
 
+        let pre_stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+            &client, DROP, wallet,
+        )
+        .await
+        .unwrap();
+        let pre_stage = pre_stages
+            .iter()
+            .find(|s| s.id == stage_id)
+            .expect("auto-resolved stage must be among discovery's own results");
+        assert!(
+            matches!(
+                pre_stage.status(OffsetDateTime::now_utc()),
+                StageStatus::NotStarted { .. }
+            ),
+            "test setup bug: the mocked gated condition must genuinely not have started yet at \
+             the point the watch call begins"
+        );
+
         let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+        let poll_config = WatchPollConfig {
+            poll_interval: StdDuration::from_millis(100),
+            arm_threshold: time::Duration::milliseconds(200),
+            max_consecutive_retryable_errors: 20,
+        };
         let outcome = run_thirdweb_watch_with_pool(
             &pool,
             &t,
             DROP,
             &stage_id,
-            &WatchPollConfig::default(),
+            &poll_config,
             &chain_info(),
             &signer,
             safety_caps(),
@@ -3889,6 +4695,281 @@ mod auto_watch_thirdweb_manifold_routing_tests {
             capture.calls_for("eth_sendRawTransaction").is_empty(),
             "rehearsal must never call eth_sendRawTransaction, even for a successfully-proven \
              gated auto-resolved stage"
+        );
+
+        let read_client = pool.preferred_read().unwrap();
+        let post_stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+            read_client,
+            DROP,
+            wallet,
+        )
+        .await
+        .unwrap();
+        let post_stage = post_stages
+            .iter()
+            .find(|s| s.id == stage_id)
+            .expect("the same gated stage must still be discoverable after the watch call");
+        assert!(
+            matches!(
+                post_stage.status(OffsetDateTime::now_utc()),
+                StageStatus::Active { .. }
+            ),
+            "real wall-clock time must have genuinely crossed the mocked T0 while the watch call \
+             was waiting -- the same fixed mocked startTimestamp now reads as Active"
+        );
+    }
+
+    /// Micro-gate item 5: allowlist negative regressions at the WATCH
+    /// integration level (`run_thirdweb_watch_with_pool`, not merely the
+    /// engine's own `resolve_effective_claim` unit tests) -- missing
+    /// proof on a genuinely gated (nonzero `merkleRoot`) stage must fail
+    /// closed before any signing, and never call `eth_sendRawTransaction`.
+    #[tokio::test]
+    async fn watch_missing_allowlist_proof_on_gated_stage_fails_closed() {
+        let signer = test_signer();
+        let leaf = crate::protocol::thirdweb::allowlist_leaf(
+            signer.address(),
+            alloy_primitives::U256::ZERO,
+            crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
+            Address::ZERO,
+        );
+        let sibling = alloy_primitives::B256::repeat_byte(0x42);
+        let root = crate::protocol::seadrop_crypto::commutative_keccak256(leaf, sibling);
+        let mut condition = active_condition_abi();
+        condition.merkleRoot = root;
+
+        let transport = gated_thirdweb_transport(condition.clone());
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+
+        let stage_id = crate::domain::stage::StageId::ThirdwebMultiPhase {
+            drop_contract: DROP,
+            condition_id: alloy_primitives::U256::ZERO,
+            config_fingerprint: crate::protocol::thirdweb::ClaimCondition::from_abi(condition)
+                .unwrap()
+                .config_fingerprint(),
+        };
+        let mut t = target(DROP);
+        t.wallet = signer.address();
+        t.allowlist_proof = Vec::new(); // no proof supplied at all
+
+        let err = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap_err();
+        let _ = err;
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "a missing proof on a gated stage must never reach signing/broadcast"
+        );
+    }
+
+    /// Same requirement, wrong proof (a syntactically valid but
+    /// non-matching sibling) -- must also fail closed before signing.
+    #[tokio::test]
+    async fn watch_wrong_allowlist_proof_on_gated_stage_fails_closed() {
+        let signer = test_signer();
+        let leaf = crate::protocol::thirdweb::allowlist_leaf(
+            signer.address(),
+            alloy_primitives::U256::ZERO,
+            crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
+            Address::ZERO,
+        );
+        let sibling = alloy_primitives::B256::repeat_byte(0x42);
+        let root = crate::protocol::seadrop_crypto::commutative_keccak256(leaf, sibling);
+        let mut condition = active_condition_abi();
+        condition.merkleRoot = root;
+
+        let transport = gated_thirdweb_transport(condition.clone());
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+
+        let stage_id = crate::domain::stage::StageId::ThirdwebMultiPhase {
+            drop_contract: DROP,
+            condition_id: alloy_primitives::U256::ZERO,
+            config_fingerprint: crate::protocol::thirdweb::ClaimCondition::from_abi(condition)
+                .unwrap()
+                .config_fingerprint(),
+        };
+        let mut t = target(DROP);
+        t.wallet = signer.address();
+        // A syntactically valid but unrelated sibling -- does not verify
+        // against `root`.
+        t.allowlist_proof = vec![format!(
+            "0x{}",
+            hex::encode(alloy_primitives::B256::repeat_byte(0x99))
+        )];
+
+        let err = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap_err();
+        let _ = err;
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "a non-verifying proof on a gated stage must never reach signing/broadcast"
+        );
+    }
+
+    /// Same requirement, a proof that verifies for a *different* wallet
+    /// than the one this watch attempt is armed for -- must also fail
+    /// closed, never silently accepted because *some* wallet's leaf
+    /// combines with the supplied sibling to the on-chain root.
+    #[tokio::test]
+    async fn watch_allowlist_proof_for_wrong_wallet_fails_closed() {
+        let signer = test_signer();
+        let other_wallet = address!("4444444444444444444444444444444444444444");
+        assert_ne!(other_wallet, signer.address());
+
+        // A tree containing `other_wallet`'s leaf, not this attempt's
+        // configured wallet's.
+        let other_leaf = crate::protocol::thirdweb::allowlist_leaf(
+            other_wallet,
+            alloy_primitives::U256::ZERO,
+            crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
+            Address::ZERO,
+        );
+        let sibling = alloy_primitives::B256::repeat_byte(0x42);
+        let root = crate::protocol::seadrop_crypto::commutative_keccak256(other_leaf, sibling);
+        let mut condition = active_condition_abi();
+        condition.merkleRoot = root;
+
+        let transport = gated_thirdweb_transport(condition.clone());
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+
+        let stage_id = crate::domain::stage::StageId::ThirdwebMultiPhase {
+            drop_contract: DROP,
+            condition_id: alloy_primitives::U256::ZERO,
+            config_fingerprint: crate::protocol::thirdweb::ClaimCondition::from_abi(condition)
+                .unwrap()
+                .config_fingerprint(),
+        };
+        let mut t = target(DROP);
+        t.wallet = signer.address(); // NOT other_wallet
+        t.allowlist_proof = vec![format!("0x{}", hex::encode(sibling))];
+
+        let err = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap_err();
+        let _ = err;
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "a proof that only verifies for a different wallet must never reach signing/broadcast"
+        );
+    }
+
+    /// Micro-gate item 5's mandatory changed-root case: the merkle root
+    /// this attempt armed against genuinely differs from what's on-chain
+    /// at the T0 signing-time re-read (not merely at the earlier
+    /// discoverability check). In practice this is caught by
+    /// `resolve_effective_claim`'s own proof-verification-against-fresh-
+    /// on-chain-root check (a proof valid against the old root will not
+    /// verify against the new one) firing before the separate
+    /// `StageChangedBeforeSigning` config-fingerprint check even runs --
+    /// either is a correct fail-closed outcome for a changed root; what
+    /// matters is that the T0 path is reached with a genuinely valid-at-
+    /// arm-time proof and it still refuses to sign once the root has
+    /// moved.
+    #[tokio::test]
+    async fn watch_merkle_root_changed_between_arm_and_t0_fails_closed_before_signing() {
+        let signer = test_signer();
+        let leaf = crate::protocol::thirdweb::allowlist_leaf(
+            signer.address(),
+            alloy_primitives::U256::ZERO,
+            crate::execution::thirdweb_engine::NO_PRICE_OVERRIDE,
+            Address::ZERO,
+        );
+        let sibling = alloy_primitives::B256::repeat_byte(0x42);
+        let root_at_arm = crate::protocol::seadrop_crypto::commutative_keccak256(leaf, sibling);
+        let root_at_t0 = alloy_primitives::B256::repeat_byte(0x77);
+        assert_ne!(root_at_arm, root_at_t0);
+
+        let transport = gated_thirdweb_transport_root_changes_before_t0(root_at_arm, root_at_t0);
+        let capture = transport.capture_handle();
+        let client = connect(transport).await;
+        let pool = crate::chain::pool::RpcPool::from_clients(1, vec![client]);
+
+        let mut condition_at_arm = active_condition_abi();
+        condition_at_arm.merkleRoot = root_at_arm;
+        let stage_id = crate::domain::stage::StageId::ThirdwebMultiPhase {
+            drop_contract: DROP,
+            condition_id: alloy_primitives::U256::ZERO,
+            config_fingerprint: crate::protocol::thirdweb::ClaimCondition::from_abi(
+                condition_at_arm,
+            )
+            .unwrap()
+            .config_fingerprint(),
+        };
+        let mut t = target(DROP);
+        t.wallet = signer.address();
+        // A genuinely valid proof against `root_at_arm` -- proves the
+        // failure is specifically the root-change detection, not just
+        // "any invalid proof fails".
+        t.allowlist_proof = vec![format!("0x{}", hex::encode(sibling))];
+
+        let err = run_thirdweb_watch_with_pool(
+            &pool,
+            &t,
+            DROP,
+            &stage_id,
+            &WatchPollConfig::default(),
+            &chain_info(),
+            &signer,
+            safety_caps(),
+            &[thirdweb_fingerprint()],
+            &ExecutionProfile::for_chain(1),
+            true, // rehearsal
+        )
+        .await
+        .unwrap_err();
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("merkleRoot") || message.contains("proof"),
+            "expected an on-chain-root/proof-verification failure caused by the changed root, \
+             got: {message}"
+        );
+        assert!(
+            capture.calls_for("eth_sendRawTransaction").is_empty(),
+            "a merkle root that changed between arm and T0 must never reach signing/broadcast"
         );
     }
 }

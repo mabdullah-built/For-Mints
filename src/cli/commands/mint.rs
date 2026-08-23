@@ -100,7 +100,8 @@ async fn select_engine(
                             args.plan_args.collection,
                             instance_id,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| KairoxError::Session(SessionError::new(e.to_string())))?;
                     eprintln!(
                         "auto-discovered Manifold extension {extension_contract} for creator \
                          contract {} via ICreatorCore::getExtensions() (exactly one candidate \
