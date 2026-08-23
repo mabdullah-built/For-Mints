@@ -154,8 +154,17 @@ pub enum EngineSelection {
     /// `--collection` is the creator (NFT) contract, `--manifold-extension`
     /// is the shared `LazyPayableClaim` extension contract (the actual
     /// `eth_call`/`eth_sendTransaction` target), and `--instance-id`
-    /// selects the specific claim on that creator contract. Explicit-only
-    /// -- not yet part of `--engine auto`'s resolution.
+    /// selects the specific claim on that creator contract.
+    /// `--manifold-extension` may be omitted -- it is then auto-discovered
+    /// via `ICreatorCore::getExtensions()`, but only when exactly one
+    /// registered extension responds like a `LazyPayableClaim` for the
+    /// given `--instance-id` (verified against real Manifold Creator Core
+    /// source; see `protocol::manifold`'s module doc comment). This is
+    /// **partial** auto-discovery only: `--instance-id` itself is never
+    /// auto-discovered (no on-chain enumeration of claim instances exists
+    /// to verify against), so this engine is never "fully automatic" even
+    /// with `--manifold-extension` omitted. Explicit-only -- not yet part
+    /// of `--engine auto`'s resolution.
     Manifold,
 }
 
@@ -184,10 +193,11 @@ pub struct PlanArgs {
     #[arg(long)]
     pub generic_schema: Option<std::path::PathBuf>,
     /// The Manifold `LazyPayableClaim` extension contract address.
-    /// Required for --engine manifold; ignored otherwise. `--collection`
-    /// continues to mean the creator (NFT) contract, exactly as for every
-    /// other engine -- see `EngineSelection::Manifold`'s doc comment for
-    /// why Manifold needs this extra identifier.
+    /// Optional for --engine manifold -- when omitted, auto-discovered via
+    /// `ICreatorCore::getExtensions()` if and only if exactly one
+    /// candidate is found (see `EngineSelection::Manifold`'s doc comment);
+    /// ignored for every other engine. `--collection` continues to mean
+    /// the creator (NFT) contract, exactly as for every other engine.
     #[arg(long)]
     pub manifold_extension: Option<Address>,
     /// The Manifold claim `instanceId` on the creator contract. Only

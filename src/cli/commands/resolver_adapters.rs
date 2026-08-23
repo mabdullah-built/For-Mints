@@ -943,27 +943,24 @@ impl MintAdapter for ThirdwebAdapter<'_> {
     }
 }
 
-/// Auto-discovery for Manifold `LazyPayableClaim` claims. **Deliberately
-/// never attempts full auto-discovery** -- a claim needs three
-/// identifiers (extension contract, creator contract, instance id), and
-/// there is no verified on-chain enumeration of "which
-/// `LazyPayableClaim` extensions are registered against this creator
-/// contract" (Manifold's creator-contract extension registry was not
-/// read/verified this pass -- see `protocol::manifold`'s module doc
-/// comment for what was and wasn't verified). Inventing a discovery
-/// heuristic here would repeat exactly the mistake this codebase already
-/// corrected once for thirdweb: treating unverified compatibility as
-/// proof.
+/// Auto-discovery for Manifold `LazyPayableClaim` claims. **Partial
+/// auto-discovery only** -- a claim needs three identifiers (extension
+/// contract, creator contract, instance id). The extension contract can
+/// be auto-discovered via `ICreatorCore::getExtensions()` (a real,
+/// bounded, on-chain enumeration -- see
+/// `execution::manifold_engine::discover_manifold_extension` and
+/// `protocol::manifold`'s module doc comment) when exactly one registered
+/// extension responds like a `LazyPayableClaim` for the given
+/// `--instance-id`. There is still no verified on-chain enumeration of
+/// instance ids themselves, so `--instance-id` is never auto-discovered
+/// -- inventing a heuristic for that would repeat exactly the mistake
+/// this codebase already corrected once for thirdweb: treating
+/// unverified compatibility as proof.
 ///
-/// This adapter only ever matches when the operator has *already*
-/// supplied `--manifold-extension` (and, implicitly, `--collection` as
-/// the creator contract, `--instance-id` as usual) alongside
-/// `--engine auto` -- at that point every identifier is already known
-/// exactly as it would be for explicit `--engine manifold`, and this
-/// adapter's only remaining job is the same registry-provenance check
-/// [`ThirdwebAdapter`] performs. Without `--manifold-extension`,
-/// `detect()` returns `Ok(None)` unconditionally, every time -- never a
-/// guess.
+/// When `--manifold-extension` is omitted and discovery finds zero or
+/// more than one candidate, `detect()` returns `Ok(None)` -- a discovery
+/// failure in `--engine auto` mode is "this adapter has nothing to add",
+/// never a hard error that aborts the whole resolution.
 pub struct ManifoldAdapter<'a> {
     pub plan_args: &'a PlanArgs,
     pub config_path: Option<&'a Path>,
@@ -981,9 +978,6 @@ impl MintAdapter for ManifoldAdapter<'_> {
     }
 
     async fn detect(&self) -> Result<Option<Detection>, KairoxError> {
-        let Some(extension_contract) = self.plan_args.manifold_extension else {
-            return Ok(None);
-        };
         let instance_id =
             crate::cli::format::parse_wei("--instance-id", &self.plan_args.instance_id)?;
 
@@ -996,6 +990,22 @@ impl MintAdapter for ManifoldAdapter<'_> {
             runtime.config.as_ref(),
         )
         .await?;
+
+        let extension_contract = match self.plan_args.manifold_extension {
+            Some(extension_contract) => extension_contract,
+            None => {
+                match crate::execution::manifold_engine::discover_manifold_extension(
+                    &client,
+                    self.plan_args.collection,
+                    instance_id,
+                )
+                .await
+                {
+                    Ok(extension_contract) => extension_contract,
+                    Err(_) => return Ok(None),
+                }
+            }
+        };
 
         let bytecode_hash =
             crate::execution::manifold_engine::resolve_manifold_extension_code_hash(

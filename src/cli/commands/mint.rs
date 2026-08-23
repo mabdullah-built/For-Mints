@@ -72,12 +72,44 @@ async fn select_engine(
         EngineSelection::Public => Ok(SelectedEngine::Public),
         EngineSelection::Thirdweb => Ok(SelectedEngine::Thirdweb),
         EngineSelection::Manifold => {
-            let extension_contract = args.plan_args.manifold_extension.ok_or_else(|| {
-                KairoxError::Session(SessionError::new(
-                    "--manifold-extension is required for --engine manifold",
-                ))
-            })?;
             let instance_id = parse_wei("--instance-id", &args.plan_args.instance_id)?;
+            let extension_contract = match args.plan_args.manifold_extension {
+                Some(extension_contract) => extension_contract,
+                None => {
+                    // Best-effort auto-discovery via ICreatorCore::getExtensions()
+                    // -- see protocol::manifold's module doc comment and
+                    // execution::manifold_engine::discover_manifold_extension.
+                    // Only ever narrows to exactly one candidate; any other
+                    // outcome fails closed with a clear message rather than
+                    // guessing.
+                    let registry = ChainRegistry::builtin();
+                    let (resolved, runtime) = resolve_chain_and_runtime(
+                        &registry,
+                        &args.plan_args.chain_args,
+                        config_path,
+                    )?;
+                    let client = crate::cli::context::connect_read_client(
+                        &resolved.info,
+                        args.plan_args.chain_args.rpc_url.as_ref(),
+                        runtime.config.as_ref(),
+                    )
+                    .await?;
+                    let extension_contract =
+                        crate::execution::manifold_engine::discover_manifold_extension(
+                            &client,
+                            args.plan_args.collection,
+                            instance_id,
+                        )
+                        .await?;
+                    eprintln!(
+                        "auto-discovered Manifold extension {extension_contract} for creator \
+                         contract {} via ICreatorCore::getExtensions() (exactly one candidate \
+                         matched instance id {instance_id})",
+                        args.plan_args.collection
+                    );
+                    extension_contract
+                }
+            };
             Ok(SelectedEngine::Manifold {
                 extension_contract,
                 instance_id,

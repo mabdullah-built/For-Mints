@@ -140,6 +140,20 @@ pub async fn fetch_manifold_claim(
     Ok(manifold::decode_get_claim(&result)?)
 }
 
+/// Fetch `getExtensions()` from a Manifold creator (`ICreatorCore`)
+/// contract -- targets the creator contract itself, never the
+/// `LazyPayableClaim` extension contract. See `protocol::manifold`'s
+/// module doc comment for why this is the only verified auto-discovery
+/// step available (no equivalent exists for `instanceId`).
+pub async fn fetch_manifold_extensions(
+    client: &RpcClient,
+    creator_contract: Address,
+) -> Result<Vec<Address>, KairoxError> {
+    let calldata = manifold::encode_get_extensions();
+    let result = client.eth_call(creator_contract, &calldata).await?;
+    Ok(manifold::decode_get_extensions(&result)?)
+}
+
 /// Fetch `getTotalMints(minter, creatorContractAddress, instanceId)` from
 /// a Manifold extension contract.
 pub async fn fetch_manifold_total_mints(

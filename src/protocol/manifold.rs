@@ -18,6 +18,22 @@
 //! `eth_sendTransaction` target) *and* the creator contract address *and*
 //! the instance id, not just one collection address.
 //!
+//! **Extension auto-discovery is possible; instance auto-discovery is
+//! not.** The creator contract (`ICreatorCore.sol`, verified against
+//! `manifoldxyz/creator-core-solidity`) exposes `getExtensions() external
+//! view returns (address[] memory)` -- a real, bounded, on-chain
+//! enumeration of every extension ever registered against it (see
+//! [`encode_get_extensions`]/[`decode_get_extensions`]), which lets
+//! `execution::manifold_engine`/`cli::commands::resolver_adapters::ManifoldAdapter`
+//! auto-fill `--manifold-extension` when exactly one candidate is found.
+//! No equivalent exists for `instanceId`: `LazyPayableClaimCore.sol`
+//! keeps no counter or list of instance ids for a given creator contract
+//! anywhere in its state -- `getClaim(creator, instanceId)` requires the
+//! id already known. This was verified by reading the full deployed
+//! source, not assumed. `--instance-id` therefore remains a required,
+//! always-explicit operator input; Manifold support is honestly
+//! **partial auto-discovery**, never "fully automatic".
+//!
 //! **Scope of this module (v0.8, first Manifold pass)**: the V1
 //! `ERC721LazyPayableClaim` extension only -- single-token `mint()` (not
 //! `mintBatch`/`mintProxy`/`mintSignature`), native-currency claims only.
@@ -96,6 +112,13 @@ sol! {
     function MEMBERSHIP_ADDRESS() external view returns (address);
 
     function isActiveMember(address sender) external view returns (bool);
+
+    // `ICreatorCore.sol`'s extension enumeration -- note this targets the
+    // CREATOR contract, not the LazyPayableClaim extension contract (a
+    // genuinely different ABI/address, verified separately). Real,
+    // bounded, on-chain: every creator contract (ERC721Creator/
+    // ERC1155Creator) implements this.
+    function getExtensions() external view returns (address[] memory);
 
     // ILazyPayableClaim.sol's `mint` -- verified verbatim, including
     // parameter order and names.
@@ -210,6 +233,19 @@ pub fn decode_get_claim(data: &[u8]) -> Result<ManifoldClaim, ManifoldError> {
     let decoded = getClaimCall::abi_decode_returns(data)
         .map_err(|e| ManifoldError::AbiDecode(e.to_string()))?;
     ManifoldClaim::from_abi(decoded)
+}
+
+/// Build the calldata for `getExtensions()` on a Manifold creator
+/// (`ICreatorCore`) contract -- verified against
+/// `manifoldxyz/creator-core-solidity`'s `ICreatorCore.sol`. Targets the
+/// creator contract, never the `LazyPayableClaim` extension contract.
+pub fn encode_get_extensions() -> Bytes {
+    Bytes::from(getExtensionsCall {}.abi_encode())
+}
+
+/// Decode the return data of `getExtensions()`.
+pub fn decode_get_extensions(data: &[u8]) -> Result<Vec<Address>, ManifoldError> {
+    getExtensionsCall::abi_decode_returns(data).map_err(|e| ManifoldError::AbiDecode(e.to_string()))
 }
 
 /// Build the calldata for `getTotalMints(minter, creatorContractAddress, instanceId)`.
@@ -492,5 +528,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&calldata[0..4], getClaimCall::SELECTOR);
+    }
+
+    #[test]
+    fn get_extensions_selector_matches_the_real_function() {
+        let calldata = encode_get_extensions();
+        assert_eq!(&calldata[0..4], getExtensionsCall::SELECTOR);
+    }
+
+    #[test]
+    fn get_extensions_takes_no_arguments() {
+        assert_eq!(encode_get_extensions().len(), 4);
+    }
+
+    #[test]
+    fn decode_get_extensions_round_trips_an_empty_list() {
+        let encoded = getExtensionsCall::abi_encode_returns(&vec![]);
+        assert_eq!(
+            decode_get_extensions(&encoded).unwrap(),
+            Vec::<Address>::new()
+        );
+    }
+
+    #[test]
+    fn decode_get_extensions_round_trips_multiple_addresses() {
+        let a = address!("1234567890123456789012345678901234567890");
+        let b = address!("0987654321098765432109876543210987654321");
+        let encoded = getExtensionsCall::abi_encode_returns(&vec![a, b]);
+        assert_eq!(decode_get_extensions(&encoded).unwrap(), vec![a, b]);
     }
 }

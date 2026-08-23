@@ -97,6 +97,60 @@ pub async fn probe_claim(
     .ok()
 }
 
+/// Attempts to auto-discover the `LazyPayableClaim` extension contract
+/// for `creator_contract` -- see `protocol::manifold`'s module doc
+/// comment for the full rationale and its limits. Reads every extension
+/// registered via `ICreatorCore::getExtensions()` (real, bounded, on-chain
+/// enumeration), then best-effort-probes each candidate with
+/// `getClaim(creator_contract, instance_id)` -- a successful decode is
+/// evidence this address speaks the `LazyPayableClaim` ABI shape, never
+/// evidence it is safe to sign against (that is
+/// [`establish_provenance`]'s job, applied afterward, unconditionally).
+///
+/// Returns exactly one candidate, or a clear error naming what was found
+/// -- zero candidates, or more than one, both refuse rather than guess.
+/// `instance_id` must already be known (it is always an explicit,
+/// required operator input -- this function never discovers it).
+pub async fn discover_manifold_extension(
+    client: &RpcClient,
+    creator_contract: Address,
+    instance_id: U256,
+) -> Result<Address, KairoxError> {
+    let extensions = crate::cli::gather::fetch_manifold_extensions(client, creator_contract)
+        .await
+        .map_err(|e| {
+            KairoxError::Session(SessionError::new(format!(
+                "could not enumerate extensions registered on creator contract {creator_contract} \
+                 via ICreatorCore::getExtensions() -- is this a genuine Manifold creator contract? \
+                 ({e})"
+            )))
+        })?;
+
+    let mut candidates = Vec::new();
+    for extension in extensions {
+        if probe_claim(client, extension, creator_contract, instance_id)
+            .await
+            .is_some()
+        {
+            candidates.push(extension);
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates[0]),
+        0 => Err(KairoxError::Session(SessionError::new(format!(
+            "no extension registered on creator contract {creator_contract} responded like a \
+             LazyPayableClaim extension for instance id {instance_id} (either none are registered \
+             at all, or none matched this instance id); pass --manifold-extension explicitly"
+        )))),
+        n => Err(KairoxError::Session(SessionError::new(format!(
+            "{n} registered extensions on creator contract {creator_contract} all responded like \
+             a LazyPayableClaim extension for instance id {instance_id} ({candidates:?}); refusing \
+             to guess which one -- pass --manifold-extension explicitly"
+        )))),
+    }
+}
+
 /// An operator-supplied proof of this wallet's inclusion in a gated
 /// claim's allowlist. Never manufactured, never brute-forced -- Kairox
 /// only ever verifies a proof the operator explicitly provides (from a
@@ -1081,6 +1135,137 @@ mod tests {
                 outcome.receipt_state,
                 Some(crate::execution::receipt::ReceiptState::ConfirmedSuccess { .. })
             ));
+        }
+    }
+
+    mod discovery_tests {
+        use super::*;
+        use crate::chain::endpoint::EndpointRole;
+        use crate::chain::mock::MockTransport;
+        use crate::protocol::manifold::{self, ClaimAbi};
+        use alloy_sol_types::SolCall;
+        use serde_json::json;
+
+        const CREATOR: Address = address!("00000000000000000000000000000000000c0DE1");
+        const CANDIDATE_A: Address = address!("000000000000000000000000000000000000aAaA");
+        const CANDIDATE_B: Address = address!("000000000000000000000000000000000000bBbB");
+        const NON_CLAIM_EXTENSION: Address = address!("000000000000000000000000000000000000cCcC");
+        const INSTANCE_ID: U256 = U256::from_limbs([1, 0, 0, 0]);
+
+        fn sample_claim_hex() -> String {
+            let claim_abi = ClaimAbi {
+                total: 0,
+                totalMax: 100,
+                walletMax: 0,
+                startDate: U256::from(1_700_000_000u64),
+                endDate: U256::from(1_800_000_000u64),
+                storageProtocol: 3,
+                contractVersion: 1,
+                identical: true,
+                merkleRoot: B256::ZERO,
+                location: "ipfs://abc".to_string(),
+                cost: U256::ZERO,
+                paymentReceiver: CREATOR,
+                erc20: Address::ZERO,
+                signingAddress: Address::ZERO,
+            };
+            format!(
+                "0x{}",
+                hex::encode(manifold::getClaimCall::abi_encode_returns(&claim_abi))
+            )
+        }
+
+        /// Builds a mock where `getExtensions()` on `CREATOR` returns
+        /// `extensions`, and `getClaim(CREATOR, INSTANCE_ID)` succeeds only
+        /// against addresses in `claim_responders` -- everything else
+        /// reverts, exactly as a genuine non-LazyPayableClaim extension
+        /// (or an unrelated contract) would.
+        async fn client_with_extensions(
+            extensions: Vec<Address>,
+            claim_responders: Vec<Address>,
+        ) -> RpcClient {
+            let get_extensions_hex = format!(
+                "0x{}",
+                hex::encode(manifold::getExtensionsCall::abi_encode_returns(&extensions))
+            );
+            let claim_hex = sample_claim_hex();
+            let get_extensions_sel =
+                format!("0x{}", hex::encode(manifold::getExtensionsCall::SELECTOR));
+            let get_claim_sel = format!("0x{}", hex::encode(manifold::getClaimCall::SELECTOR));
+            let transport = MockTransport::builder()
+                .respond("eth_chainId", json!("0x1"))
+                .respond_dynamic_result("eth_call", move |params| {
+                    let to = params
+                        .get(0)
+                        .and_then(|c| c.get("to"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("0x")
+                        .to_string();
+                    let data = params
+                        .get(0)
+                        .and_then(|c| c.get("data"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("0x");
+                    if data.starts_with(&get_extensions_sel) {
+                        return Ok(json!(get_extensions_hex));
+                    }
+                    if data.starts_with(&get_claim_sel) {
+                        let target: Address = to.parse().unwrap();
+                        return if claim_responders.contains(&target) {
+                            Ok(json!(claim_hex))
+                        } else {
+                            Err((-32000, "execution reverted".into()))
+                        };
+                    }
+                    Err((-32601, "unexpected selector in discovery test".into()))
+                })
+                .build();
+            RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn exactly_one_candidate_resolves() {
+            let client = client_with_extensions(vec![CANDIDATE_A], vec![CANDIDATE_A]).await;
+            let found = discover_manifold_extension(&client, CREATOR, INSTANCE_ID)
+                .await
+                .unwrap();
+            assert_eq!(found, CANDIDATE_A);
+        }
+
+        #[tokio::test]
+        async fn zero_candidates_refuses_rather_than_guessing() {
+            let client = client_with_extensions(vec![NON_CLAIM_EXTENSION], vec![]).await;
+            let err = discover_manifold_extension(&client, CREATOR, INSTANCE_ID)
+                .await
+                .unwrap_err();
+            let message = format!("{err}");
+            assert!(message.contains("--manifold-extension"));
+        }
+
+        #[tokio::test]
+        async fn multiple_candidates_refuses_rather_than_guessing() {
+            let client = client_with_extensions(
+                vec![CANDIDATE_A, CANDIDATE_B],
+                vec![CANDIDATE_A, CANDIDATE_B],
+            )
+            .await;
+            let err = discover_manifold_extension(&client, CREATOR, INSTANCE_ID)
+                .await
+                .unwrap_err();
+            let message = format!("{err}");
+            assert!(message.contains("--manifold-extension"));
+        }
+
+        #[tokio::test]
+        async fn no_extensions_registered_at_all_refuses() {
+            let client = client_with_extensions(vec![], vec![]).await;
+            let err = discover_manifold_extension(&client, CREATOR, INSTANCE_ID)
+                .await
+                .unwrap_err();
+            let message = format!("{err}");
+            assert!(message.contains("--manifold-extension"));
         }
     }
 }
