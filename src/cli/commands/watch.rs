@@ -646,7 +646,8 @@ async fn resolve_watch_engine(
                 target.collection,
                 target.wallet,
             )
-            .await;
+            .await
+            .map_err(|e| KairoxError::Session(SessionError::new(e.to_string())))?;
             match crate::execution::stage_resolver::select_for_watch(
                 &stages,
                 OffsetDateTime::now_utc(),
@@ -1379,7 +1380,8 @@ impl StageProbe for ThirdwebStageProbe<'_> {
             self.drop_contract,
             self.wallet,
         )
-        .await;
+        .await
+        .map_err(|e| KairoxError::Session(SessionError::new(e.to_string())))?;
         let stage = stages
             .into_iter()
             .find(|s| &s.id == self.stage_id)
@@ -1779,7 +1781,13 @@ async fn run_thirdweb_watch(
         drop_contract,
         target.wallet,
     )
-    .await;
+    .await
+    .map_err(|e| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::StageResolutionChanged,
+            e.to_string(),
+        ))
+    })?;
     let Some(stage) = stages.iter().find(|s| s.id == expected_stage_id).cloned() else {
         return Err(KairoxError::Session(SessionError::with_kind(
             SessionErrorKind::StageResolutionChanged,

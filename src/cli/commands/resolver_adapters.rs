@@ -1133,20 +1133,17 @@ const MAX_THIRDWEB_PHASES: u64 = 20;
 /// function's doc comment) -- never infers flavor from selector
 /// existence alone.
 ///
-/// **Multi-phase**: **CORRECTION** -- an earlier version of this
-/// function used `getActiveClaimConditionId()`/`active_id + 1` as its
-/// enumeration anchor. That is insufficient: `getActiveClaimConditionId()`
-/// *reverts* (`DropNoActiveCondition`, verified against `Drop.sol`
-/// source) until at least one configured phase has started, which means
-/// a multi-phase drop configured entirely in the future -- exactly the
-/// case `watch` exists for -- was undiscoverable. Replaced with reading
-/// the list's own authoritative `(currentStartId, count)` metadata
-/// directly (via `claimCondition()`'s auto-generated getter, which
-/// exposes only the non-mapping fields of the real `ClaimConditionList`
-/// struct -- verified against `IDrop.sol` source), then enumerating
-/// every id in `[currentStartId, currentStartId + min(count,
-/// MAX_THIRDWEB_PHASES))` via `getClaimConditionById`. Each condition's
-/// `StageId` carries its exact id plus a
+/// **Multi-phase**: reads the list's own authoritative `(currentStartId,
+/// count)` metadata directly (via `claimCondition()`'s auto-generated
+/// getter, which exposes only the non-mapping fields of the real
+/// `ClaimConditionList` struct -- verified against `IDrop.sol` source;
+/// this works identically whether or not any phase has started yet,
+/// unlike `getActiveClaimConditionId()`, which reverts until the first
+/// configured phase opens), then enumerates every id in
+/// `[currentStartId, currentStartId + count)` via `getClaimConditionById`
+/// -- see [`ThirdwebDiscoveryError::TooManyPhases`] for what happens when
+/// `count` exceeds [`MAX_THIRDWEB_PHASES`]. Each condition's `StageId`
+/// carries its exact id plus a
 /// [`crate::protocol::thirdweb::ClaimCondition::config_fingerprint`], and
 /// each condition's effective end is the *real* `startTimestamp` of the
 /// next enumerated condition (verified against `getActiveClaimConditionId`'s
@@ -1164,11 +1161,34 @@ const MAX_THIRDWEB_PHASES: u64 = 20;
 /// replaced in place -- see `StageId::ThirdwebSinglePhase`'s doc
 /// comment); `end` is always `None` (this protocol supplies no end
 /// field for this flavor at all).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ThirdwebDiscoveryError {
+    /// `count` exceeded [`MAX_THIRDWEB_PHASES`] -- refused outright,
+    /// never partially enumerated. A truncated read would risk two real
+    /// bugs: silently hiding configured phases beyond the cutoff from an
+    /// operator relying on `watch` to find them, and -- worse --
+    /// incorrectly reporting the last *read* phase as open-ended
+    /// (`end: None`) when a real, later-configured phase (past the
+    /// cutoff) actually ends it. Neither is acceptable; fail closed
+    /// instead and let the operator investigate a drop with an
+    /// unreasonably large configured phase count.
+    #[error(
+        "thirdweb Drop at {drop_contract} reports {count} configured multi-phase conditions, \
+         exceeding the maximum of {max} this pass will enumerate; refusing to return a \
+         possibly-truncated/incorrectly-open-ended stage list"
+    )]
+    TooManyPhases {
+        drop_contract: alloy_primitives::Address,
+        count: alloy_primitives::U256,
+        max: u64,
+    },
+}
+
 pub(crate) async fn discover_thirdweb_stages(
     client: &crate::chain::rpc::RpcClient,
     drop_contract: alloy_primitives::Address,
     wallet: alloy_primitives::Address,
-) -> Vec<NormalizedStage> {
+) -> Result<Vec<NormalizedStage>, ThirdwebDiscoveryError> {
     use crate::cli::gather::ThirdwebClaimConditionShape;
     use crate::protocol::thirdweb::ClaimCondition;
 
@@ -1221,7 +1241,7 @@ pub(crate) async fn discover_thirdweb_stages(
     let Ok(shape) =
         crate::cli::gather::fetch_thirdweb_claim_condition_or_list(client, drop_contract).await
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     match shape {
@@ -1238,9 +1258,9 @@ pub(crate) async fn discover_thirdweb_stages(
                 condition.start_timestamp,
                 "thirdweb single-phase claimCondition startTimestamp",
             ) else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
-            vec![NormalizedStage {
+            Ok(vec![NormalizedStage {
                 id: StageId::ThirdwebSinglePhase {
                     drop_contract,
                     config_fingerprint: condition.config_fingerprint(),
@@ -1267,14 +1287,20 @@ pub(crate) async fn discover_thirdweb_stages(
                      (startTimestamp {}, merkleRoot {:#x})",
                     condition.start_timestamp, condition.merkle_root
                 ),
-            }]
+            }])
         }
         ThirdwebClaimConditionShape::MultiPhaseList(current_start_id, count) => {
-            let bounded_count = count.min(alloy_primitives::U256::from(MAX_THIRDWEB_PHASES));
+            if count > alloy_primitives::U256::from(MAX_THIRDWEB_PHASES) {
+                return Err(ThirdwebDiscoveryError::TooManyPhases {
+                    drop_contract,
+                    count,
+                    max: MAX_THIRDWEB_PHASES,
+                });
+            }
             let mut conditions: Vec<(alloy_primitives::U256, ClaimCondition)> = Vec::new();
             let mut id = current_start_id;
             let mut read = alloy_primitives::U256::ZERO;
-            while read < bounded_count {
+            while read < count {
                 if let Ok(condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
                     client,
                     drop_contract,
@@ -1313,7 +1339,7 @@ pub(crate) async fn discover_thirdweb_stages(
                     stages.push(stage);
                 }
             }
-            stages
+            Ok(stages)
         }
     }
 }
@@ -1649,7 +1675,9 @@ mod thirdweb_manifold_stage_discovery_tests {
         let transport = multi_phase_transport(0, &[(1_700_000_000, alloy_primitives::B256::ZERO)]);
         let client = connect(transport).await;
 
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .unwrap();
         assert_eq!(stages.len(), 1);
         let expected_fingerprint = crate::protocol::thirdweb::ClaimCondition::from_abi(
             condition_abi(1_700_000_000, alloy_primitives::B256::ZERO),
@@ -1688,7 +1716,9 @@ mod thirdweb_manifold_stage_discovery_tests {
         );
         let client = connect(transport).await;
 
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .unwrap();
         assert_eq!(
             stages.len(),
             3,
@@ -1727,7 +1757,9 @@ mod thirdweb_manifold_stage_discovery_tests {
         );
         let client = connect(transport).await;
 
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .unwrap();
         assert_eq!(stages.len(), 3);
         for (offset, stage) in stages.iter().enumerate() {
             match &stage.id {
@@ -1743,6 +1775,57 @@ mod thirdweb_manifold_stage_discovery_tests {
     }
 
     #[tokio::test]
+    async fn multi_phase_count_exactly_at_the_max_succeeds_completely() {
+        let conditions: Vec<(u64, alloy_primitives::B256)> = (0..MAX_THIRDWEB_PHASES)
+            .map(|i| (1_700_000_000 + i * 3600, alloy_primitives::B256::ZERO))
+            .collect();
+        let transport = multi_phase_transport(0, &conditions);
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .expect("count == MAX must succeed completely, not fail closed");
+        assert_eq!(stages.len(), MAX_THIRDWEB_PHASES as usize);
+        // The last enumerated phase has no later configured phase beyond
+        // it (count == MAX exactly, nothing truncated), so end: None is
+        // correct here, not a truncation artifact.
+        assert_eq!(stages.last().unwrap().window.end, None);
+    }
+
+    #[tokio::test]
+    async fn multi_phase_count_exceeding_the_max_fails_closed_with_no_partial_list() {
+        // count = MAX + 1, deliberately without registering mocks for
+        // every individual condition id -- discovery must refuse before
+        // ever attempting to enumerate a single one of them, proving the
+        // rejection is a genuine fail-fast, not merely "give up partway
+        // through the loop".
+        let list_hex = list_metadata_hex(0, MAX_THIRDWEB_PHASES + 1);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(list_hex))
+            .error(
+                "eth_call",
+                -32000,
+                "must never be called: count exceeds the max, discovery must fail before any \
+                 per-condition read",
+            )
+            .build();
+        let client = connect(transport).await;
+
+        let err = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .expect_err("count == MAX + 1 must fail closed, never return a truncated list");
+        assert_eq!(
+            err,
+            ThirdwebDiscoveryError::TooManyPhases {
+                drop_contract: DROP,
+                count: alloy_primitives::U256::from(MAX_THIRDWEB_PHASES + 1),
+                max: MAX_THIRDWEB_PHASES,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn multi_phase_effective_end_is_exactly_the_next_configured_starttimestamp() {
         let transport = multi_phase_transport(
             0,
@@ -1753,7 +1836,9 @@ mod thirdweb_manifold_stage_discovery_tests {
         );
         let client = connect(transport).await;
 
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(
             stages[0].window.end,
@@ -1833,7 +1918,9 @@ mod thirdweb_manifold_stage_discovery_tests {
             .build();
         let client = connect(transport).await;
 
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .unwrap();
         assert_eq!(stages.len(), 1);
         match &stages[0].id {
             StageId::ThirdwebSinglePhase { drop_contract, .. } => {
@@ -1872,7 +1959,9 @@ mod thirdweb_manifold_stage_discovery_tests {
             .error("eth_call", -32000, "execution reverted")
             .build();
         let client = connect(transport).await;
-        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET)
+            .await
+            .unwrap();
         assert!(stages.is_empty());
     }
 
