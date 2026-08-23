@@ -6,6 +6,7 @@ use alloy_primitives::{Address, Bytes, U256};
 
 use crate::chain::rpc::{BlockHeader, RpcClient};
 use crate::execution::errors::{KairoxError, SessionError};
+use crate::protocol::manifold::{self, ManifoldClaim};
 use crate::protocol::seadrop::{self, MintStats, PublicDropConfig};
 use crate::protocol::thirdweb::{self, ClaimCondition};
 
@@ -124,6 +125,59 @@ pub async fn fetch_thirdweb_supply_claimed_by_wallet_single_phase(
     Ok(thirdweb::decode_get_supply_claimed_by_wallet_single_phase(
         &result,
     )?)
+}
+
+/// Fetch `getClaim(creatorContractAddress, instanceId)` from a Manifold
+/// `LazyPayableClaim` extension contract.
+pub async fn fetch_manifold_claim(
+    client: &RpcClient,
+    extension_contract: Address,
+    creator_contract: Address,
+    instance_id: U256,
+) -> Result<ManifoldClaim, KairoxError> {
+    let calldata = manifold::encode_get_claim(creator_contract, instance_id)?;
+    let result = client.eth_call(extension_contract, &calldata).await?;
+    Ok(manifold::decode_get_claim(&result)?)
+}
+
+/// Fetch `getTotalMints(minter, creatorContractAddress, instanceId)` from
+/// a Manifold extension contract.
+pub async fn fetch_manifold_total_mints(
+    client: &RpcClient,
+    extension_contract: Address,
+    minter: Address,
+    creator_contract: Address,
+    instance_id: U256,
+) -> Result<u32, KairoxError> {
+    let calldata = manifold::encode_get_total_mints(minter, creator_contract, instance_id);
+    let result = client.eth_call(extension_contract, &calldata).await?;
+    Ok(manifold::decode_get_total_mints(&result)?)
+}
+
+/// Fetch `MEMBERSHIP_ADDRESS()` from a Manifold extension contract. A
+/// zero address means no membership contract is configured -- the flat
+/// protocol fee always applies (see
+/// `protocol::manifold::required_msg_value`).
+pub async fn fetch_manifold_membership_address(
+    client: &RpcClient,
+    extension_contract: Address,
+) -> Result<Address, KairoxError> {
+    let calldata = manifold::encode_membership_address();
+    let result = client.eth_call(extension_contract, &calldata).await?;
+    Ok(manifold::decode_membership_address(&result)?)
+}
+
+/// Fetch `isActiveMember(address)` from the Manifold Membership contract
+/// (a different address from the extension contract -- see
+/// [`fetch_manifold_membership_address`]).
+pub async fn fetch_manifold_is_active_member(
+    client: &RpcClient,
+    membership_contract: Address,
+    wallet: Address,
+) -> Result<bool, KairoxError> {
+    let calldata = manifold::encode_is_active_member(wallet);
+    let result = client.eth_call(membership_contract, &calldata).await?;
+    Ok(manifold::decode_is_active_member(&result)?)
 }
 
 /// Base fee plus block context, and (best-effort) a suggested priority fee.

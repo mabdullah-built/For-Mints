@@ -8,6 +8,8 @@ pub mod generic_schema;
 pub mod generic_semantics;
 pub mod live;
 pub mod manifest;
+pub mod manifold_engine;
+pub mod manifold_registry;
 pub mod metrics;
 pub mod multi_wallet;
 pub mod opensea_engine;
