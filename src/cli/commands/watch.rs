@@ -50,6 +50,8 @@ struct WatchTarget {
     collection: Address,
     wallet: Address,
     slug: Option<String>,
+    manifold_extension: Option<Address>,
+    instance_id: String,
     quantity: u64,
     engine: EngineSelection,
     fee_recipient: Option<Address>,
@@ -69,11 +71,8 @@ impl WatchTarget {
             // The generic verified contract engine is not wired into
             // `watch` this pass -- see docs/generic-engine.md.
             generic_schema: None,
-            // Manifold is not wired into `watch` either (see the
-            // EngineSelection::Manifold match arm in resolve_watch_engine
-            // below) -- these fields are never consulted.
-            manifold_extension: None,
-            instance_id: "0".to_string(),
+            manifold_extension: self.manifold_extension,
+            instance_id: self.instance_id.clone(),
             wallet: Some(self.wallet),
             quantity: self.quantity,
             fee_recipient: self.fee_recipient,
@@ -162,6 +161,8 @@ pub async fn run(args: WatchArgs, config_path: Option<&Path>) -> Result<(), Kair
             collection,
             wallet,
             slug: args.slug.clone(),
+            manifold_extension: args.manifold_extension,
+            instance_id: args.instance_id.clone(),
             quantity: args.quantity,
             engine: args.engine,
             fee_recipient: args.fee_recipient,
@@ -377,6 +378,40 @@ async fn run_single_target(
                 )
                 .await
             }
+            ResolvedWatchEngine::Thirdweb { drop_contract, .. } => {
+                run_thirdweb_watch(
+                    target.clone(),
+                    *drop_contract,
+                    &poll_config,
+                    &resolved,
+                    &profile,
+                    &signer,
+                    safety_caps,
+                    json,
+                    rehearsal,
+                )
+                .await
+            }
+            ResolvedWatchEngine::Manifold {
+                extension_contract,
+                creator_contract,
+                instance_id,
+            } => {
+                run_manifold_watch(
+                    target.clone(),
+                    *extension_contract,
+                    *creator_contract,
+                    *instance_id,
+                    &poll_config,
+                    &resolved,
+                    &profile,
+                    &signer,
+                    safety_caps,
+                    json,
+                    rehearsal,
+                )
+                .await
+            }
         };
 
         match result {
@@ -413,13 +448,17 @@ async fn run_single_target(
                         stage_uuid: uuid.clone(),
                     }),
                     // An operator-provided --slug (no discovered stage
-                    // identity) or the native public engine -- neither
-                    // has a single specific stage to exclude, so a
-                    // rejection here is never retried; it propagates.
+                    // identity), the native public engine, or thirdweb/
+                    // Manifold (no per-stage exclusion/retry mechanism
+                    // implemented this pass) -- none of these has a
+                    // single specific stage to exclude, so a rejection
+                    // here is never retried; it propagates.
                     ResolvedWatchEngine::OpenSea {
                         stage_uuid: None, ..
                     }
-                    | ResolvedWatchEngine::Public => None,
+                    | ResolvedWatchEngine::Public
+                    | ResolvedWatchEngine::Thirdweb { .. }
+                    | ResolvedWatchEngine::Manifold { .. } => None,
                 };
                 if let (Some(stage_id), true) = (stage_id, is_clear_ineligibility_rejection(&e)) {
                     ineligibility_attempts += 1;
@@ -466,6 +505,20 @@ enum ResolvedWatchEngine {
         /// The exact discovered stage identity, when one exists -- see
         /// `execution::resolver::ResolvedEngine::OpenSea`'s doc comment.
         stage_uuid: Option<String>,
+    },
+    /// The specific thirdweb condition selected to wait for/mint --
+    /// carries the resolved `StageId` so the T0 probe and dispatch agree
+    /// on exactly which condition this attempt targets (multi-phase
+    /// condition ids are NOT interchangeable -- see
+    /// `domain::stage::StageId::ThirdwebMultiPhase`'s doc comment).
+    Thirdweb {
+        drop_contract: alloy_primitives::Address,
+        stage_id: crate::domain::stage::StageId,
+    },
+    Manifold {
+        extension_contract: alloy_primitives::Address,
+        creator_contract: alloy_primitives::Address,
+        instance_id: alloy_primitives::U256,
     },
 }
 
@@ -574,16 +627,113 @@ async fn resolve_watch_engine(
     allow_already_live: bool,
 ) -> Result<ResolvedWatchEngine, KairoxError> {
     match target.engine {
-        EngineSelection::Thirdweb => Err(KairoxError::Session(SessionError::new(
-            "--engine thirdweb is not yet supported by watch; use kairox mint --engine thirdweb \
-             --send directly against an already-live phase (v0.8 Phase B scope)"
-                .to_string(),
-        ))),
-        EngineSelection::Manifold => Err(KairoxError::Session(SessionError::new(
-            "--engine manifold is not yet supported by watch; use kairox mint --engine manifold \
-             --send directly against an already-live claim (v0.8 scope)"
-                .to_string(),
-        ))),
+        EngineSelection::Thirdweb => {
+            let registry = ChainRegistry::builtin();
+            let (resolved, runtime) =
+                resolve_chain_and_runtime(&registry, &target.chain_args, config_path)?;
+            let client = crate::cli::context::connect_read_client(
+                &resolved.info,
+                target.chain_args.rpc_url.as_ref(),
+                runtime.config.as_ref(),
+            )
+            .await?;
+            let stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+                &client,
+                target.collection,
+                target.wallet,
+            )
+            .await;
+            match crate::execution::stage_resolver::select_for_watch(
+                &stages,
+                OffsetDateTime::now_utc(),
+            ) {
+                crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(stage) => {
+                    if allow_already_live {
+                        Ok(ResolvedWatchEngine::Thirdweb {
+                            drop_contract: target.collection,
+                            stage_id: stage.id,
+                        })
+                    } else {
+                        Err(stage_already_live_error(target.collection))
+                    }
+                }
+                crate::execution::stage_resolver::WatchStageDecision::WaitFor(stage) => {
+                    Ok(ResolvedWatchEngine::Thirdweb {
+                        drop_contract: target.collection,
+                        stage_id: stage.id,
+                    })
+                }
+                crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
+                    reason,
+                } => Err(KairoxError::Session(SessionError::new(format!(
+                    "no supported thirdweb claim condition (active or future) found for {}: {reason}",
+                    target.collection
+                )))),
+            }
+        }
+        EngineSelection::Manifold => {
+            let extension_contract = plan_args.manifold_extension.ok_or_else(|| {
+                KairoxError::Session(SessionError::new(
+                    "--manifold-extension is required for --engine manifold (watch never \
+                     auto-discovers it -- see EngineSelection::Manifold's doc comment)",
+                ))
+            })?;
+            let instance_id = parse_wei("--instance-id", &plan_args.instance_id)?;
+            let registry = ChainRegistry::builtin();
+            let (resolved, runtime) =
+                resolve_chain_and_runtime(&registry, &target.chain_args, config_path)?;
+            let client = crate::cli::context::connect_read_client(
+                &resolved.info,
+                target.chain_args.rpc_url.as_ref(),
+                runtime.config.as_ref(),
+            )
+            .await?;
+            let stage = crate::cli::commands::resolver_adapters::discover_manifold_stage(
+                &client,
+                extension_contract,
+                target.collection,
+                instance_id,
+                target.wallet,
+            )
+            .await
+            .ok_or_else(|| {
+                KairoxError::Session(SessionError::new(format!(
+                    "no readable Manifold claim at extension {extension_contract} / creator {} \
+                     / instance {instance_id}",
+                    target.collection
+                )))
+            })?;
+            match crate::execution::stage_resolver::select_for_watch(
+                std::slice::from_ref(&stage),
+                OffsetDateTime::now_utc(),
+            ) {
+                crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(_) => {
+                    if allow_already_live {
+                        Ok(ResolvedWatchEngine::Manifold {
+                            extension_contract,
+                            creator_contract: target.collection,
+                            instance_id,
+                        })
+                    } else {
+                        Err(stage_already_live_error(target.collection))
+                    }
+                }
+                crate::execution::stage_resolver::WatchStageDecision::WaitFor(_) => {
+                    Ok(ResolvedWatchEngine::Manifold {
+                        extension_contract,
+                        creator_contract: target.collection,
+                        instance_id,
+                    })
+                }
+                crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage {
+                    reason,
+                } => Err(KairoxError::Session(SessionError::new(format!(
+                    "Manifold claim at extension {extension_contract} / creator {} / instance \
+                     {instance_id} is not a supported watch target: {reason}",
+                    target.collection
+                )))),
+            }
+        }
         EngineSelection::Public => {
             // Explicit-engine modes obey the exact same WATCH-vs-LIVE
             // contract as `--engine auto` -- item 6 of the true-final
@@ -1201,6 +1351,86 @@ impl StageProbe for OpenSeaStageProbe<'_> {
     }
 }
 
+/// Re-reads `drop_contract`'s thirdweb claim conditions fresh on every
+/// poll and picks out the *same* condition this attempt is watching
+/// (identified by `stage_id`, not merely "whatever is active/next now")
+/// -- if a creator reconfigures conditions mid-wait such that this
+/// specific condition id is no longer discoverable, `probe()` fails
+/// (mirrors `OpenSeaStageProbe`'s "sold out"/"no stage" failure
+/// handling), which `wait_for_stage`'s existing error propagation
+/// already treats as a hard stop rather than assuming the wait can
+/// continue against unknown state.
+struct ThirdwebStageProbe<'a> {
+    client: &'a crate::chain::rpc::RpcClient,
+    drop_contract: alloy_primitives::Address,
+    wallet: alloy_primitives::Address,
+    stage_id: &'a crate::domain::stage::StageId,
+}
+
+#[async_trait::async_trait]
+impl StageProbe for ThirdwebStageProbe<'_> {
+    async fn probe(&self) -> Result<StageSnapshot, KairoxError> {
+        let stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+            self.client,
+            self.drop_contract,
+            self.wallet,
+        )
+        .await;
+        let stage = stages
+            .into_iter()
+            .find(|s| &s.id == self.stage_id)
+            .ok_or_else(|| {
+                KairoxError::Session(SessionError::new(format!(
+                    "the thirdweb condition this attempt is watching ({:?}) is no longer \
+                     discoverable on {} -- it may have been reconfigured",
+                    self.stage_id, self.drop_contract
+                )))
+            })?;
+        Ok(StageSnapshot {
+            stage_start: stage.window.start,
+            status: stage.status(OffsetDateTime::now_utc()),
+        })
+    }
+}
+
+/// Re-reads the Manifold claim fresh on every poll. `(extension_contract,
+/// creator_contract, instance_id)` together are this attempt's whole
+/// stage identity (see `domain::stage::StageId::ManifoldClaim`'s doc
+/// comment), so there is no separate "which stage" lookup needed the way
+/// `ThirdwebStageProbe` needs one among possibly-multiple conditions.
+struct ManifoldStageProbe<'a> {
+    client: &'a crate::chain::rpc::RpcClient,
+    extension_contract: alloy_primitives::Address,
+    creator_contract: alloy_primitives::Address,
+    instance_id: alloy_primitives::U256,
+    wallet: alloy_primitives::Address,
+}
+
+#[async_trait::async_trait]
+impl StageProbe for ManifoldStageProbe<'_> {
+    async fn probe(&self) -> Result<StageSnapshot, KairoxError> {
+        let stage = crate::cli::commands::resolver_adapters::discover_manifold_stage(
+            self.client,
+            self.extension_contract,
+            self.creator_contract,
+            self.instance_id,
+            self.wallet,
+        )
+        .await
+        .ok_or_else(|| {
+            KairoxError::Session(SessionError::new(format!(
+                "the Manifold claim this attempt is watching (extension {}, creator {}, \
+                 instance {}) is no longer readable",
+                self.extension_contract, self.creator_contract, self.instance_id
+            )))
+        })?;
+        Ok(StageSnapshot {
+            stage_start: stage.window.start,
+            status: stage.status(OffsetDateTime::now_utc()),
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_public_watch(
     target: WatchTarget,
@@ -1483,6 +1713,239 @@ async fn run_opensea_watch(
     Ok(())
 }
 
+/// Mirrors `run_public_watch`'s exact shape: connect and fully benchmark
+/// the pool *before* the wait (never reconnected/re-benchmarked at T0 --
+/// `execution::thirdweb_engine::run_thirdweb_mint`'s own
+/// `pool.preferred_read()`/`pool.select_send_endpoints()` calls are pure
+/// lookups over this pool's already-computed ranking, not a fresh live
+/// benchmark, so this reuse is genuine, not merely apparent), wait for
+/// the resolved condition, then dispatch through the same
+/// `establish_provenance`-gated, already-hardened `run_thirdweb_mint`
+/// `mint --send` uses. Production `BUILTIN_REGISTRY` ships empty, so a
+/// real `--auto-send`/non-rehearsal arm here always refuses at the
+/// provenance gate -- exactly the correct, honest behavior until a real
+/// fingerprint is authenticated (tests inject their own registry to
+/// exercise the rest of the pipeline).
+#[allow(clippy::too_many_arguments)]
+async fn run_thirdweb_watch(
+    target: WatchTarget,
+    drop_contract: Address,
+    poll_config: &WatchPollConfig,
+    resolved: &crate::cli::context::ResolvedChain,
+    profile: &ExecutionProfile,
+    signer: &dyn Signer,
+    safety_caps: SafetyCaps,
+    json: bool,
+    rehearsal: bool,
+) -> Result<(), KairoxError> {
+    if json {
+        // Neither `run_thirdweb_mint`'s outcome nor `mint --engine
+        // thirdweb --send` (see `cli::commands::mint::run_send_thirdweb`)
+        // support structured JSON reporting yet -- refusing explicitly
+        // here is more honest than silently falling back to text output
+        // an operator's tooling did not ask for.
+        return Err(KairoxError::Session(SessionError::new(
+            "watch --json is not yet supported for --engine thirdweb",
+        )));
+    }
+
+    let mut pool = connect_send_pool(resolved, target.chain_args.rpc_url.as_ref(), None).await?;
+    pool.benchmark_all(&profile.benchmark_policy).await;
+    pool.rewarm_all().await;
+
+    let read_client = pool.preferred_read().ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available",
+        ))
+    })?;
+    // Re-resolve which exact condition to wait for using this now-
+    // connected client -- `resolve_watch_engine` already did this once
+    // to decide whether to arm at all, but that used its own short-lived
+    // client; the probe below needs a client it can hold onto for the
+    // whole wait, so it resolves the target stage id fresh, once more,
+    // here.
+    let stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
+        read_client,
+        drop_contract,
+        target.wallet,
+    )
+    .await;
+    let stage = match crate::execution::stage_resolver::select_for_watch(
+        &stages,
+        OffsetDateTime::now_utc(),
+    ) {
+        crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(s)
+        | crate::execution::stage_resolver::WatchStageDecision::WaitFor(s) => *s,
+        crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage { reason } => {
+            return Err(KairoxError::Session(SessionError::new(format!(
+                "no supported thirdweb claim condition found for {drop_contract} on the freshly \
+                 connected pool: {reason}"
+            ))));
+        }
+    };
+
+    let inner_probe = ThirdwebStageProbe {
+        client: read_client,
+        drop_contract,
+        wallet: target.wallet,
+        stage_id: &stage.id,
+    };
+    let telemetry = std::sync::Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+    let probe = TelemetryProbe {
+        inner: &inner_probe,
+        label: "thirdweb-stage-probe",
+        store: &telemetry,
+        network_source: pool.preferred_read(),
+        arm_threshold: poll_config.arm_threshold,
+    };
+    let reporter = crate::cli::progress_reporter::ProgressReporter::spawn(|state: WatchState| {
+        print_state(&state)
+    });
+    // Not `EngineSelection::Auto` -- `wait_for_stage_with_reresolution`
+    // takes its plain `wait_for_stage` branch, no periodic re-resolution
+    // (thirdweb is not wired into `--engine auto`'s watch resolution --
+    // see `domain::stage::StageProtocol::ThirdwebClaim`'s doc comment).
+    wait_for_stage(&probe, poll_config, |state| reporter.emit(state)).await?;
+    reporter.emit(WatchState::Arming);
+
+    let request = crate::execution::thirdweb_engine::ThirdwebMintRequest {
+        chain: resolved.info.clone(),
+        drop_contract,
+        wallet: target.wallet,
+        quantity: target.quantity,
+        gas_buffer_multiplier: target.gas_buffer_multiplier,
+        safety_caps,
+        // Allowlist-gated thirdweb conditions are not yet wired into
+        // watch (mirrors `mint --engine thirdweb --send`'s own current
+        // CLI surface, which has no --allowlist-proof plumbed through
+        // this path either) -- a genuinely gated condition fails closed
+        // inside `run_thirdweb_mint` with a clear error, never silently
+        // attempted with no proof.
+        allowlist_proof: None,
+    };
+
+    let outcome = crate::execution::thirdweb_engine::run_thirdweb_mint(
+        &pool,
+        signer,
+        &request,
+        crate::execution::thirdweb_registry::BUILTIN_REGISTRY,
+        &profile.health_policy,
+        profile.receipt_poll_interval,
+        profile.receipt_timeout,
+        rehearsal,
+    )
+    .await?;
+
+    reporter.emit(WatchState::Success);
+    reporter.finish().await;
+    print_telemetry_summary(&telemetry);
+
+    print_broadcast_result(
+        outcome.prepared.tx_hash,
+        &outcome.broadcast_results,
+        &outcome.broadcast_summary,
+        &outcome.receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
+        rehearsal,
+    );
+    Ok(())
+}
+
+/// Mirrors [`run_thirdweb_watch`]'s exact shape and rationale, dispatched
+/// through `run_manifold_mint` instead.
+#[allow(clippy::too_many_arguments)]
+async fn run_manifold_watch(
+    target: WatchTarget,
+    extension_contract: Address,
+    creator_contract: Address,
+    instance_id: alloy_primitives::U256,
+    poll_config: &WatchPollConfig,
+    resolved: &crate::cli::context::ResolvedChain,
+    profile: &ExecutionProfile,
+    signer: &dyn Signer,
+    safety_caps: SafetyCaps,
+    json: bool,
+    rehearsal: bool,
+) -> Result<(), KairoxError> {
+    if json {
+        return Err(KairoxError::Session(SessionError::new(
+            "watch --json is not yet supported for --engine manifold",
+        )));
+    }
+
+    let mut pool = connect_send_pool(resolved, target.chain_args.rpc_url.as_ref(), None).await?;
+    pool.benchmark_all(&profile.benchmark_policy).await;
+    pool.rewarm_all().await;
+
+    let read_client = pool.preferred_read().ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::NoVerifiedReadRpc,
+            "no healthy, chain-verified read-capable RPC endpoint available",
+        ))
+    })?;
+
+    let inner_probe = ManifoldStageProbe {
+        client: read_client,
+        extension_contract,
+        creator_contract,
+        instance_id,
+        wallet: target.wallet,
+    };
+    let telemetry = std::sync::Mutex::new(crate::chain::telemetry::TelemetryStore::default());
+    let probe = TelemetryProbe {
+        inner: &inner_probe,
+        label: "manifold-stage-probe",
+        store: &telemetry,
+        network_source: pool.preferred_read(),
+        arm_threshold: poll_config.arm_threshold,
+    };
+    let reporter = crate::cli::progress_reporter::ProgressReporter::spawn(|state: WatchState| {
+        print_state(&state)
+    });
+    wait_for_stage(&probe, poll_config, |state| reporter.emit(state)).await?;
+    reporter.emit(WatchState::Arming);
+
+    let request = crate::execution::manifold_engine::ManifoldMintRequest {
+        chain: resolved.info.clone(),
+        extension_contract,
+        creator_contract,
+        instance_id,
+        wallet: target.wallet,
+        gas_buffer_multiplier: target.gas_buffer_multiplier,
+        safety_caps,
+        // Same rationale as ThirdwebMintRequest above -- allowlist-gated
+        // claims are not yet wired into watch.
+        allowlist: None,
+    };
+
+    let outcome = crate::execution::manifold_engine::run_manifold_mint(
+        &pool,
+        signer,
+        &request,
+        crate::execution::manifold_registry::BUILTIN_REGISTRY,
+        &profile.health_policy,
+        profile.receipt_poll_interval,
+        profile.receipt_timeout,
+        rehearsal,
+    )
+    .await?;
+
+    reporter.emit(WatchState::Success);
+    reporter.finish().await;
+    print_telemetry_summary(&telemetry);
+
+    print_broadcast_result(
+        outcome.prepared.tx_hash,
+        &outcome.broadcast_results,
+        &outcome.broadcast_summary,
+        &outcome.receipt_state,
+        &crate::execution::metrics::LatencyMetrics::default(),
+        rehearsal,
+    );
+    Ok(())
+}
+
 fn live_progress_to_watch_state(progress: &LiveProgress) -> WatchState {
     match progress {
         LiveProgress::Benchmarking | LiveProgress::Prewarming { .. } => WatchState::Arming,
@@ -1613,6 +2076,12 @@ fn load_manifest(path: &Path) -> Result<Vec<WatchTarget>, KairoxError> {
                 collection,
                 wallet,
                 slug: entry.slug,
+                // The watchlist manifest schema has no fields for these
+                // yet -- --engine manifold is not supported in manifest
+                // mode this pass (mirrors the schema's existing
+                // Public/OpenSea-only engine scope).
+                manifold_extension: None,
+                instance_id: "0".to_string(),
                 quantity: entry.quantity,
                 engine: entry.engine.into(),
                 fee_recipient,

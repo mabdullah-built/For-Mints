@@ -25,6 +25,17 @@ pub enum StageProtocol {
     SignedPresale,
     Fcfs,
     Fcfa,
+    /// A thirdweb Drop claim condition (multi-phase or single-phase --
+    /// see `StageId::ThirdwebMultiPhase`/`ThirdwebSinglePhase`). Never
+    /// discovered alongside SeaDrop/OpenSea stages for the same
+    /// collection today -- `--engine thirdweb` is explicit-only, its own
+    /// protocol-exclusive stage list -- so this variant's exact rank
+    /// relative to the SeaDrop/OpenSea tiers has no observable effect
+    /// yet; it exists for `StageProtocol`'s own exhaustive matches.
+    ThirdwebClaim,
+    /// A Manifold `LazyPayableClaim` claim instance. Same "protocol
+    /// exclusive today" note as `ThirdwebClaim`.
+    ManifoldClaim,
 }
 
 /// What Kairox currently knows about whether the configured wallet may
@@ -67,6 +78,39 @@ pub enum StageId {
     /// `DropStageResponse` that actually identifies *this* stage, not
     /// the drop it belongs to.
     OpenSea { stage_uuid: String },
+    /// A thirdweb multi-phase (`Drop`/`IClaimConditionMultiPhase`) claim
+    /// condition. `condition_id` is the exact on-chain condition id this
+    /// stage represents -- authoritative, never invented (see
+    /// `cli::commands::resolver_adapters::discover_thirdweb_stages`'s
+    /// doc comment for how it's resolved). Two different condition ids
+    /// are two different stages, even on the same `drop_contract`, so
+    /// watch's re-resolution can correctly detect "the specific
+    /// condition being watched changed identity" (e.g. the creator
+    /// reconfigured conditions) rather than silently treating a
+    /// different condition as the same stage.
+    ThirdwebMultiPhase {
+        drop_contract: alloy_primitives::Address,
+        condition_id: alloy_primitives::U256,
+    },
+    /// A thirdweb single-phase (`DropSinglePhase`) claim condition. No
+    /// condition id exists in this flavor's ABI at all (see
+    /// `protocol::thirdweb`'s module doc comment) -- `drop_contract`
+    /// alone is the whole identity, since a single-phase contract has
+    /// exactly one condition, ever.
+    ThirdwebSinglePhase {
+        drop_contract: alloy_primitives::Address,
+    },
+    /// A Manifold `LazyPayableClaim` claim instance. All three
+    /// identifiers are required -- see `protocol::manifold`'s module doc
+    /// comment for why neither `creator_contract` nor `instance_id`
+    /// alone identifies a claim, and `execution::manifold_registry`'s
+    /// doc comment for why `extension_contract` (not a per-collection
+    /// proxy) is the address whose identity/provenance actually matters.
+    ManifoldClaim {
+        extension_contract: alloy_primitives::Address,
+        creator_contract: alloy_primitives::Address,
+        instance_id: alloy_primitives::U256,
+    },
 }
 
 /// What's needed to actually execute against a selected stage. Carries
@@ -80,6 +124,25 @@ pub enum StageExecutionRef {
     /// per-stage identifier; that's [`StageId::OpenSea`]'s job.
     OpenSea {
         slug: String,
+    },
+    /// `drop_contract` is both the NFT and the claim logic, exactly as
+    /// for explicit `--engine thirdweb` -- see
+    /// `EngineSelection::Thirdweb`'s doc comment. The engine
+    /// (`execution::thirdweb_engine::run_thirdweb_mint`) re-establishes
+    /// provenance and re-resolves the active/single-phase condition
+    /// itself at execution time; this ref carries no flavor or condition
+    /// id, since the contract's own `claim()` call is condition-id-
+    /// agnostic (it internally determines the active condition itself --
+    /// verified against `Drop.sol`'s `getActiveClaimConditionId`).
+    Thirdweb {
+        drop_contract: alloy_primitives::Address,
+    },
+    /// See `protocol::manifold`'s module doc comment for why all three
+    /// identifiers are required.
+    Manifold {
+        extension_contract: alloy_primitives::Address,
+        creator_contract: alloy_primitives::Address,
+        instance_id: alloy_primitives::U256,
     },
 }
 

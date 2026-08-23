@@ -77,7 +77,7 @@ pub struct MintPlan {
     pub dry_run: bool,
 }
 
-fn unix_timestamp(seconds: u64, what: &str) -> Result<OffsetDateTime, KairoxError> {
+pub(crate) fn unix_timestamp(seconds: u64, what: &str) -> Result<OffsetDateTime, KairoxError> {
     let seconds: i64 = seconds.try_into().map_err(|_| {
         KairoxError::Session(SessionError::new(format!("{what} does not fit in i64")))
     })?;

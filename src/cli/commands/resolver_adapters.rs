@@ -403,7 +403,10 @@ pub(crate) fn stage_to_detection(stage: &NormalizedStage) -> Detection {
         StageExecutionRef::OpenSea { slug } => {
             let stage_uuid = match &stage.id {
                 StageId::OpenSea { stage_uuid } => Some(stage_uuid.clone()),
-                StageId::OnChainPublic => None,
+                StageId::OnChainPublic
+                | StageId::ThirdwebMultiPhase { .. }
+                | StageId::ThirdwebSinglePhase { .. }
+                | StageId::ManifoldClaim { .. } => None,
             };
             (
                 ResolvedEngine::OpenSea {
@@ -413,6 +416,31 @@ pub(crate) fn stage_to_detection(stage: &NormalizedStage) -> Detection {
                 "OpenSeaDropsAdapter",
             )
         }
+        // stage_to_detection is only ever called on stages
+        // NormalizedStageAdapter discovers (SeaDrop/OpenSea) -- see this
+        // function's callers. Thirdweb/Manifold stages come from
+        // discover_thirdweb_stages/discover_manifold_stages instead,
+        // consumed directly by watch's own resolution, never through
+        // this conversion. These arms exist only for match
+        // exhaustiveness.
+        StageExecutionRef::Thirdweb { drop_contract } => (
+            ResolvedEngine::Thirdweb {
+                drop_contract: *drop_contract,
+            },
+            "ThirdwebStageAdapter",
+        ),
+        StageExecutionRef::Manifold {
+            extension_contract,
+            creator_contract,
+            instance_id,
+        } => (
+            ResolvedEngine::Manifold {
+                extension_contract: *extension_contract,
+                creator_contract: *creator_contract,
+                instance_id: *instance_id,
+            },
+            "ManifoldStageAdapter",
+        ),
     };
     Detection {
         engine,
@@ -1081,6 +1109,286 @@ impl MintAdapter for ManifoldAdapter<'_> {
     }
 }
 
+/// Sentinel used only when a stage's real effective end genuinely cannot
+/// be read from the chain (see [`discover_thirdweb_stages`]'s doc
+/// comment) -- never a guess at a real value. Deliberately implausible
+/// (no real claim condition will still be open in the year 2999) so it
+/// can never be mistaken for authoritative data downstream; `PhaseWindow`
+/// itself has no `Option<end>` representation, so an explicit,
+/// obviously-synthetic constant is the least-guessy way to satisfy its
+/// shape (mirrors the existing test fixtures' identical use of
+/// `2999-01-01` as a "does not meaningfully end" placeholder).
+const NO_KNOWN_END: OffsetDateTime = time::macros::datetime!(2999-01-01 00:00:00 UTC);
+
+/// Discovers thirdweb Drop claim condition(s) for `drop_contract` as
+/// [`NormalizedStage`] entries, for `--engine thirdweb`'s `watch`
+/// support. Purely a **read-only, best-effort discovery** step -- it
+/// never authorizes anything; live-send/watch-arm authorization is
+/// [`crate::execution::thirdweb_engine::establish_provenance`]'s job
+/// alone, applied unconditionally afterward by the caller.
+///
+/// **Multi-phase**: reads the active condition via
+/// `getActiveClaimConditionId`/`getClaimConditionById` (both
+/// authoritative on-chain reads), then probes exactly **one** condition
+/// id ahead (`active_id + 1`) as a bounded, non-guessing check for a
+/// configured future phase -- verified against `Drop.sol`'s real
+/// `setClaimConditions` source: conditions are assigned strictly
+/// sequential ids starting from a base index, so `active_id + 1` is
+/// genuinely "the next condition, if the creator has configured one",
+/// not an assumption about how many phases exist in total. If that read
+/// succeeds, its own real `startTimestamp` becomes both the active
+/// condition's effective end (verified against `getActiveClaimConditionId`'s
+/// own backward-iterating "first condition whose startTimestamp has
+/// passed" logic -- a later condition's start genuinely does end the
+/// previous one for "active" purposes) and a second, separate
+/// [`StageId::ThirdwebMultiPhase`] stage in its own right (watchable if
+/// it hasn't started yet). No id beyond `active_id + 1` is ever probed --
+/// this function does not claim to enumerate every future phase, only
+/// the immediately next one.
+///
+/// **Single-phase**: only attempted if no multi-phase condition was
+/// found (mirrors [`crate::execution::thirdweb_engine::probe_flavor`]'s
+/// precedence). Uses `claimCondition()`/`getSupplyClaimedByWallet(address)`
+/// -- no condition id exists in this flavor's ABI at all, so its
+/// [`StageId::ThirdwebSinglePhase`] identity carries only the contract
+/// address; there is no "next condition" concept to probe for at all
+/// (see `protocol::thirdweb`'s module doc comment).
+pub(crate) async fn discover_thirdweb_stages(
+    client: &crate::chain::rpc::RpcClient,
+    drop_contract: alloy_primitives::Address,
+    wallet: alloy_primitives::Address,
+) -> Vec<NormalizedStage> {
+    use crate::protocol::thirdweb::ClaimCondition;
+
+    fn to_stage(
+        drop_contract: alloy_primitives::Address,
+        condition_id: alloy_primitives::U256,
+        condition: &ClaimCondition,
+        end: OffsetDateTime,
+        wallet_claimed: Option<alloy_primitives::U256>,
+    ) -> Option<NormalizedStage> {
+        let start = crate::execution::plan::unix_timestamp(
+            condition.start_timestamp,
+            "thirdweb claim condition startTimestamp",
+        )
+        .ok()?;
+        Some(NormalizedStage {
+            id: StageId::ThirdwebMultiPhase {
+                drop_contract,
+                condition_id,
+            },
+            execution: StageExecutionRef::Thirdweb { drop_contract },
+            protocol: StageProtocol::ThirdwebClaim,
+            label: None,
+            window: PhaseWindow { start, end },
+            price_per_token_wei: if condition.is_native_currency() {
+                Some(condition.price_per_token)
+            } else {
+                None
+            },
+            max_per_wallet: u64::try_from(condition.quantity_limit_per_wallet).ok(),
+            wallet_minted: wallet_claimed.and_then(|w| u64::try_from(w).ok()),
+            supply_remaining: u64::try_from(condition.supply_remaining()).ok(),
+            eligibility: if condition.merkle_root.is_zero() {
+                EligibilityState::Eligible
+            } else {
+                // A merkle-gated phase's real eligibility can only be
+                // established once the operator supplies a proof at
+                // execution time -- never guessed here.
+                EligibilityState::UnknownUntilActive
+            },
+            evidence: format!(
+                "thirdweb multi-phase condition {condition_id} read from {drop_contract} \
+                 (startTimestamp {}, merkleRoot {:#x})",
+                condition.start_timestamp, condition.merkle_root
+            ),
+        })
+    }
+
+    let mut stages = Vec::new();
+
+    if let Ok(active_id) =
+        crate::cli::gather::fetch_thirdweb_active_claim_condition_id(client, drop_contract).await
+        && let Ok(active_condition) = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+            client,
+            drop_contract,
+            active_id,
+        )
+        .await
+    {
+        let wallet_claimed = crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet(
+            client,
+            drop_contract,
+            active_id,
+            wallet,
+        )
+        .await
+        .ok();
+
+        let next_id = active_id.saturating_add(alloy_primitives::U256::from(1));
+        let next_condition = crate::cli::gather::fetch_thirdweb_claim_condition_by_id(
+            client,
+            drop_contract,
+            next_id,
+        )
+        .await
+        .ok();
+
+        let active_end = match &next_condition {
+            Some(next) => crate::execution::plan::unix_timestamp(
+                next.start_timestamp,
+                "thirdweb next claim condition startTimestamp",
+            )
+            .unwrap_or(NO_KNOWN_END),
+            None => NO_KNOWN_END,
+        };
+
+        if let Some(stage) = to_stage(
+            drop_contract,
+            active_id,
+            &active_condition,
+            active_end,
+            wallet_claimed,
+        ) {
+            stages.push(stage);
+        }
+
+        if let Some(next_condition) = next_condition
+            && let Some(stage) =
+                to_stage(drop_contract, next_id, &next_condition, NO_KNOWN_END, None)
+        {
+            stages.push(stage);
+        }
+    }
+
+    if stages.is_empty()
+        && let Ok(condition) =
+            crate::cli::gather::fetch_thirdweb_claim_condition_single_phase(client, drop_contract)
+                .await
+    {
+        let wallet_claimed =
+            crate::cli::gather::fetch_thirdweb_supply_claimed_by_wallet_single_phase(
+                client,
+                drop_contract,
+                wallet,
+            )
+            .await
+            .ok();
+        if let Ok(start) = crate::execution::plan::unix_timestamp(
+            condition.start_timestamp,
+            "thirdweb single-phase claimCondition startTimestamp",
+        ) {
+            stages.push(NormalizedStage {
+                id: StageId::ThirdwebSinglePhase { drop_contract },
+                execution: StageExecutionRef::Thirdweb { drop_contract },
+                protocol: StageProtocol::ThirdwebClaim,
+                label: None,
+                window: PhaseWindow {
+                    start,
+                    end: NO_KNOWN_END,
+                },
+                price_per_token_wei: if condition.is_native_currency() {
+                    Some(condition.price_per_token)
+                } else {
+                    None
+                },
+                max_per_wallet: u64::try_from(condition.quantity_limit_per_wallet).ok(),
+                wallet_minted: wallet_claimed.and_then(|w| u64::try_from(w).ok()),
+                supply_remaining: u64::try_from(condition.supply_remaining()).ok(),
+                eligibility: if condition.merkle_root.is_zero() {
+                    EligibilityState::Eligible
+                } else {
+                    EligibilityState::UnknownUntilActive
+                },
+                evidence: format!(
+                    "thirdweb single-phase claimCondition read from {drop_contract} \
+                     (startTimestamp {}, merkleRoot {:#x})",
+                    condition.start_timestamp, condition.merkle_root
+                ),
+            });
+        }
+    }
+
+    stages
+}
+
+/// Discovers the Manifold `LazyPayableClaim` claim at
+/// `(extension_contract, creator_contract, instance_id)` as a
+/// [`NormalizedStage`], for `--engine manifold`'s `watch` support.
+/// `instance_id` is always operator-supplied (see
+/// `execution::manifold_engine::discover_manifold_extension`'s doc
+/// comment for why no on-chain instance enumeration exists) --
+/// read-only, best-effort, never authorizes anything on its own.
+pub(crate) async fn discover_manifold_stage(
+    client: &crate::chain::rpc::RpcClient,
+    extension_contract: alloy_primitives::Address,
+    creator_contract: alloy_primitives::Address,
+    instance_id: alloy_primitives::U256,
+    wallet: alloy_primitives::Address,
+) -> Option<NormalizedStage> {
+    let claim = crate::execution::manifold_engine::probe_claim(
+        client,
+        extension_contract,
+        creator_contract,
+        instance_id,
+    )
+    .await?;
+
+    let start =
+        crate::execution::plan::unix_timestamp(claim.start_date, "Manifold claim startDate")
+            .ok()?;
+    let end =
+        crate::execution::plan::unix_timestamp(claim.end_date, "Manifold claim endDate").ok()?;
+
+    let wallet_claimed = crate::cli::gather::fetch_manifold_total_mints(
+        client,
+        extension_contract,
+        wallet,
+        creator_contract,
+        instance_id,
+    )
+    .await
+    .ok();
+
+    Some(NormalizedStage {
+        id: StageId::ManifoldClaim {
+            extension_contract,
+            creator_contract,
+            instance_id,
+        },
+        execution: StageExecutionRef::Manifold {
+            extension_contract,
+            creator_contract,
+            instance_id,
+        },
+        protocol: StageProtocol::ManifoldClaim,
+        label: None,
+        window: PhaseWindow { start, end },
+        price_per_token_wei: if claim.is_native_currency() {
+            Some(claim.cost)
+        } else {
+            None
+        },
+        max_per_wallet: if claim.wallet_max == 0 {
+            None
+        } else {
+            Some(u64::from(claim.wallet_max))
+        },
+        wallet_minted: wallet_claimed.map(u64::from),
+        supply_remaining: Some(u64::from(claim.supply_remaining())),
+        eligibility: if claim.is_gated() {
+            EligibilityState::UnknownUntilActive
+        } else {
+            EligibilityState::Eligible
+        },
+        evidence: format!(
+            "Manifold claim (extension {extension_contract}, creator {creator_contract}, \
+             instance {instance_id}) read (startDate {}, endDate {}, merkleRoot {:#x})",
+            claim.start_date, claim.end_date, claim.merkle_root
+        ),
+    })
+}
+
 #[cfg(test)]
 mod stage_identity_tests {
     use super::*;
@@ -1211,5 +1519,335 @@ mod stage_identity_tests {
             "an OpenSea stage coincidentally uuid'd the same as the old sentinel string must \
              never collide with the on-chain public stage's identity"
         );
+    }
+}
+
+#[cfg(test)]
+mod thirdweb_manifold_stage_discovery_tests {
+    use super::*;
+    use crate::chain::endpoint::EndpointRole;
+    use crate::chain::mock::MockTransport;
+    use crate::chain::rpc::RpcClient;
+    use crate::protocol::manifold::ClaimAbi;
+    use crate::protocol::thirdweb::{self as tw, ClaimConditionAbi};
+    use alloy_primitives::address;
+    use alloy_sol_types::SolCall;
+    use serde_json::json;
+
+    const DROP: alloy_primitives::Address = address!("00000000000000000000000000000000000c0DE0");
+    const WALLET: alloy_primitives::Address = address!("1111111111111111111111111111111111111111");
+
+    async fn connect(transport: MockTransport) -> RpcClient {
+        RpcClient::connect(Box::new(transport), 1, EndpointRole::ReadWrite, None)
+            .await
+            .unwrap()
+    }
+
+    fn condition_abi(start: u64, merkle_root: alloy_primitives::B256) -> ClaimConditionAbi {
+        ClaimConditionAbi {
+            startTimestamp: alloy_primitives::U256::from(start),
+            maxClaimableSupply: alloy_primitives::U256::from(1_000u64),
+            supplyClaimed: alloy_primitives::U256::from(10u64),
+            quantityLimitPerWallet: alloy_primitives::U256::from(5u64),
+            merkleRoot: merkle_root,
+            pricePerToken: alloy_primitives::U256::from(10_000_000_000_000_000u64),
+            currency: tw::NATIVE_TOKEN,
+            metadata: String::new(),
+        }
+    }
+
+    fn eth_call_data(params: &serde_json::Value) -> String {
+        params
+            .get(0)
+            .and_then(|c| c.get("data"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0x")
+            .to_string()
+    }
+
+    fn selector_prefix(selector: [u8; 4]) -> String {
+        format!("0x{}", hex::encode(selector))
+    }
+
+    #[tokio::test]
+    async fn multi_phase_active_only_with_no_next_condition_is_open_ended() {
+        let active_id_hex = format!(
+            "0x{}",
+            hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                &alloy_primitives::U256::from(3u64)
+            ))
+        );
+        let condition_3_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition_abi(1_700_000_000, alloy_primitives::B256::ZERO)
+            ))
+        );
+        let condition_by_id_prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
+        // The condition id is the sole (padded to 32 bytes) argument
+        // right after the 4-byte selector.
+        let id_3_suffix = format!("{:064x}", 3u64);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(active_id_hex),
+            )
+            .respond_matching(
+                "eth_call",
+                move |params| {
+                    let data = eth_call_data(params);
+                    data.starts_with(&condition_by_id_prefix) && data.ends_with(&id_3_suffix)
+                },
+                json!(condition_3_hex),
+            )
+            // Any other getClaimConditionById id (the id+1 probe for id
+            // 4) falls through to this blanket eth_call error -- exactly
+            // as a real contract would revert for an unconfigured
+            // future phase.
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert_eq!(stages.len(), 1);
+        assert_eq!(
+            stages[0].id,
+            StageId::ThirdwebMultiPhase {
+                drop_contract: DROP,
+                condition_id: alloy_primitives::U256::from(3u64),
+            }
+        );
+        assert_eq!(stages[0].window.end, NO_KNOWN_END);
+    }
+
+    #[tokio::test]
+    async fn multi_phase_active_plus_a_real_next_condition_yields_two_stages_with_a_shared_boundary()
+     {
+        let active_id_hex = format!(
+            "0x{}",
+            hex::encode(tw::getActiveClaimConditionIdCall::abi_encode_returns(
+                &alloy_primitives::U256::from(0u64)
+            ))
+        );
+        let condition_0 = condition_abi(1_700_000_000, alloy_primitives::B256::ZERO);
+        let condition_1 = condition_abi(1_800_000_000, alloy_primitives::B256::ZERO);
+        let condition_0_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition_0
+            ))
+        );
+        let condition_1_hex = format!(
+            "0x{}",
+            hex::encode(tw::getClaimConditionByIdCall::abi_encode_returns(
+                &condition_1
+            ))
+        );
+        let condition_by_id_prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
+        let id_0_suffix = format!("{:064x}", 0u64);
+        let id_1_suffix = format!("{:064x}", 1u64);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(
+                tw::getActiveClaimConditionIdCall::SELECTOR,
+                json!(active_id_hex),
+            )
+            .respond_matching(
+                "eth_call",
+                move |params| {
+                    let data = eth_call_data(params);
+                    data.starts_with(&condition_by_id_prefix) && data.ends_with(&id_0_suffix)
+                },
+                json!(condition_0_hex),
+            )
+            .respond_matching(
+                "eth_call",
+                {
+                    let prefix = selector_prefix(tw::getClaimConditionByIdCall::SELECTOR);
+                    move |params| {
+                        let data = eth_call_data(params);
+                        data.starts_with(&prefix) && data.ends_with(&id_1_suffix)
+                    }
+                },
+                json!(condition_1_hex),
+            )
+            .respond_eth_call_selector(
+                tw::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(tw::getSupplyClaimedByWalletCall::abi_encode_returns(
+                        &alloy_primitives::U256::ZERO
+                    ))
+                )),
+            )
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert_eq!(stages.len(), 2);
+        assert_eq!(
+            stages[0].id,
+            StageId::ThirdwebMultiPhase {
+                drop_contract: DROP,
+                condition_id: alloy_primitives::U256::from(0u64),
+            }
+        );
+        assert_eq!(
+            stages[1].id,
+            StageId::ThirdwebMultiPhase {
+                drop_contract: DROP,
+                condition_id: alloy_primitives::U256::from(1u64),
+            }
+        );
+        assert_eq!(
+            stages[0].window.end, stages[1].window.start,
+            "the active condition's effective end must be exactly the next condition's real \
+             startTimestamp -- verified against Drop.sol's getActiveClaimConditionId semantics"
+        );
+        assert_eq!(stages[1].window.end, NO_KNOWN_END);
+    }
+
+    #[tokio::test]
+    async fn single_phase_stage_is_discovered_when_no_multi_phase_condition_exists() {
+        let condition_hex = format!(
+            "0x{}",
+            hex::encode(tw::claimConditionCall::abi_encode_returns(&condition_abi(
+                1_700_000_000,
+                alloy_primitives::B256::ZERO
+            )))
+        );
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond_eth_call_selector(tw::claimConditionCall::SELECTOR, json!(condition_hex))
+            .respond_eth_call_selector(
+                tw::single_phase::getSupplyClaimedByWalletCall::SELECTOR,
+                json!(format!(
+                    "0x{}",
+                    hex::encode(
+                        tw::single_phase::getSupplyClaimedByWalletCall::abi_encode_returns(
+                            &alloy_primitives::U256::ZERO
+                        )
+                    )
+                )),
+            )
+            // getActiveClaimConditionId (and every other unmatched
+            // eth_call) reverts -- this is a genuine single-phase-only
+            // deployment.
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert_eq!(stages.len(), 1);
+        assert_eq!(
+            stages[0].id,
+            StageId::ThirdwebSinglePhase {
+                drop_contract: DROP
+            }
+        );
+        assert_ne!(
+            stages[0].id,
+            StageId::ThirdwebMultiPhase {
+                drop_contract: DROP,
+                condition_id: alloy_primitives::U256::ZERO,
+            },
+            "single-phase stage identity must never collide with a multi-phase identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn neither_flavor_responding_yields_no_stages() {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+        let stages = discover_thirdweb_stages(&client, DROP, WALLET).await;
+        assert!(stages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manifold_readable_claim_is_discovered_with_full_native_identity() {
+        let extension: alloy_primitives::Address =
+            address!("2222222222222222222222222222222222222222");
+        let creator: alloy_primitives::Address =
+            address!("3333333333333333333333333333333333333333");
+        let instance_id = alloy_primitives::U256::from(7u64);
+        let claim_abi = ClaimAbi {
+            total: 3,
+            totalMax: 100,
+            walletMax: 2,
+            startDate: alloy_primitives::U256::from(1_700_000_000u64),
+            endDate: alloy_primitives::U256::from(1_800_000_000u64),
+            storageProtocol: 3,
+            contractVersion: 1,
+            identical: true,
+            merkleRoot: alloy_primitives::B256::ZERO,
+            location: "ipfs://abc".to_string(),
+            cost: alloy_primitives::U256::from(1_000_000_000_000_000u64),
+            paymentReceiver: address!("4444444444444444444444444444444444444444"),
+            erc20: alloy_primitives::Address::ZERO,
+            signingAddress: alloy_primitives::Address::ZERO,
+        };
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .respond(
+                "eth_call",
+                json!(format!(
+                    "0x{}",
+                    hex::encode(crate::protocol::manifold::getClaimCall::abi_encode_returns(
+                        &claim_abi
+                    ))
+                )),
+            )
+            .build();
+        let client = connect(transport).await;
+
+        let stage = discover_manifold_stage(&client, extension, creator, instance_id, WALLET)
+            .await
+            .expect("a readable claim must produce a stage");
+        assert_eq!(
+            stage.id,
+            StageId::ManifoldClaim {
+                extension_contract: extension,
+                creator_contract: creator,
+                instance_id,
+            }
+        );
+        assert_eq!(stage.eligibility, EligibilityState::Eligible);
+    }
+
+    #[tokio::test]
+    async fn manifold_unreadable_claim_yields_no_stage() {
+        let extension: alloy_primitives::Address =
+            address!("5555555555555555555555555555555555555555");
+        let creator: alloy_primitives::Address =
+            address!("6666666666666666666666666666666666666666");
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0x1"))
+            .error("eth_call", -32000, "execution reverted")
+            .build();
+        let client = connect(transport).await;
+
+        let stage = discover_manifold_stage(
+            &client,
+            extension,
+            creator,
+            alloy_primitives::U256::from(1u64),
+            WALLET,
+        )
+        .await;
+        assert!(stage.is_none());
     }
 }

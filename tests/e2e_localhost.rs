@@ -7462,3 +7462,153 @@ fn manifold_real_send_refuses_without_an_established_trusted_fingerprint() {
         "an unverified extension contract must never be signed or broadcast against a real --send"
     );
 }
+
+// =======================================================================
+// v0.8 operationalization: thirdweb/Manifold watch stage discovery + T0
+// dispatch, real CLI binary E2E. Both real BUILTIN_REGISTRYs ship empty,
+// so every one of these correctly refuses at the provenance gate rather
+// than ever signing/broadcasting -- proving the full stage-discovery ->
+// wait -> arm -> dispatch pipeline runs, not that a live send succeeds.
+// =======================================================================
+
+#[test]
+fn watch_thirdweb_rehearsal_discovers_the_active_condition_and_refuses_at_provenance() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "must never be called: provenance is never established for this fixture"
+                .into(),
+        },
+        _ => thirdweb_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in thirdweb watch rehearsal scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{THIRDWEB_DROP:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "thirdweb",
+            "--rehearsal",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "no trusted implementation fingerprint",
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never broadcast, even for an already-active condition"
+    );
+}
+
+#[test]
+fn watch_manifold_rehearsal_discovers_the_claim_and_refuses_at_provenance() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(move |method, params| match method {
+        "eth_sendRawTransaction" | "eth_getTransactionReceipt" => Behavior::JsonRpcError {
+            code: -32000,
+            message: "must never be called: provenance is never established for this fixture"
+                .into(),
+        },
+        _ => manifold_read_response(method, params).unwrap_or(Behavior::JsonRpcError {
+            code: -32601,
+            message: format!("unexpected method in manifold watch rehearsal scenario: {method}"),
+        }),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{MANIFOLD_CREATOR:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "manifold",
+            "--manifold-extension",
+            &format!("{MANIFOLD_EXTENSION:#x}"),
+            "--rehearsal",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "no trusted implementation fingerprint",
+        ));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        !received.iter().any(|(m, _)| m == "eth_sendRawTransaction"),
+        "watch --rehearsal must never broadcast, even for an already-active claim"
+    );
+}
+
+#[test]
+fn watch_manifold_without_extension_flag_refuses_before_touching_the_network() {
+    let signer = test_signer();
+    let wallet = signer.address();
+    let key_hex = signing_key_hex(&signer);
+
+    let server = LocalHttpServer::spawn_json_rpc(|method, _params| Behavior::JsonRpcError {
+        code: -32601,
+        message: format!("must never be called: {method}"),
+    });
+
+    kairox_bin()
+        .env("KAIROX_RPC_1_0_URL", server.url())
+        .env("KAIROX_SIGNING_KEY", &key_hex)
+        .args([
+            "watch",
+            &format!("{MANIFOLD_CREATOR:#x}"),
+            "--wallet",
+            &format!("{wallet:#x}"),
+            "--engine",
+            "manifold",
+            "--rehearsal",
+            "--max-mint-value-wei",
+            "1000000000000000000",
+            "--max-gas-cost-wei",
+            "1000000000000000000",
+            "--max-total-spend-wei",
+            "2000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--manifold-extension"));
+
+    let received = server.received.lock().unwrap();
+    assert!(
+        received.is_empty(),
+        "missing --manifold-extension must be rejected before any network call"
+    );
+}

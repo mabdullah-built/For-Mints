@@ -39,6 +39,14 @@ fn protocol_rank(protocol: StageProtocol) -> u8 {
         | StageProtocol::Fcfs
         | StageProtocol::Allowlist => 0,
         StageProtocol::Public => 1,
+        // Never discovered alongside SeaDrop/OpenSea stages for the same
+        // collection today (--engine thirdweb/manifold are explicit-only,
+        // their own protocol-exclusive stage lists) -- see
+        // `domain::stage::StageProtocol::ThirdwebClaim`'s doc comment.
+        // Ranked in their own tier so a future cross-protocol merge (if
+        // one is ever built) does not silently inherit an unreviewed
+        // ranking relative to Public.
+        StageProtocol::ThirdwebClaim | StageProtocol::ManifoldClaim => 2,
     }
 }
 

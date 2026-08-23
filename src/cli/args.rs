@@ -368,6 +368,16 @@ pub struct WatchArgs {
     /// --engine auto only when no on-chain public stage is configured.
     #[arg(long)]
     pub slug: Option<String>,
+    /// The Manifold `LazyPayableClaim` extension contract address.
+    /// Required for --engine manifold. `watch` never auto-discovers it
+    /// (see `EngineSelection::Manifold`'s doc comment) -- `--collection`
+    /// continues to mean the creator (NFT) contract.
+    #[arg(long)]
+    pub manifold_extension: Option<Address>,
+    /// The Manifold claim `instanceId`. Only meaningful with --engine
+    /// manifold.
+    #[arg(long, default_value = "0")]
+    pub instance_id: String,
     /// Wallet address to watch/mint for. Required unless --manifest is used.
     #[arg(long, conflicts_with = "manifest")]
     pub wallet: Option<Address>,
