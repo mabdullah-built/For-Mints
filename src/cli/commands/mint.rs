@@ -1207,6 +1207,10 @@ async fn run_send_thirdweb(
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
         safety_caps,
         allowlist_proof,
+        // A normal mint --send always signs against whatever condition
+        // resolves as current -- only watch (which knows exactly which
+        // condition it armed for) sets this.
+        expected_stage: None,
     };
 
     let profile = ExecutionProfile::for_chain(resolved.info.chain_id);
@@ -1384,6 +1388,7 @@ async fn run_send_manifold(
         gas_buffer_multiplier: args.plan_args.gas_buffer_multiplier,
         safety_caps,
         allowlist,
+        expected_stage: None,
     };
 
     let profile = ExecutionProfile::for_chain(resolved.info.chain_id);

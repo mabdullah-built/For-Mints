@@ -119,6 +119,15 @@ pub enum SessionErrorKind {
     /// (e.g. a proxy was upgraded). The evidence a fingerprint match was
     /// verified against no longer describes what would actually execute.
     ProxyImplementationChanged,
+    /// A `watch` attempt's exact expected claim-condition identity
+    /// (condition id/config fingerprint for thirdweb, or claim
+    /// configuration fingerprint for Manifold) no longer matches what was
+    /// read immediately before signing -- the creator materially
+    /// reconfigured the condition/claim between when `watch` armed and
+    /// T0. Only ever produced when the request carries an explicit
+    /// expected-stage identity (i.e. from `watch`, never a normal
+    /// `mint --send`, whose resolution behavior is unaffected).
+    StageChangedBeforeSigning,
     /// `watch --auto-send` was invoked without an explicit
     /// `--max-mint-value-wei`/`--max-gas-cost-wei`/`--max-total-spend-wei`
     /// (or, for a manifest target, without all three declared on that
@@ -253,6 +262,7 @@ pub enum KairoxErrorCode {
     UnsupportedProtocol,
     AmbiguousProtocol,
     ProxyImplementationChanged,
+    StageChangedBeforeSigning,
     MissingSpendCaps,
     /// `watch --auto-send` refused because the resolved stage is already
     /// live and actionable right now -- use `mint --send` instead.
@@ -291,6 +301,7 @@ impl std::fmt::Display for KairoxErrorCode {
             Self::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
             Self::AmbiguousProtocol => "AMBIGUOUS_PROTOCOL",
             Self::ProxyImplementationChanged => "PROXY_IMPLEMENTATION_CHANGED",
+            Self::StageChangedBeforeSigning => "STAGE_CHANGED_BEFORE_SIGNING",
             Self::MissingSpendCaps => "MISSING_SPEND_CAPS",
             Self::StageAlreadyLive => "STAGE_ALREADY_LIVE",
             Self::ActiveStageEligibilityUnknown => "ACTIVE_STAGE_ELIGIBILITY_UNKNOWN",
@@ -375,6 +386,9 @@ impl KairoxError {
                 SessionErrorKind::AmbiguousProtocol => KairoxErrorCode::AmbiguousProtocol,
                 SessionErrorKind::ProxyImplementationChanged => {
                     KairoxErrorCode::ProxyImplementationChanged
+                }
+                SessionErrorKind::StageChangedBeforeSigning => {
+                    KairoxErrorCode::StageChangedBeforeSigning
                 }
                 SessionErrorKind::MissingSpendCaps => KairoxErrorCode::MissingSpendCaps,
                 SessionErrorKind::StageAlreadyLive => KairoxErrorCode::StageAlreadyLive,

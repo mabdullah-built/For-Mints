@@ -378,10 +378,14 @@ async fn run_single_target(
                 )
                 .await
             }
-            ResolvedWatchEngine::Thirdweb { drop_contract, .. } => {
+            ResolvedWatchEngine::Thirdweb {
+                drop_contract,
+                stage_id,
+            } => {
                 run_thirdweb_watch(
                     target.clone(),
                     *drop_contract,
+                    stage_id.clone(),
                     &poll_config,
                     &resolved,
                     &profile,
@@ -1730,6 +1734,7 @@ async fn run_opensea_watch(
 async fn run_thirdweb_watch(
     target: WatchTarget,
     drop_contract: Address,
+    expected_stage_id: crate::domain::stage::StageId,
     poll_config: &WatchPollConfig,
     resolved: &crate::cli::context::ResolvedChain,
     profile: &ExecutionProfile,
@@ -1759,30 +1764,31 @@ async fn run_thirdweb_watch(
             "no healthy, chain-verified read-capable RPC endpoint available",
         ))
     })?;
-    // Re-resolve which exact condition to wait for using this now-
-    // connected client -- `resolve_watch_engine` already did this once
-    // to decide whether to arm at all, but that used its own short-lived
-    // client; the probe below needs a client it can hold onto for the
-    // whole wait, so it resolves the target stage id fresh, once more,
-    // here.
+    // VERIFY, never silently re-select, the exact stage
+    // `resolve_watch_engine` already chose. Re-running `select_for_watch`
+    // from scratch here (an earlier version of this function did) could
+    // silently retarget the whole attempt from stage A to a different
+    // stage B if, say, an earlier condition became active in between --
+    // that must be a distinct, visible re-resolution, never a silent
+    // substitution. `discover_thirdweb_stages` is still called (this
+    // client is a different, newly-connected one from the one
+    // `resolve_watch_engine` used), but only to confirm
+    // `expected_stage_id` is still among the discovered stages.
     let stages = crate::cli::commands::resolver_adapters::discover_thirdweb_stages(
         read_client,
         drop_contract,
         target.wallet,
     )
     .await;
-    let stage = match crate::execution::stage_resolver::select_for_watch(
-        &stages,
-        OffsetDateTime::now_utc(),
-    ) {
-        crate::execution::stage_resolver::WatchStageDecision::AlreadyLive(s)
-        | crate::execution::stage_resolver::WatchStageDecision::WaitFor(s) => *s,
-        crate::execution::stage_resolver::WatchStageDecision::NoSupportedFutureStage { reason } => {
-            return Err(KairoxError::Session(SessionError::new(format!(
-                "no supported thirdweb claim condition found for {drop_contract} on the freshly \
-                 connected pool: {reason}"
-            ))));
-        }
+    let Some(stage) = stages.iter().find(|s| s.id == expected_stage_id).cloned() else {
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::StageResolutionChanged,
+            format!(
+                "the thirdweb condition this attempt was armed for ({expected_stage_id:?}) is \
+                 no longer discoverable on {drop_contract} -- it may have been reconfigured or \
+                 removed; refusing to silently retarget a different condition"
+            ),
+        )));
     };
 
     let inner_probe = ThirdwebStageProbe {
@@ -1809,6 +1815,29 @@ async fn run_thirdweb_watch(
     wait_for_stage(&probe, poll_config, |state| reporter.emit(state)).await?;
     reporter.emit(WatchState::Arming);
 
+    let expected_stage = match &stage.id {
+        crate::domain::stage::StageId::ThirdwebMultiPhase {
+            condition_id,
+            config_fingerprint,
+            ..
+        } => Some(crate::execution::thirdweb_engine::ExpectedThirdwebStage {
+            condition_id: Some(*condition_id),
+            config_fingerprint: *config_fingerprint,
+        }),
+        crate::domain::stage::StageId::ThirdwebSinglePhase {
+            config_fingerprint, ..
+        } => Some(crate::execution::thirdweb_engine::ExpectedThirdwebStage {
+            condition_id: None,
+            config_fingerprint: *config_fingerprint,
+        }),
+        other => {
+            return Err(KairoxError::Session(SessionError::new(format!(
+                "internal error: discover_thirdweb_stages produced a non-thirdweb StageId \
+                 ({other:?})"
+            ))));
+        }
+    };
+
     let request = crate::execution::thirdweb_engine::ThirdwebMintRequest {
         chain: resolved.info.clone(),
         drop_contract,
@@ -1816,6 +1845,7 @@ async fn run_thirdweb_watch(
         quantity: target.quantity,
         gas_buffer_multiplier: target.gas_buffer_multiplier,
         safety_caps,
+        expected_stage,
         // Allowlist-gated thirdweb conditions are not yet wired into
         // watch (mirrors `mint --engine thirdweb --send`'s own current
         // CLI surface, which has no --allowlist-proof plumbed through
@@ -1885,6 +1915,31 @@ async fn run_manifold_watch(
         ))
     })?;
 
+    // VERIFY the claim is still readable on this freshly-connected client
+    // (mirrors run_thirdweb_watch's identical verify-never-silently-
+    // reselect discipline) and capture its material-configuration
+    // fingerprint now, at arm time, so a change before T0 can be
+    // detected below.
+    let armed_claim = crate::execution::manifold_engine::probe_claim(
+        read_client,
+        extension_contract,
+        creator_contract,
+        instance_id,
+    )
+    .await
+    .ok_or_else(|| {
+        KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::StageResolutionChanged,
+            format!(
+                "the Manifold claim this attempt was armed for (extension {extension_contract}, \
+                 creator {creator_contract}, instance {instance_id}) is no longer readable"
+            ),
+        ))
+    })?;
+    let expected_stage = crate::execution::manifold_engine::ExpectedManifoldStage {
+        config_fingerprint: armed_claim.config_fingerprint(),
+    };
+
     let inner_probe = ManifoldStageProbe {
         client: read_client,
         extension_contract,
@@ -1917,6 +1972,7 @@ async fn run_manifold_watch(
         // Same rationale as ThirdwebMintRequest above -- allowlist-gated
         // claims are not yet wired into watch.
         allowlist: None,
+        expected_stage: Some(expected_stage),
     };
 
     let outcome = crate::execution::manifold_engine::run_manifold_mint(

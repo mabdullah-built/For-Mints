@@ -209,6 +209,30 @@ impl ManifoldClaim {
     pub fn is_gated(&self) -> bool {
         self.merkle_root != B256::ZERO
     }
+
+    /// A stable fingerprint of this claim's execution-affecting
+    /// configuration -- `total_max`, `wallet_max`, `start_date`,
+    /// `end_date`, `merkle_root`, `cost`, `payment_receiver`, `erc20`.
+    /// Deliberately EXCLUDES `total` (the mint counter, which increments
+    /// with every claim and is never grounds for treating a watched
+    /// claim as changed). Manifold's own `updateClaim(creatorContractAddress,
+    /// instanceId, claimParameters)` (verified against
+    /// `IERC721LazyPayableClaim.sol`) can rewrite a claim's terms in
+    /// place while its `instanceId` stays the same, so the three native
+    /// identifiers alone do not prove unchanged semantics -- a `watch`
+    /// attempt must be able to detect a fingerprint change and stop.
+    pub fn config_fingerprint(&self) -> B256 {
+        let mut buf = Vec::with_capacity(4 + 4 + 8 + 8 + 32 + 32 + 20 + 20);
+        buf.extend_from_slice(&self.total_max.to_be_bytes());
+        buf.extend_from_slice(&self.wallet_max.to_be_bytes());
+        buf.extend_from_slice(&self.start_date.to_be_bytes());
+        buf.extend_from_slice(&self.end_date.to_be_bytes());
+        buf.extend_from_slice(self.merkle_root.as_slice());
+        buf.extend_from_slice(&self.cost.to_be_bytes::<32>());
+        buf.extend_from_slice(self.payment_receiver.as_slice());
+        buf.extend_from_slice(self.erc20.as_slice());
+        keccak256(buf)
+    }
 }
 
 /// Build the calldata for `getClaim(creatorContractAddress, instanceId)`.

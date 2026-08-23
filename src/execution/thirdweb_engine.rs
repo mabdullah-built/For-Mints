@@ -146,7 +146,7 @@ async fn fetch_condition_and_wallet_claimed(
     drop_contract: Address,
     wallet: Address,
     flavor: ThirdwebFlavor,
-) -> Result<(ClaimCondition, U256), KairoxError> {
+) -> Result<(ClaimCondition, U256, Option<U256>), KairoxError> {
     match flavor {
         ThirdwebFlavor::DropMultiPhase721 => {
             let condition_id =
@@ -172,7 +172,7 @@ async fn fetch_condition_and_wallet_claimed(
                     wallet,
                 ),
             )?;
-            Ok((condition, wallet_claimed))
+            Ok((condition, wallet_claimed, Some(condition_id)))
         }
         ThirdwebFlavor::DropSinglePhase721 => {
             let (condition, wallet_claimed) = tokio::try_join!(
@@ -186,7 +186,7 @@ async fn fetch_condition_and_wallet_claimed(
                     wallet,
                 ),
             )?;
-            Ok((condition, wallet_claimed))
+            Ok((condition, wallet_claimed, None))
         }
     }
 }
@@ -234,6 +234,25 @@ pub struct ThirdwebMintRequest {
     /// nonzero; ignored (and never required) for a public
     /// (`merkleRoot == 0`) phase.
     pub allowlist_proof: Option<OperatorAllowlistProof>,
+    /// Set only by `watch` -- the exact condition identity that was
+    /// selected and armed for this attempt. When `Some`,
+    /// `prepare_thirdweb_transaction` verifies the freshly-read condition
+    /// still matches it immediately before signing (mirrors the existing
+    /// implementation-bytecode re-check's placement and purpose) and
+    /// fails closed with `SessionErrorKind::StageChangedBeforeSigning`
+    /// otherwise. `None` (the default for a normal `mint --send`)
+    /// preserves the existing "sign against whatever is active/current
+    /// right now" resolution behavior unchanged.
+    pub expected_stage: Option<ExpectedThirdwebStage>,
+}
+
+/// See [`ThirdwebMintRequest::expected_stage`]'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedThirdwebStage {
+    /// `None` only for the single-phase flavor, which has no condition
+    /// id in its ABI at all. `Some` for multi-phase.
+    pub condition_id: Option<U256>,
+    pub config_fingerprint: B256,
 }
 
 /// The exact top-level `claim()` arguments the real contract itself will
@@ -426,7 +445,7 @@ pub async fn prepare_thirdweb_transaction(
                 .map_err(KairoxError::from)
         },
     )?;
-    let (condition, wallet_claimed) = condition_and_claimed;
+    let (condition, wallet_claimed, condition_id) = condition_and_claimed;
 
     let resolved =
         resolve_effective_claim(request.wallet, &condition, request.allowlist_proof.as_ref())?;
@@ -522,6 +541,31 @@ pub async fn prepare_thirdweb_transaction(
                 fingerprint.implementation_bytecode_hash
             ),
         )));
+    }
+
+    // EXPECTED-STAGE RE-CHECK (watch only -- see
+    // `ThirdwebMintRequest::expected_stage`'s doc comment): the condition
+    // this attempt was armed against must still be exactly what is about
+    // to be signed. A normal (non-watch) `mint --send` has
+    // `expected_stage: None` and always signs against whatever resolves
+    // as current, unchanged from before this pass.
+    if let Some(expected) = &request.expected_stage {
+        let fingerprint_matches = condition.config_fingerprint() == expected.config_fingerprint;
+        let condition_id_matches = condition_id == expected.condition_id;
+        if !fingerprint_matches || !condition_id_matches {
+            return Err(KairoxError::Session(SessionError::with_kind(
+                SessionErrorKind::StageChangedBeforeSigning,
+                format!(
+                    "the thirdweb condition this watch attempt was armed for changed before \
+                     signing (expected condition_id {:?} / fingerprint {:#x}, now {:?} / {:#x}); \
+                     refusing to sign against different terms than were watched",
+                    expected.condition_id,
+                    expected.config_fingerprint,
+                    condition_id,
+                    condition.config_fingerprint()
+                ),
+            )));
+        }
     }
 
     let unsigned = UnsignedEip1559Tx {
@@ -999,6 +1043,7 @@ mod tests {
                     max_total_spend: U256::from(1_000_000_000_000_000_000u128),
                 },
                 allowlist_proof: None,
+                expected_stage: None,
             }
         }
 
@@ -1017,6 +1062,78 @@ mod tests {
                 U256::from(10_000_000_000_000_000u128) // price * quantity(1)
             );
             assert_eq!(prepared.wallet, wallet);
+        }
+
+        /// The exact `ClaimCondition` `MockOpts::default()`'s mocked
+        /// responses decode to -- used to compute the real, matching
+        /// `config_fingerprint()` for the expected-stage tests below.
+        fn default_mock_condition() -> crate::protocol::thirdweb::ClaimCondition {
+            let opts = MockOpts::default();
+            crate::protocol::thirdweb::ClaimCondition::from_abi(ClaimConditionAbi {
+                startTimestamp: U256::from(1_700_000_000u64),
+                maxClaimableSupply: U256::from(opts.max_claimable_supply),
+                supplyClaimed: U256::from(opts.supply_claimed),
+                quantityLimitPerWallet: U256::from(opts.quantity_limit_per_wallet),
+                merkleRoot: B256::ZERO,
+                pricePerToken: U256::from(opts.price_per_token_wei),
+                currency: NATIVE_TOKEN,
+                metadata: String::new(),
+            })
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn expected_stage_matching_the_real_condition_signs_successfully() {
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let mut req = request(wallet);
+            req.expected_stage = Some(ExpectedThirdwebStage {
+                condition_id: Some(U256::ZERO),
+                config_fingerprint: default_mock_condition().config_fingerprint(),
+            });
+            let prepared = prepare_thirdweb_transaction(&client, &s, &req, &test_registry())
+                .await
+                .unwrap();
+            assert_eq!(prepared.target, DROP);
+        }
+
+        #[tokio::test]
+        async fn expected_stage_wrong_condition_id_fails_closed_before_signing() {
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let mut req = request(wallet);
+            req.expected_stage = Some(ExpectedThirdwebStage {
+                condition_id: Some(U256::from(7u64)), // real is 0
+                config_fingerprint: default_mock_condition().config_fingerprint(),
+            });
+            let err = prepare_thirdweb_transaction(&client, &s, &req, &test_registry())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code(),
+                crate::execution::errors::KairoxErrorCode::StageChangedBeforeSigning
+            );
+        }
+
+        #[tokio::test]
+        async fn expected_stage_wrong_fingerprint_fails_closed_before_signing() {
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let mut req = request(wallet);
+            req.expected_stage = Some(ExpectedThirdwebStage {
+                condition_id: Some(U256::ZERO),
+                config_fingerprint: B256::repeat_byte(0xEE), // does not match the real condition
+            });
+            let err = prepare_thirdweb_transaction(&client, &s, &req, &test_registry())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code(),
+                crate::execution::errors::KairoxErrorCode::StageChangedBeforeSigning
+            );
         }
 
         #[tokio::test]

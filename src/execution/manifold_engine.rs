@@ -179,6 +179,19 @@ pub struct ManifoldMintRequest {
     /// ignored (and never required) for a public (`merkleRoot == 0`)
     /// claim.
     pub allowlist: Option<OperatorManifoldAllowlist>,
+    /// Set only by `watch` -- the exact claim configuration fingerprint
+    /// that was armed for this attempt. When `Some`,
+    /// `prepare_manifold_transaction` verifies the freshly-read claim
+    /// still matches it immediately before signing and fails closed with
+    /// `SessionErrorKind::StageChangedBeforeSigning` otherwise. `None`
+    /// (a normal `mint --send`) preserves existing resolution behavior.
+    pub expected_stage: Option<ExpectedManifoldStage>,
+}
+
+/// See [`ManifoldMintRequest::expected_stage`]'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedManifoldStage {
+    pub config_fingerprint: B256,
 }
 
 /// The exact `mint()` arguments to send, resolved from the claim and (if
@@ -411,6 +424,26 @@ pub async fn prepare_manifold_transaction(
                 "extension contract bytecode hash changed since provenance was established \
                  (expected {}, now {current_hash}); refusing to sign against stale evidence",
                 fingerprint.extension_bytecode_hash
+            ),
+        )));
+    }
+
+    // EXPECTED-STAGE RE-CHECK (watch only -- see
+    // `ManifoldMintRequest::expected_stage`'s doc comment). A normal
+    // `mint --send` has `expected_stage: None` and always signs against
+    // whatever the claim's current configuration is, unchanged from
+    // before this pass.
+    if let Some(expected) = &request.expected_stage
+        && claim.config_fingerprint() != expected.config_fingerprint
+    {
+        return Err(KairoxError::Session(SessionError::with_kind(
+            SessionErrorKind::StageChangedBeforeSigning,
+            format!(
+                "the Manifold claim this watch attempt was armed for changed before signing \
+                 (expected fingerprint {:#x}, now {:#x}); refusing to sign against different \
+                 terms than were watched",
+                expected.config_fingerprint,
+                claim.config_fingerprint()
             ),
         )));
     }
@@ -798,7 +831,68 @@ mod tests {
                     max_total_spend: U256::from(1_000_000_000_000_000_000u128),
                 },
                 allowlist: None,
+                expected_stage: None,
             }
+        }
+
+        /// The exact `ManifoldClaim` `MockOpts::default()`'s mocked
+        /// `getClaim` response decodes to -- used to compute the real,
+        /// matching `config_fingerprint()` for the expected-stage tests
+        /// below.
+        fn default_mock_claim() -> crate::protocol::manifold::ManifoldClaim {
+            let opts = MockOpts::default();
+            crate::protocol::manifold::decode_get_claim(
+                &manifold::getClaimCall::abi_encode_returns(&ClaimAbi {
+                    total: opts.total,
+                    totalMax: opts.total_max,
+                    walletMax: opts.wallet_max,
+                    startDate: U256::from(1_700_000_000u64),
+                    endDate: U256::from(1_800_000_000u64),
+                    storageProtocol: 3,
+                    contractVersion: 1,
+                    identical: true,
+                    merkleRoot: opts.merkle_root,
+                    location: "ipfs://abc".to_string(),
+                    cost: U256::from(opts.cost_wei),
+                    paymentReceiver: CREATOR,
+                    erc20: opts.erc20,
+                    signingAddress: Address::ZERO,
+                }),
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn expected_stage_matching_the_real_claim_signs_successfully() {
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let mut req = request(wallet);
+            req.expected_stage = Some(ExpectedManifoldStage {
+                config_fingerprint: default_mock_claim().config_fingerprint(),
+            });
+            let prepared = prepare_manifold_transaction(&client, &s, &req, &test_registry())
+                .await
+                .unwrap();
+            assert_eq!(prepared.target, EXTENSION);
+        }
+
+        #[tokio::test]
+        async fn expected_stage_wrong_fingerprint_fails_closed_before_signing() {
+            let s = signer();
+            let wallet = s.address();
+            let client = connect(MockOpts::default()).await;
+            let mut req = request(wallet);
+            req.expected_stage = Some(ExpectedManifoldStage {
+                config_fingerprint: B256::repeat_byte(0xEE),
+            });
+            let err = prepare_manifold_transaction(&client, &s, &req, &test_registry())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code(),
+                crate::execution::errors::KairoxErrorCode::StageChangedBeforeSigning
+            );
         }
 
         #[tokio::test]
