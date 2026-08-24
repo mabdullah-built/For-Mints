@@ -80,8 +80,73 @@ pub fn worst_case_total_spend(mint_value: U256, worst_case_gas_cost: U256) -> U2
     mint_value.saturating_add(worst_case_gas_cost)
 }
 
+/// How strongly a fee figure Kairox computed can actually be trusted not
+/// to be exceeded once a transaction executes.
+///
+/// On a plain EIP-1559 chain (Ethereum, Robinhood Chain), every fee
+/// component Kairox bounds genuinely IS `ProtocolEnforced`: the EVM
+/// itself refuses to charge more than `gasLimit * maxFeePerGas`, because
+/// that ceiling is encoded directly in the signed transaction. Kairox's
+/// worst-case numbers on those chains are real, immutable upper bounds.
+///
+/// On an OP Stack chain (Ink), this stops being true for two of the
+/// three fee components. Verified this pass against the current
+/// official OP Stack documentation and specification:
+///
+/// - L1 data/security fee: "You currently cannot specify a custom L1
+///   data fee for your transaction" -- there is no transaction field
+///   that limits it. The chain charges whatever the L1 gas price (and
+///   `GasPriceOracle` scalars) are AT INCLUSION time, which can differ
+///   from what `getL1FeeUpperBound` reported immediately before signing.
+/// - Operator fee: `operatorFeeScalar`/`operatorFeeConstant` are
+///   `SystemConfig`-owner-updatable at any time (a permissioned but
+///   still off-chain-triggered change, per the OP Stack Isthmus
+///   `SystemConfig` spec) -- the same "read now, may differ at
+///   inclusion" exposure as the L1 fee.
+///
+/// Only L2 execution (`gasLimit * maxFeePerGas`) remains
+/// `ProtocolEnforced` on Ink, exactly as on any other EIP-1559 chain --
+/// that part of the transaction format is unchanged by the OP Stack.
+///
+/// Kairox still performs the strongest practical mitigation available
+/// for the `PreSignBoundOnly` components -- reading them fresh via
+/// `eth_call` immediately before signing (see
+/// `execution::op_stack_fees`) and refusing to sign if that read fails
+/// or the resulting bound would exceed configured caps -- but this must
+/// never be described to the operator as an immutable maximum the way
+/// `ProtocolEnforced` figures are. See
+/// `execution::op_stack_fees::OpStackFeeBound::fee_guarantee_disclosure`
+/// for the exact operator-facing wording this produces on Ink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyCapGuarantee {
+    /// The signed transaction's own format enforces this ceiling; the
+    /// chain cannot legally charge more for this component.
+    ProtocolEnforced,
+    /// A live estimate/bound read immediately before signing -- the best
+    /// practical mitigation available, but not encoded in the
+    /// transaction itself, so the actual charged amount at inclusion may
+    /// differ (higher or lower) if the relevant oracle/chain state
+    /// changes between signing and inclusion.
+    PreSignBoundOnly,
+}
+
 /// User-configured spend ceilings. A plan must fail before signing if any
 /// cap would be exceeded.
+///
+/// **Meaning of `max_gas_cost`/`max_total_spend` is chain-dependent** --
+/// see [`SafetyCapGuarantee`] for the full rationale:
+///
+/// - On Ethereum/Robinhood Chain (plain EIP-1559, no OP Stack fees):
+///   `max_gas_cost` bounds `gasLimit * maxFeePerGas` alone, and that
+///   bound is `ProtocolEnforced` -- a genuine, immutable maximum.
+/// - On Ink (OP Stack): `max_gas_cost` bounds the sum of L2 execution
+///   (`ProtocolEnforced`) **plus** the L1 data fee and operator fee
+///   (both `PreSignBoundOnly`) -- see
+///   `execution::op_stack_fees::OpStackFeeBound`. `check` below still
+///   refuses to sign when the pre-sign-computed sum would exceed the
+///   configured cap, but that check is the strongest practical
+///   mitigation available, not a claim that the chain is incapable of
+///   charging more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SafetyCaps {
     pub max_mint_value: U256,

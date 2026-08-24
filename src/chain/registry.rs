@@ -134,15 +134,52 @@ fn robinhood_testnet() -> ChainInfo {
 /// official SeaDrop 1.0 release, modulo the two expected chain-specific
 /// immutables) and why that is explicitly NOT the same claim as
 /// "OpenSea officially deployed this."
+/// Ink's EVM chain id -- a plain constant, not itself safety-sensitive,
+/// but named so [`canonical_op_stack_gas_price_oracle`]/
+/// [`canonical_seadrop_requires_trusted_fingerprint`] below (which ARE
+/// safety-sensitive) have one obviously-correct literal to compare
+/// against rather than a magic number repeated in three places.
+pub const INK_CHAIN_ID: ChainId = 57073;
+
+/// Ink's canonical, hardcoded OP Stack fee-oracle policy -- deliberately
+/// a plain function of `chain_id`, NOT a lookup into any `ChainInfo` a
+/// caller could construct or a mutable `ChainRegistry` a caller could
+/// have inserted into. `execution::prepared::gather_unsigned_plan`
+/// consults THIS function directly (never
+/// `LiveMintRequest.chain.op_stack_gas_price_oracle`) to decide whether
+/// the complete OP Stack fee bound applies -- so even a hypothetically
+/// tampered/reconstructed `ChainInfo { chain_id: 57073, ... }` with
+/// `op_stack_gas_price_oracle: None` cannot disable Ink's fee bounding;
+/// `ink()` below itself calls this same function, so there is exactly
+/// one source of truth, never two definitions that could drift apart.
+pub fn canonical_op_stack_gas_price_oracle(chain_id: ChainId) -> Option<Address> {
+    if chain_id == INK_CHAIN_ID {
+        Some(crate::protocol::op_stack::GAS_PRICE_ORACLE)
+    } else {
+        None
+    }
+}
+
+/// Ink's canonical, hardcoded SeaDrop trusted-fingerprint requirement --
+/// see [`canonical_op_stack_gas_price_oracle`]'s doc comment for the
+/// identical rationale and the same "single source of truth, consulted
+/// directly by `gather_unsigned_plan` rather than trusting a passed-in
+/// struct's own field" design.
+pub fn canonical_seadrop_requires_trusted_fingerprint(chain_id: ChainId) -> bool {
+    chain_id == INK_CHAIN_ID
+}
+
 fn ink() -> ChainInfo {
     ChainInfo {
-        chain_id: 57073,
+        chain_id: INK_CHAIN_ID,
         name: "Ink",
         native_symbol: "ETH",
         default_seadrop_address: None,
         aliases: &[],
-        op_stack_gas_price_oracle: Some(crate::protocol::op_stack::GAS_PRICE_ORACLE),
-        seadrop_requires_trusted_fingerprint: true,
+        op_stack_gas_price_oracle: canonical_op_stack_gas_price_oracle(INK_CHAIN_ID),
+        seadrop_requires_trusted_fingerprint: canonical_seadrop_requires_trusted_fingerprint(
+            INK_CHAIN_ID,
+        ),
     }
 }
 
@@ -396,6 +433,28 @@ mod tests {
                 "chain {chain_id} must not have gained a trusted-fingerprint requirement as a \
                  side effect of adding Ink"
             );
+        }
+    }
+
+    #[test]
+    fn canonical_policy_functions_agree_with_the_compiled_ink_entry() {
+        let reg = ChainRegistry::builtin();
+        let ink = reg.by_id(INK_CHAIN_ID).unwrap();
+        assert_eq!(
+            canonical_op_stack_gas_price_oracle(INK_CHAIN_ID),
+            ink.op_stack_gas_price_oracle
+        );
+        assert_eq!(
+            canonical_seadrop_requires_trusted_fingerprint(INK_CHAIN_ID),
+            ink.seadrop_requires_trusted_fingerprint
+        );
+    }
+
+    #[test]
+    fn canonical_policy_functions_are_false_none_for_every_other_chain_id() {
+        for chain_id in [1u64, 8453, 4663, 46630, 999_999] {
+            assert_eq!(canonical_op_stack_gas_price_oracle(chain_id), None);
+            assert!(!canonical_seadrop_requires_trusted_fingerprint(chain_id));
         }
     }
 }

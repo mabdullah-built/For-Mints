@@ -147,30 +147,62 @@ async fn read_op_stack_fee_oracle_status(
     use crate::protocol::op_stack;
     use alloy_sol_types::SolCall;
 
+    let is_ecotone_calldata: alloy_primitives::Bytes =
+        op_stack::isEcotoneCall {}.abi_encode().into();
     let is_fjord_calldata: alloy_primitives::Bytes = op_stack::isFjordCall {}.abi_encode().into();
     let is_isthmus_calldata: alloy_primitives::Bytes =
         op_stack::isIsthmusCall {}.abi_encode().into();
     let is_jovian_calldata: alloy_primitives::Bytes = op_stack::isJovianCall {}.abi_encode().into();
-    let (fjord_raw, isthmus_raw, jovian_raw) = tokio::try_join!(
+    let (ecotone_raw, fjord_raw, isthmus_raw, jovian_raw) = tokio::try_join!(
+        client.eth_call(oracle, &is_ecotone_calldata),
         client.eth_call(oracle, &is_fjord_calldata),
         client.eth_call(oracle, &is_isthmus_calldata),
         client.eth_call(oracle, &is_jovian_calldata),
     )?;
 
     let decode_bool = |raw: &[u8]| raw.last().copied().unwrap_or(0) != 0;
+    let is_ecotone = decode_bool(&ecotone_raw);
     let is_fjord = decode_bool(&fjord_raw);
     let is_isthmus = decode_bool(&isthmus_raw);
     let is_jovian = decode_bool(&jovian_raw);
 
+    // FAIL, not WARN: `execution::op_stack_fees::bound_op_stack_fees`
+    // (the ONLY thing standing between an Ink live send and an
+    // unbounded L1 data fee) calls `getL1FeeUpperBound`, which itself
+    // `require`s `isFjord` and reverts otherwise -- see
+    // `protocol::op_stack`'s doc comment. Doctor must never report PASS
+    // (or a merely-advisory WARN) for a capability whose absence would
+    // make every live send on this chain fail closed at fee-bounding
+    // time; that is a hard blocker, reported as such.
     if !is_fjord {
         return Ok(format!(
-            "WARN: isFjord=false -- Kairox's L1-data-fee bounding (getL1FeeUpperBound) requires \
-             Fjord; live send on this chain would fail closed at fee-bounding time \
+            "FAIL: isFjord=false -- Kairox's L1-data-fee bounding (getL1FeeUpperBound) hard-\
+             requires Fjord and reverts without it; every live send on this chain would fail \
+             closed at fee-bounding time (isEcotone={is_ecotone}, isIsthmus={is_isthmus}, \
+             isJovian={is_jovian})"
+        ));
+    }
+    // Fjord alone makes L1-fee bounding *functional*, but Kairox's
+    // documented three-component fee model (L2 execution + L1 data +
+    // operator fee -- see `domain::fees::SafetyCapGuarantee`) is only
+    // fully represented when the operator-fee component can actually be
+    // nonzero, which requires Isthmus (`GasPriceOracle.getOperatorFee`
+    // always succeeds, but is hardcoded to return 0 pre-Isthmus, per its
+    // verified source). Reported as a distinct, explicit PASS variant --
+    // never silently folded into an unqualified "PASS" -- so an operator
+    // is never left assuming operator-fee accounting is meaningfully
+    // active on this chain when the oracle itself confirms it cannot be
+    // yet.
+    if !is_isthmus {
+        return Ok(format!(
+            "PASS (L1 data fee only; isFjord={is_fjord}, isEcotone={is_ecotone}) -- operator fee \
+             is unavailable pre-Isthmus and will always read 0 on this chain \
              (isIsthmus={is_isthmus}, isJovian={is_jovian})"
         ));
     }
     Ok(format!(
-        "PASS (isFjord={is_fjord}, isIsthmus={is_isthmus}, isJovian={is_jovian})"
+        "PASS (isEcotone={is_ecotone}, isFjord={is_fjord}, isIsthmus={is_isthmus}, \
+         isJovian={is_jovian})"
     ))
 }
 
@@ -294,5 +326,75 @@ async fn gather(config_path: Option<&std::path::Path>) -> DoctorReport {
         config_path: resolved_config_path.map(|p| p.display().to_string()),
         config_status,
         chains,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::endpoint::EndpointRole;
+    use crate::chain::mock::MockTransport;
+    use crate::chain::rpc::RpcClient;
+    use crate::protocol::op_stack;
+    use alloy_sol_types::SolCall;
+    use serde_json::json;
+
+    const ORACLE: alloy_primitives::Address =
+        alloy_primitives::address!("420000000000000000000000000000000000000F");
+
+    fn encode_bool(value: bool) -> String {
+        format!("0x{}", "0".repeat(63) + if value { "1" } else { "0" })
+    }
+
+    async fn connect(ecotone: bool, fjord: bool, isthmus: bool, jovian: bool) -> RpcClient {
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0xdef1"))
+            .respond_eth_call_selector(
+                op_stack::isEcotoneCall::SELECTOR,
+                json!(encode_bool(ecotone)),
+            )
+            .respond_eth_call_selector(op_stack::isFjordCall::SELECTOR, json!(encode_bool(fjord)))
+            .respond_eth_call_selector(
+                op_stack::isIsthmusCall::SELECTOR,
+                json!(encode_bool(isthmus)),
+            )
+            .respond_eth_call_selector(op_stack::isJovianCall::SELECTOR, json!(encode_bool(jovian)))
+            .build();
+        RpcClient::connect(Box::new(transport), 57073, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_fjord_is_a_hard_fail_not_a_mere_warning() {
+        let client = connect(true, false, false, false).await;
+        let status = read_op_stack_fee_oracle_status(&client, ORACLE)
+            .await
+            .unwrap();
+        assert!(status.starts_with("FAIL"));
+        assert!(status.contains("isFjord=false"));
+    }
+
+    #[tokio::test]
+    async fn fjord_without_isthmus_is_a_qualified_pass_not_an_unqualified_one() {
+        let client = connect(true, true, false, false).await;
+        let status = read_op_stack_fee_oracle_status(&client, ORACLE)
+            .await
+            .unwrap();
+        assert!(status.starts_with("PASS"));
+        assert!(status.contains("L1 data fee only"));
+        assert!(status.contains("operator fee is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn full_capability_set_present_is_an_unqualified_pass() {
+        let client = connect(true, true, true, true).await;
+        let status = read_op_stack_fee_oracle_status(&client, ORACLE)
+            .await
+            .unwrap();
+        assert!(status.starts_with("PASS"));
+        assert!(!status.contains("L1 data fee only"));
+        assert!(status.contains("isEcotone=true"));
+        assert!(status.contains("isJovian=true"));
     }
 }

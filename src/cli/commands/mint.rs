@@ -905,6 +905,25 @@ async fn run_send_public(
         "worst-case total spend:{} wei",
         preview.worst_case_total_spend
     );
+    if resolved.info.op_stack_gas_price_oracle.is_some() {
+        // This preview's "worst-case gas cost" reflects L2 execution
+        // only (`build_plan`'s dry-run-shared math is unchanged by Ink
+        // support -- see `execution::plan`). The actual pre-sign check
+        // immediately below additionally bounds the L1 data fee and
+        // operator fee, and refuses to sign if their sum would exceed
+        // this session's caps -- but per this pass's explicit truthful-
+        // labeling requirement, neither of those two components is a
+        // protocol-enforced maximum on Ink; see
+        // `execution::op_stack_fees::OpStackFeeBound::fee_guarantee_disclosure`
+        // for the full wording, which the actual `PreparedTransaction`
+        // carries once signing succeeds.
+        eprintln!(
+            "NOTE (Ink/OP Stack):   the figures above are L2 execution cost only. The L1 data \
+             fee and operator fee are additionally bounded immediately before signing, but are \
+             PRE-SIGN BOUNDS ONLY -- the OP Stack protocol provides no transaction field that \
+             caps either, so the actual charged amount at inclusion may differ."
+        );
+    }
     eprintln!("target contract:       {}", preview.target_contract);
     eprintln!(
         "planned stage-open:    {} (unix {})",

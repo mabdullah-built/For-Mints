@@ -232,12 +232,39 @@ pub struct BlockHeader {
 }
 
 /// The fields Kairox needs from `eth_getTransactionReceipt`.
+///
+/// The OP-Stack-specific fields below are genuinely optional: they are
+/// parsed best-effort from whatever the receipt JSON object actually
+/// contains, and are `None` when a field is absent -- **never inferred,
+/// defaulted, or reconstructed from any other source**. In particular,
+/// none of them are read from current on-chain `GasPriceOracle` state;
+/// see `execution::op_stack_fees::network_fee_accounting`'s doc comment
+/// for why using *current* oracle parameters to reconstruct a *historical*
+/// receipt's fee would be actively wrong when the chain's fee parameters
+/// have since changed. Real Ink receipts (verified live against
+/// `rpc-gel.inkonchain.com` this pass) expose `l1Fee`/`l1GasUsed`/
+/// `l1GasPrice`/`l1BaseFeeScalar`/`l1BlobBaseFee`/`l1BlobBaseFeeScalar`/
+/// `effectiveGasPrice`/`gasUsed`, but do NOT expose `operatorFeeScalar`/
+/// `operatorFeeConstant` at all -- so `operator_fee_scalar`/
+/// `operator_fee_constant` are `None` for every real Ink receipt observed
+/// so far, and any consumer must treat the resulting operator fee as
+/// genuinely unknown rather than assuming zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionReceipt {
     pub transaction_hash: B256,
     pub status_success: bool,
     pub block_number: u64,
     pub logs: Vec<RawLog>,
+    pub gas_used: Option<u64>,
+    pub effective_gas_price: Option<u128>,
+    pub l1_fee: Option<U256>,
+    pub l1_gas_used: Option<U256>,
+    pub l1_gas_price: Option<U256>,
+    pub l1_base_fee_scalar: Option<U256>,
+    pub l1_blob_base_fee: Option<U256>,
+    pub l1_blob_base_fee_scalar: Option<U256>,
+    pub operator_fee_scalar: Option<U256>,
+    pub operator_fee_constant: Option<U256>,
 }
 
 /// A single endpoint, wrapped with the chain id it has been verified
@@ -724,7 +751,49 @@ impl RpcClient {
             status_success,
             block_number,
             logs,
+            gas_used: obj.get("gasUsed").and_then(Self::hex_to_u64_opt),
+            effective_gas_price: obj.get("effectiveGasPrice").and_then(Self::hex_to_u128_opt),
+            l1_fee: obj.get("l1Fee").and_then(Self::hex_to_u256_opt),
+            l1_gas_used: obj.get("l1GasUsed").and_then(Self::hex_to_u256_opt),
+            l1_gas_price: obj.get("l1GasPrice").and_then(Self::hex_to_u256_opt),
+            l1_base_fee_scalar: obj.get("l1BaseFeeScalar").and_then(Self::hex_to_u256_opt),
+            l1_blob_base_fee: obj.get("l1BlobBaseFee").and_then(Self::hex_to_u256_opt),
+            l1_blob_base_fee_scalar: obj
+                .get("l1BlobBaseFeeScalar")
+                .and_then(Self::hex_to_u256_opt),
+            operator_fee_scalar: obj.get("operatorFeeScalar").and_then(Self::hex_to_u256_opt),
+            operator_fee_constant: obj
+                .get("operatorFeeConstant")
+                .and_then(Self::hex_to_u256_opt),
         }))
+    }
+
+    /// Best-effort optional hex-string decode -- `None` (never an error)
+    /// for a missing/null/malformed field, since every field this feeds
+    /// is a genuinely optional OP-Stack receipt extension that plain
+    /// EIP-1559 chains, and even some OP-Stack RPC providers, may not
+    /// return at all. A required field uses `hex_to_u64`/`hex_to_b256`
+    /// (which do error) instead -- this helper is only ever used for
+    /// fields this pass's own doc comments document as optional.
+    fn hex_to_u64_opt(value: &Value) -> Option<u64> {
+        let s = value
+            .as_str()?
+            .strip_prefix("0x")
+            .unwrap_or(value.as_str()?);
+        u64::from_str_radix(s, 16).ok()
+    }
+
+    fn hex_to_u128_opt(value: &Value) -> Option<u128> {
+        let s = value
+            .as_str()?
+            .strip_prefix("0x")
+            .unwrap_or(value.as_str()?);
+        u128::from_str_radix(s, 16).ok()
+    }
+
+    fn hex_to_u256_opt(value: &Value) -> Option<U256> {
+        let s = value.as_str()?;
+        U256::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok()
     }
 
     fn hex_to_b256(value: &Value, field: &str) -> Result<B256, RpcError> {
@@ -993,6 +1062,67 @@ mod tests {
         assert_eq!(receipt.transaction_hash, tx_hash);
         assert_eq!(receipt.logs.len(), 1);
         assert_eq!(receipt.logs[0].address, nft);
+        // A plain EIP-1559 receipt with none of the OP-Stack fields must
+        // parse every one of them as None -- never invented, never
+        // defaulted to zero.
+        assert_eq!(receipt.gas_used, None);
+        assert_eq!(receipt.effective_gas_price, None);
+        assert_eq!(receipt.l1_fee, None);
+        assert_eq!(receipt.operator_fee_scalar, None);
+        assert_eq!(receipt.operator_fee_constant, None);
+    }
+
+    #[tokio::test]
+    async fn get_transaction_receipt_decodes_real_ink_shaped_op_stack_fields() {
+        // Field shapes mirror an actual live Ink receipt fetched this
+        // pass -- including the real, confirmed absence of
+        // operatorFeeScalar/operatorFeeConstant on Ink's own RPC, which
+        // this test also proves parses as None, not 0.
+        let tx_hash = B256::repeat_byte(0x22);
+        let transport = MockTransport::builder()
+            .respond("eth_chainId", json!("0xdef1"))
+            .respond(
+                "eth_getTransactionReceipt",
+                json!({
+                    "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+                    "status": "0x1",
+                    "blockNumber": "0x64",
+                    "gasUsed": "0xbe53",
+                    "effectiveGasPrice": "0x202232",
+                    "l1Fee": "0x48245719",
+                    "l1GasUsed": "0x640",
+                    "l1GasPrice": "0x61eccd1",
+                    "l1BaseFeeScalar": "0x1148",
+                    "l1BlobBaseFee": "0x5afdeb",
+                    "l1BlobBaseFeeScalar": "0xc5f4f",
+                    "logs": []
+                }),
+            )
+            .build();
+        let client = RpcClient::connect(Box::new(transport), 57073, EndpointRole::ReadOnly, None)
+            .await
+            .unwrap();
+        let receipt = client
+            .get_transaction_receipt(tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(receipt.gas_used, Some(0xbe53));
+        assert_eq!(receipt.effective_gas_price, Some(0x202232));
+        assert_eq!(receipt.l1_fee, Some(U256::from(0x48245719u64)));
+        assert_eq!(receipt.l1_gas_used, Some(U256::from(0x640u64)));
+        assert_eq!(receipt.l1_gas_price, Some(U256::from(0x61eccd1u64)));
+        assert_eq!(receipt.l1_base_fee_scalar, Some(U256::from(0x1148u64)));
+        assert_eq!(receipt.l1_blob_base_fee, Some(U256::from(0x5afdebu64)));
+        assert_eq!(
+            receipt.l1_blob_base_fee_scalar,
+            Some(U256::from(0xc5f4fu64))
+        );
+        // Real Ink receipts do not expose these -- must parse as None,
+        // never as Some(0).
+        assert_eq!(receipt.operator_fee_scalar, None);
+        assert_eq!(receipt.operator_fee_constant, None);
     }
 
     #[tokio::test]

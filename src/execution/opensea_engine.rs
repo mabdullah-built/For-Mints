@@ -601,6 +601,10 @@ pub async fn finalize_and_broadcast_opensea_wallet(
         broadcast,
         broadcast_prepare_ms,
         prepared_at: OffsetDateTime::now_utc(),
+        // The OpenSea engine has no OP Stack fee-bounding path (Ink
+        // support does not extend here yet) -- `None` is truthful, not
+        // a placeholder.
+        fee_guarantee_disclosure: None,
     };
 
     // REHEARSAL: everything above this line -- benchmarking, drop-details

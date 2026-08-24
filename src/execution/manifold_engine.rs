@@ -538,6 +538,10 @@ pub async fn prepare_manifold_transaction(
         broadcast,
         broadcast_prepare_ms,
         prepared_at: OffsetDateTime::now_utc(),
+        // The Manifold engine has no OP Stack fee-bounding path (Ink
+        // support does not extend here yet) -- `None` is truthful, not
+        // a placeholder.
+        fee_guarantee_disclosure: None,
     })
 }
 
